@@ -2219,6 +2219,52 @@ fn conflicts_match_the_edited_rows() {
     assert!(compared > 40, "{compared} cases with a conflict");
 }
 
+/// Under `series_labels`, a source whose series carry their own `sampler`
+/// (`cpu`) beside a recording label `sampler=agent` reads with the series'
+/// value, and a source and its copy are one read group, so the union adds
+/// no `__recording__` and reads as the source alone.
+#[test]
+fn series_labels_over_a_copy_add_no_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.dendro");
+    write(
+        &a,
+        &[spec(
+            &[("host", "a"), ("sampler", "agent")],
+            &[("e", at(10, 0, 0))],
+            rows(at(10, 0, 0), at(10, 2, 0), S),
+            cycles,
+        )],
+    );
+    let both = dir.path().join("both.dendro");
+    combine(&both, &[(&a, None), (&a, None)]);
+    let options = QueryOptions::default().with_series_labels(true);
+    let (s, e) = (at(10, 0, 0) as f64 / 1e9, at(10, 2, 0) as f64 / 1e9);
+    for query in ["rate(cpu_cycles[3s])", "g"] {
+        type Read = Vec<(BTreeMap<String, String>, Vec<(f64, f64)>)>;
+        let read = |path: &Path| -> Read {
+            let reader = open(path);
+            let result = reader.query_range_opts(query, s, e, 1.0, &options).unwrap();
+            let QueryResult::Matrix { result, .. } = result else {
+                panic!("{query}: not a matrix");
+            };
+            result
+                .into_iter()
+                .map(|m| (m.metric.into_iter().collect(), m.values))
+                .collect()
+        };
+        let alone = read(&a);
+        assert_eq!(alone.len(), 1, "{query}: {alone:?}");
+        assert!(!alone[0].1.is_empty(), "{query}");
+        assert_eq!(
+            alone[0].0.get("sampler").map(String::as_str),
+            Some("cpu"),
+            "{query}"
+        );
+        assert_eq!(read(&both), alone, "{query}");
+    }
+}
+
 /// A recording that is a group of one, read beside a process group, is its
 /// own answers as they are: a rate across a gap in it (which a group's
 /// rules would leave empty) is the recording's alone, on the batched scan

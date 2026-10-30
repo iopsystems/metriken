@@ -15,6 +15,14 @@
 //! when the series also carries `exported_<key>`. A filter naming `<key>`
 //! matches the added value, and one naming `exported_<key>` matches the
 //! series' own.
+//!
+//! Under [`Precedence::Series`] a series keeps its own value of a key it
+//! carries, and the recording's value of that key is not added: a template
+//! written for the producer's series matches them by their own labels,
+//! while the caller chooses the recordings by which sources it wraps
+//! (metriken-query: by the query's scope). A filter naming an added key is
+//! then decided on each series after the labels are added, against its own
+//! value where it carries the key and the recording's elsewhere.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -36,6 +44,29 @@ pub const EXPORTED_PREFIX: &str = "exported_";
 /// process group share their group's labels and do not carry it. Internal under
 /// the `__` rule ([`crate::is_internal_label`]).
 pub const RECORDING_LABEL: &str = "__recording__";
+
+/// Which value a key gets when a series and its recording both carry it
+/// (see the module docs).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Precedence {
+    /// The recording's value; the series' own moves to `exported_<key>`.
+    #[default]
+    Recording,
+    /// The series' own value; the recording's is not added.
+    Series,
+}
+
+/// `labels` with `extra` added under `precedence`.
+pub fn add_labels_with(labels: &mut Labels, extra: &Labels, precedence: Precedence) {
+    match precedence {
+        Precedence::Recording => add_labels(labels, extra),
+        Precedence::Series => {
+            for (k, v) in &extra.inner {
+                labels.inner.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
+}
 
 /// `labels` with `extra` added: a key the series already carries keeps its
 /// own value under `exported_<key>` (see the module docs).
@@ -62,6 +93,51 @@ pub fn add_labels_map(labels: &mut BTreeMap<String, String>, extra: &Labels) {
     };
     add_labels(&mut wrapped, extra);
     *labels = wrapped.inner;
+}
+
+/// [`translate_filter`] under `precedence`. Under [`Precedence::Series`] a
+/// matcher on an added key is removed and decided on the relabelled series
+/// ([`keeps_with`]), so this is never `None`.
+pub fn translate_filter_with(
+    extra: &Labels,
+    filter: &Labels,
+    precedence: Precedence,
+) -> Option<Labels> {
+    match precedence {
+        Precedence::Recording => translate_filter(extra, filter),
+        Precedence::Series => Some(Labels {
+            inner: filter
+                .inner
+                .iter()
+                .filter(|(k, _)| !extra.inner.contains_key(*k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        }),
+    }
+}
+
+/// [`keeps`] under `precedence`. Under [`Precedence::Series`], whether a
+/// relabelled series satisfies `filter`'s matchers on the added keys.
+pub fn keeps_with(
+    labels: &Labels,
+    extra: &Labels,
+    filter: &Labels,
+    precedence: Precedence,
+) -> bool {
+    match precedence {
+        Precedence::Recording => keeps(labels, extra, filter),
+        Precedence::Series => {
+            let added = Labels {
+                inner: filter
+                    .inner
+                    .iter()
+                    .filter(|(k, _)| extra.inner.contains_key(*k))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            };
+            added.inner.is_empty() || labels.matches(&added)
+        }
+    }
 }
 
 /// The filter to pass to the source under `extra`, or `None` when `extra`
@@ -127,6 +203,13 @@ pub struct LabeledSource {
     inner: Arc<dyn DataSource>,
     extra: Labels,
     interval: Option<f64>,
+    precedence: Precedence,
+    /// Under [`Precedence::Series`], a label set on every series, and the
+    /// only key reported as the recording's ([`Self::marking`]).
+    mark: Option<(String, String)>,
+    /// The keys whose matchers are decided on the relabelled series under
+    /// [`Precedence::Series`]: `extra`'s and `mark`'s.
+    decided: Labels,
 }
 
 impl LabeledSource {
@@ -135,6 +218,44 @@ impl LabeledSource {
             inner,
             extra,
             interval: None,
+            precedence: Precedence::Recording,
+            mark: None,
+            decided: Labels::default(),
+        }
+    }
+
+    /// Resolve a key the series and the recording both carry by
+    /// `precedence` (see the module docs). Under [`Precedence::Series`]
+    /// without [`marking`](Self::marking), this source reports no recording
+    /// key of its own, so beside another source an operator pairs their
+    /// series as one recording's; mark each such source.
+    /// `with_precedence(Recording)` after `marking` turns the mark off.
+    pub fn with_precedence(mut self, precedence: Precedence) -> Self {
+        self.precedence = precedence;
+        self.set_decided();
+        self
+    }
+
+    /// [`Precedence::Series`], with `key` set to `value` on every series
+    /// (over `extra`'s value of `key`, where it has one). Under `Series` a
+    /// series' labels need not carry the recording's values, so two
+    /// recordings' series can share a label set; the mark keeps them apart.
+    /// It is the only key
+    /// [`recording_label_keys`](DataSource::recording_label_keys) reports
+    /// as this source's, so an operator pairs series of one recording
+    /// whatever their own values of `extra`'s keys. A matcher on `key` is
+    /// decided on the relabelled series.
+    pub fn marking(mut self, key: &str, value: &str) -> Self {
+        self.precedence = Precedence::Series;
+        self.mark = Some((key.to_string(), value.to_string()));
+        self.set_decided();
+        self
+    }
+
+    fn set_decided(&mut self) {
+        self.decided = self.extra.clone();
+        if let Some((k, v)) = &self.mark {
+            self.decided.inner.insert(k.clone(), v.clone());
         }
     }
 
@@ -154,7 +275,10 @@ impl LabeledSource {
     }
 
     fn relabel(&self, labels: &mut Labels) {
-        add_labels(labels, &self.extra);
+        add_labels_with(labels, &self.extra, self.precedence);
+        if let (Some((k, v)), Precedence::Series) = (&self.mark, self.precedence) {
+            labels.inner.insert(k.clone(), v.clone());
+        }
     }
 
     fn relabel_listing(
@@ -162,19 +286,56 @@ impl LabeledSource {
         sets: Vec<BTreeMap<String, String>>,
     ) -> Vec<BTreeMap<String, String>> {
         sets.into_iter()
-            .map(|mut set| {
-                add_labels_map(&mut set, &self.extra);
-                set
+            .map(|set| {
+                let mut labels = Labels { inner: set };
+                self.relabel(&mut labels);
+                labels.inner
             })
             .collect()
+    }
+
+    fn translate(&self, filter: &Labels) -> Option<Labels> {
+        match self.precedence {
+            Precedence::Recording => translate_filter(&self.extra, filter),
+            Precedence::Series => translate_filter_with(&self.decided, filter, self.precedence),
+        }
+    }
+
+    fn keeps(&self, labels: &Labels, filter: &Labels) -> bool {
+        match self.precedence {
+            Precedence::Recording => keeps(labels, &self.extra, filter),
+            Precedence::Series => keeps_with(labels, &self.decided, filter, self.precedence),
+        }
     }
 }
 
 impl LabeledSource {
     /// `stream` with this source's labels added to its series, and the rows
     /// of series `filter` does not accept dropped.
-    fn relabel_stream(&self, stream: HistogramStream, filter: &Labels) -> Option<HistogramStream> {
-        relabel_stream(stream, &self.extra, filter)
+    fn relabel_stream(
+        &self,
+        mut stream: HistogramStream,
+        filter: &Labels,
+    ) -> Option<HistogramStream> {
+        for labels in &mut stream.meta.series {
+            self.relabel(labels);
+        }
+        // Rows refer to series by index, so a series cannot be dropped from
+        // the meta; drop its rows instead.
+        let dropped: Vec<bool> = stream
+            .meta
+            .series
+            .iter()
+            .map(|l| !self.keeps(l, filter))
+            .collect();
+        if dropped.iter().all(|d| *d) {
+            return None;
+        }
+        if dropped.iter().any(|d| *d) {
+            let rows = stream.rows;
+            stream.rows = Box::new(rows.filter(move |r| !dropped[r.series_idx]));
+        }
+        Some(stream)
     }
 }
 
@@ -215,14 +376,12 @@ impl DataSource for LabeledSource {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<Counters> {
-        let inner_filter = translate_filter(&self.extra, filter)?;
+        let inner_filter = self.translate(filter)?;
         let mut counters = self.inner.counters(name, &inner_filter, start_ns, end_ns)?;
         for c in &mut counters.series {
             self.relabel(&mut c.labels);
         }
-        counters
-            .series
-            .retain(|c| keeps(&c.labels, &self.extra, filter));
+        counters.series.retain(|c| self.keeps(&c.labels, filter));
         (!counters.series.is_empty()).then_some(counters)
     }
 
@@ -233,7 +392,7 @@ impl DataSource for LabeledSource {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<Vec<CounterStream<'s>>> {
-        let inner_filter = translate_filter(&self.extra, filter)?;
+        let inner_filter = self.translate(filter)?;
         let mut streams = self
             .inner
             .counter_streams(name, &inner_filter, start_ns, end_ns)?;
@@ -243,7 +402,7 @@ impl DataSource for LabeledSource {
                 s.interval = self.interval;
             }
         }
-        streams.retain(|s| keeps(&s.labels, &self.extra, filter));
+        streams.retain(|s| self.keeps(&s.labels, filter));
         (!streams.is_empty()).then_some(streams)
     }
 
@@ -281,7 +440,7 @@ impl DataSource for LabeledSource {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<scan::CounterScan<'_>> {
-        let inner_filter = translate_filter(&self.extra, filter)?;
+        let inner_filter = self.translate(filter)?;
         let mut scan = self
             .inner
             .counter_scan(name, &inner_filter, start_ns, end_ns)?;
@@ -294,25 +453,19 @@ impl DataSource for LabeledSource {
         // A scan's series are positions in its chunks, so one cannot be
         // dropped here; a filter that needs the exact `exported_` check
         // takes the per-series path instead.
-        if scan
-            .series
-            .iter()
-            .any(|s| !keeps(&s.labels, &self.extra, filter))
-        {
+        if scan.series.iter().any(|s| !self.keeps(&s.labels, filter)) {
             return None;
         }
         Some(scan)
     }
 
     fn gauges(&self, name: &str, filter: &Labels, start_ns: u64, end_ns: u64) -> Option<Gauges> {
-        let inner_filter = translate_filter(&self.extra, filter)?;
+        let inner_filter = self.translate(filter)?;
         let mut gauges = self.inner.gauges(name, &inner_filter, start_ns, end_ns)?;
         for g in &mut gauges.series {
             self.relabel(&mut g.labels);
         }
-        gauges
-            .series
-            .retain(|g| keeps(&g.labels, &self.extra, filter));
+        gauges.series.retain(|g| self.keeps(&g.labels, filter));
         (!gauges.series.is_empty()).then_some(gauges)
     }
 
@@ -331,7 +484,7 @@ impl DataSource for LabeledSource {
             let gauges = self.gauges(name, filter, start_ns.saturating_sub(lookback_ns), end_ns)?;
             return Some(vec![(gauges, interval)]);
         }
-        let inner_filter = translate_filter(&self.extra, filter)?;
+        let inner_filter = self.translate(filter)?;
         let mut parts = self
             .inner
             .gauge_parts(name, &inner_filter, start_ns, end_ns, step_ns)?;
@@ -339,9 +492,7 @@ impl DataSource for LabeledSource {
             for g in &mut gauges.series {
                 self.relabel(&mut g.labels);
             }
-            gauges
-                .series
-                .retain(|g| keeps(&g.labels, &self.extra, filter));
+            gauges.series.retain(|g| self.keeps(&g.labels, filter));
         }
         parts.retain(|(g, _)| !g.series.is_empty());
         (!parts.is_empty()).then_some(parts)
@@ -354,7 +505,7 @@ impl DataSource for LabeledSource {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<HistogramStream> {
-        let inner_filter = translate_filter(&self.extra, filter)?;
+        let inner_filter = self.translate(filter)?;
         let stream = self
             .inner
             .histogram_stream(name, &inner_filter, start_ns, end_ns)?;
@@ -368,7 +519,7 @@ impl DataSource for LabeledSource {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<HistogramStream> {
-        let inner_filter = translate_filter(&self.extra, filter)?;
+        let inner_filter = self.translate(filter)?;
         let stream = self
             .inner
             .gauge_histogram_stream(name, &inner_filter, start_ns, end_ns)?;
@@ -397,7 +548,7 @@ impl DataSource for LabeledSource {
             let stream = self.gauge_histogram_stream(name, filter, start_ns, end_ns)?;
             return Some(vec![(stream, interval)]);
         }
-        let inner_filter = translate_filter(&self.extra, filter)?;
+        let inner_filter = self.translate(filter)?;
         let parts: Vec<(HistogramStream, f64)> = self
             .inner
             .gauge_histogram_parts(name, &inner_filter, start_ns, end_ns)?
@@ -424,10 +575,15 @@ impl DataSource for LabeledSource {
             .unwrap_or_else(|| self.inner.gauge_interval(name))
     }
 
-    /// The keys this adds, and the source's own.
+    /// The keys this adds, and the source's own. Under
+    /// [`Precedence::Series`] the added keys are not reported (a series can
+    /// carry its own value of one), only the mark's.
     fn recording_label_keys(&self) -> Vec<String> {
         let mut keys = self.inner.recording_label_keys();
-        keys.extend(self.extra.inner.keys().cloned());
+        match self.precedence {
+            Precedence::Recording => keys.extend(self.extra.inner.keys().cloned()),
+            Precedence::Series => keys.extend(self.mark.iter().map(|(k, _)| k.clone())),
+        }
         keys.sort();
         keys.dedup();
         keys
@@ -565,6 +721,104 @@ mod tests {
                 ("source", "svc")
             ])
         );
+    }
+
+    /// Marked, a series keeps its own value of a key the recording carries,
+    /// one without the key gets the recording's value, and every series
+    /// gets the mark, which is the only recording key reported. Matchers on
+    /// the added keys and the mark's are decided on the relabelled series,
+    /// on the histogram and listing paths as on the counter path.
+    #[test]
+    fn series_precedence_keeps_a_series_own_value() {
+        let config = ::histogram::Config::new(2, 10).unwrap();
+        let mut memory = crate::memory::Memory::new(1000);
+        for own in [&[("instance", "api")][..], &[][..]] {
+            let histogram = || crate::types::Histogram {
+                labels: labels(own),
+                config,
+                timestamps: vec![1_000_000_000],
+                snapshots: vec![HistogramSnapshot {
+                    index: vec![1],
+                    count: vec![1],
+                }],
+            };
+            memory.push_histogram_series("h", histogram());
+            memory.push_gauge_histogram_series("gh", histogram());
+            memory.push_counter_series(
+                "c",
+                Counter {
+                    labels: labels(own),
+                    timestamps: vec![1_000_000_000],
+                    values: vec![1],
+                    windows: None,
+                },
+            );
+        }
+        let source = LabeledSource::new(Arc::new(memory), labels(&[("instance", "rec")]))
+            .marking(RECORDING_LABEL, "7");
+        let series = |filter: &[(&str, &str)]| -> Vec<Labels> {
+            source
+                .histogram_stream("h", &labels(filter), 0, 2_000_000_000)
+                .map(|s| {
+                    let kept: std::collections::BTreeSet<usize> =
+                        s.rows.map(|r| r.series_idx).collect();
+                    kept.into_iter().map(|i| s.meta.series[i].clone()).collect()
+                })
+                .unwrap_or_default()
+        };
+        let marked = labels(&[(RECORDING_LABEL, "7"), ("instance", "api")]);
+        let plain = labels(&[(RECORDING_LABEL, "7"), ("instance", "rec")]);
+        assert_eq!(series(&[]), [marked.clone(), plain.clone()]);
+        assert_eq!(
+            series(&[("instance", "api")]),
+            std::slice::from_ref(&marked)
+        );
+        assert_eq!(series(&[("instance", "rec")]), std::slice::from_ref(&plain));
+        assert_eq!(
+            series(&[(RECORDING_LABEL, "7")]),
+            [marked.clone(), plain.clone()]
+        );
+        assert!(series(&[(RECORDING_LABEL, "8")]).is_empty());
+        assert_eq!(source.recording_label_keys(), [RECORDING_LABEL]);
+        // The counter and gauge histogram paths decide the same way.
+        let counters = |filter: &[(&str, &str)]| -> Vec<Labels> {
+            let mut out: Vec<Labels> = source
+                .counters("c", &labels(filter), 0, 2_000_000_000)
+                .map(|c| c.series.into_iter().map(|s| s.labels).collect())
+                .unwrap_or_default();
+            out.sort_by(|a, b| a.inner.cmp(&b.inner));
+            out
+        };
+        assert_eq!(
+            counters(&[("instance", "api")]),
+            std::slice::from_ref(&marked)
+        );
+        assert_eq!(
+            counters(&[("instance", "rec")]),
+            std::slice::from_ref(&plain)
+        );
+        let gauge_histograms = |filter: &[(&str, &str)]| -> usize {
+            source
+                .gauge_histogram_parts("gh", &labels(filter), 0, 2_000_000_000)
+                .map(|parts| {
+                    parts
+                        .into_iter()
+                        .map(|(s, _)| {
+                            s.rows
+                                .map(|r| r.series_idx)
+                                .collect::<std::collections::BTreeSet<_>>()
+                                .len()
+                        })
+                        .sum()
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!(gauge_histograms(&[("instance", "api")]), 1);
+        assert_eq!(gauge_histograms(&[("instance", "rec")]), 1);
+        assert_eq!(gauge_histograms(&[]), 2);
+        let mut listed = source.histogram_labels("h");
+        listed.sort();
+        assert_eq!(listed, [marked.inner, plain.inner]);
     }
 
     #[test]

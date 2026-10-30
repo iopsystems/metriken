@@ -159,6 +159,18 @@ names index below, and `HistogramRow` has a new public field.
   before each change it takes from another source's rows, and
   `histogram_irate` gives no point at such a row. A struct literal of
   `HistogramRow` must set it.
+- **Added:** `labeled::Precedence`, which value a key gets when a series
+  and its recording both carry it: `Recording` (the default and the only
+  behaviour before), where the series' own value moves to
+  `exported_<key>`, or `Series`, where the series keeps its own value and
+  the recording's is not added. `LabeledSource::with_precedence` sets it.
+  `LabeledSource::marking` sets `Series` and a label on every series
+  (metriken-query uses `__recording__`), which is then the only key
+  `recording_label_keys` reports, so operators pair a recording's series
+  by it. Under `Series` a filter's matchers on the added keys and the
+  mark's are decided on each relabelled series. `add_labels_with`,
+  `translate_filter_with` and `keeps_with` are the free functions with a
+  precedence.
 - **Added:** `overlay`, an open-time label overlay: entries, each a
   selector (a source's uuid, or matchers on its stored labels) and labels to
   set or, with `""`, remove, applied in order where the catalog reports a
@@ -368,6 +380,26 @@ public API uses metriken-storage types.
   inside a coarse one, the group can count less than the coarse source
   alone. Members of different bucket configurations still read one source.
   The group's histogram interval is its coarsest member's.
+- **Added:** `QueryOptions::series_labels` and
+  `QueryOptions::with_series_labels`, the template evaluation rule for a
+  producer's or the registry's template: an `ArchiveReader` query matches a
+  key that a series and its recording both carry against the series' own
+  value and leaves the recording's value off the series; a key only the
+  recording carries is matched against the recording's value. A matcher on
+  a recording label then leaves out no recording, so the scope chooses the
+  recordings. The recording's keys are then not what tells recordings
+  apart: where the scope (else the archive) holds more than one read
+  group, every series carries `__recording__`, numbered over the reader's
+  read groups (the catalog index of each group's first source, or its
+  position when readers joined by `flatten` share catalog indices), and
+  operators pair series by it; with one read group no series carries it,
+  a twin's own included, and a source and its copies are one read group.
+  Without a scope, a query that selected one recording by a label matcher
+  reads every recording: it is refused where a metric is a different kind
+  in two of them (the refusal names the scope) and gets no single
+  recording's cross-cadence timestamps. Any source other than an
+  `ArchiveReader` refuses a query that sets it, as it refuses a scope, and
+  an instant query (`query`, which takes no options) cannot set it.
 - **Added:** `Scope` and `QueryOptions::with_scope`: the sources a query
   reads, each named by uuid (a source and its copies) or by position among
   the reader's `ArchiveReader::sources`, with an optional span. An
