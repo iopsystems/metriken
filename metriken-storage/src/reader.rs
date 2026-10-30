@@ -13,7 +13,8 @@
 //! metrics from several tables of the SAME sampler OF THE SAME source is
 //! answered by composing their sources into one union (through the checking
 //! [`UnionSource::try_new`](crate::union::UnionSource::try_new), so a producer
-//! bug that put one metric name in two tables is an error). The union
+//! bug that put one series in two tables is an error; a name whose tables hold
+//! different series of it is read from all of them). The union
 //! dispatches by metric name, with no timestamp join: each metric keeps its
 //! acquisition window from its own table, and the engine aligns independently
 //! timestamped series on its evaluation grid as it always does. Routing groups
@@ -1467,17 +1468,18 @@ impl ArchiveReader {
     /// one level up. Derive the label from something the caller knows is
     /// unique per participant instead.
     ///
-    /// # Composition tolerates name-sharing that `route` refuses
+    /// # Composition tolerates name-sharing that a query refuses
     ///
-    /// `route` answers a query naming metrics from several tables of one
-    /// sampler through `UnionMetricsSource::try_new`, which REFUSES when those
-    /// tables share a metric name. This composition has no equivalent check,
+    /// A query of the archive (metriken-query's `recording_source`) whose
+    /// tables include tables of two samplers holding one metric name, whether
+    /// or not the query names it, is refused, and so is one series in two
+    /// tables of one sampler. This composition has no equivalent check,
     /// because it is eager and whole-archive: refusing here would reject an
     /// entire archive over a name the caller may never query. Shared names are
     /// real and shipped — `gpu_nvidia` and `gpu_amd_smi` both publish
     /// `gpu_utilization` — so on a host running both, a composed query that
     /// aggregates the name away (`sum by (id) (gpu_utilization)`) sums across
-    /// vendors where `route` would have refused. The series remain
+    /// vendors where a query of the archive would have refused. The series remain
     /// distinguishable by their `sampler` label; a caller that must not
     /// conflate them should group by it.
     ///
@@ -1567,8 +1569,10 @@ impl ArchiveReader {
     /// calls this, so the cost is paid only by a consumer that wants the
     /// catalog, and never at open.
     ///
-    /// Tables hold disjoint metric names, so merging is unambiguous in the
-    /// normal case. Where two samplers deliberately share a name — `gpu_nvidia`
+    /// Tables usually hold disjoint metric names, so merging is unambiguous.
+    /// One sampler can read one name in two group tables, each over its own
+    /// population (rezolus's `drivehealth`); both describe the same metric.
+    /// Where two samplers deliberately share a name — `gpu_nvidia`
     /// and `gpu_amd_smi` both publish `gpu_utilization`, since only one
     /// populates on a given host — the first table wins. They describe the same
     /// vendor-neutral quantity, so unit and description agree.

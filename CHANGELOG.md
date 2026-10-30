@@ -44,6 +44,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   64 threads all wrote one shard; on macOS the addresses were equal modulo
   16, which left 4 of 64 shards in use.
 
+### metriken-storage 0.6.1
+
+- **Fixed:** `UnionSource::try_new` accepts a metric name present in several
+  children when their series of it carry different label sets, and a read
+  of that name returns every such child's series. Before, any name in two
+  children was `UnionError::NonDisjoint`, so a metric family read in two
+  acquisition groups of one sampler, each over its own population and told
+  apart by a label, could not be queried. `NonDisjoint` now means one label
+  set of a name is in more than one child, or a child holding the name lists
+  no label sets for it. `UnionSource::new` is unchanged: the first child's
+  series of a name present in several.
+
+### metriken-query 0.43.1
+
+- **Fixed:** an archive query naming a metric that two group tables of one
+  sampler hold under different labels returns both tables' series instead of
+  failing with "present in more than one acquisition-group table" (through
+  metriken-storage 0.6.1). A name held by tables of two samplers is still
+  refused as ambiguous, whatever their labels. The error for one series in two
+  group tables of one sampler says the clash is a series with the same labels;
+  it still lists metric names.
+
 ### metriken-recorder 0.6.0
 
 Requires metriken-storage 0.6.0, metriken-model 0.2.1 and dendro 0.6.1.
