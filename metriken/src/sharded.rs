@@ -8,7 +8,38 @@ use histogram::{Config, Error, Histogram};
 use crate::group::metadata::GroupMetadata;
 use crate::{CounterGroupMetric, HistogramGroupMetric, HistogramMetric, Metric, Value};
 
-const CACHE_LINE: usize = 64;
+/// The line size shards are padded to, so that two threads' shards never share
+/// a cache line or a pair of lines one prefetch pulls together. The values are
+/// crossbeam-utils' `CachePadded` alignments: 128 on x86_64 (Intel's L2
+/// spatial prefetcher, since Sandy Bridge, fetches 64-byte lines in pairs),
+/// aarch64 (128-byte lines on Apple silicon and some big.LITTLE big cores)
+/// and powerpc64; 32, 16 or 256 where those architectures' lines are that
+/// size; 64 elsewhere. It must
+/// match the `repr(align)` on [`CacheLine`], which is asserted below.
+const CACHE_LINE: usize = if cfg!(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "arm64ec",
+    target_arch = "powerpc64",
+)) {
+    128
+} else if cfg!(any(
+    target_arch = "arm",
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "mips64",
+    target_arch = "mips64r6",
+    target_arch = "sparc",
+    target_arch = "hexagon",
+)) {
+    32
+} else if cfg!(target_arch = "m68k") {
+    16
+} else if cfg!(target_arch = "s390x") {
+    256
+} else {
+    64
+};
 const SLOTS_PER_LINE: usize = CACHE_LINE / 8;
 /// Number of shards. Ids passed to [`set_thread_shard`] are taken modulo this
 /// count.
@@ -115,10 +146,55 @@ fn assign_thread_shard() -> usize {
     id
 }
 
-#[repr(C, align(64))]
+#[cfg_attr(
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "arm64ec",
+        target_arch = "powerpc64",
+    ),
+    repr(C, align(128))
+)]
+#[cfg_attr(
+    any(
+        target_arch = "arm",
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6",
+        target_arch = "sparc",
+        target_arch = "hexagon",
+    ),
+    repr(C, align(32))
+)]
+#[cfg_attr(target_arch = "m68k", repr(C, align(16)))]
+#[cfg_attr(target_arch = "s390x", repr(C, align(256)))]
+#[cfg_attr(
+    not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "arm64ec",
+        target_arch = "powerpc64",
+        target_arch = "arm",
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6",
+        target_arch = "sparc",
+        target_arch = "hexagon",
+        target_arch = "m68k",
+        target_arch = "s390x",
+    )),
+    repr(C, align(64))
+)]
 struct CacheLine {
     slots: [AtomicU64; SLOTS_PER_LINE],
 }
+
+const _: () = assert!(
+    std::mem::align_of::<CacheLine>() == CACHE_LINE
+        && std::mem::size_of::<CacheLine>() == CACHE_LINE
+);
 
 /// A group of sharded counters for high-throughput workloads.
 ///
@@ -173,6 +249,7 @@ impl ShardedCounterGroup {
         self.entries
     }
 
+    #[inline]
     fn get_or_init(&self) -> &[CacheLine] {
         self.values.get_or_init(|| {
             let total_lines = NUM_SHARDS * self.lines_per_shard;
@@ -740,12 +817,12 @@ mod tests {
 
     #[test]
     fn packing() {
-        // 8 counters should fit in one cache line per shard
-        static GROUP: ShardedCounterGroup = ShardedCounterGroup::new(8);
+        // A full line of counters fits in one cache line per shard
+        static GROUP: ShardedCounterGroup = ShardedCounterGroup::new(SLOTS_PER_LINE);
         assert_eq!(GROUP.lines_per_shard, 1);
 
-        // 9 counters needs two cache lines per shard
-        static GROUP2: ShardedCounterGroup = ShardedCounterGroup::new(9);
+        // One more needs two cache lines per shard
+        static GROUP2: ShardedCounterGroup = ShardedCounterGroup::new(SLOTS_PER_LINE + 1);
         assert_eq!(GROUP2.lines_per_shard, 2);
     }
 

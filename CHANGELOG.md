@@ -16,18 +16,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Value::Histogram` and `Value::HistogramGroup`, which metriken-exposition
   reads with no change. `ShardedCounterHistogramGroup` implements
   `SlotMetadata`.
-- **Changed:** the shard count is 256, up from 64. `ShardedCounterGroup` uses
-  4x the memory (16 KiB for a group of up to 8 counters), and `value()` and
-  `load()` sum 256 shards.
+- **Changed:** `ShardedCounterGroup` holds 256 shards, up from 64, each
+  padded to the target's cache line size instead of 64 bytes: 128 on x86_64,
+  aarch64 and powerpc64; 32, 16 or 256 on the architectures whose lines are
+  that size; 64 otherwise (the values crossbeam-utils' `CachePadded` uses).
+  A group of up to 16 counters takes 32 KiB where the padding is 128 bytes
+  (4 KiB for up to 8 counters in 0.11.4), and a group of up to 8 takes 16
+  KiB where it is 64 bytes. `value()` and `load()` sum 256 shards. On an
+  Apple M4 (128-byte lines) two threads writing adjacent shards packed at 64
+  bytes shared a line and ran at 0.71x the per-thread rate of 128-byte
+  padding, 0.53x at eight threads (5 unpinned runs on a loaded machine, so
+  indicative only); on a Ryzen 7 7840HS (64-byte lines) the two paddings
+  were within 0.3% at 1, 2 and 8 threads.
+- **Changed:** `AtomicCounterHistogram::increment` and `ShardedCounterGroup`'s
+  recording path are inlined into callers in other crates. Measured from a
+  downstream crate without LTO on a Ryzen 7 7840HS, one thread, median of 5
+  interleaved runs: `AtomicCounterHistogram::increment` 425 to 511 million
+  values/s, `ShardedCounterGroup::increment` 611 to 636 million/s.
 - **Fixed:** a thread that records without calling `set_thread_shard` takes a
   shard from a pool on its first write and returns it when it exits. Threads
   alive at the same time get distinct shards while no more than 256 of them
   have held one at once; a thread that starts while all 256 are leased shares
   a shard for its whole life. Pooled shards are numbered down from 255, away
-  from the low ids callers usually pass to `set_thread_shard`. The shard was the address of a thread-local modulo the
-  shard count. Measured on Linux with glibc 2.41, that address was the same
-  modulo 4096 in every thread, so 64 threads all wrote one shard; on macOS the
-  addresses were equal modulo 16, which left 4 of 64 shards in use.
+  from the low ids callers usually pass to `set_thread_shard`. The shard was
+  the address of a thread-local modulo the shard count. Measured on Linux
+  with glibc 2.41, that address was the same modulo 4096 in every thread, so
+  64 threads all wrote one shard; on macOS the addresses were equal modulo
+  16, which left 4 of 64 shards in use.
 
 ### metriken-recorder 0.6.0
 
