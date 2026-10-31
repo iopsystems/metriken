@@ -44,7 +44,7 @@ impl Backing {
 /// only indices with explicitly attached metadata consume memory for it.
 ///
 /// An owned entry that has never been written reads back as `None`, not
-/// `Some(0)` — see [`UNWRITTEN`]. That distinction matters for any group whose
+/// `Some(0)`; it holds the `UNWRITTEN` sentinel (`u64::MAX`). That distinction matters for any group whose
 /// population is smaller than its capacity, or whose members appear at runtime:
 /// without it, every index the sampler never touched publishes a zero that a
 /// consumer cannot tell from a real measurement. An externally-backed group is
@@ -108,7 +108,7 @@ impl CounterGroup {
     /// lifetime.
     ///
     /// An external store is the caller's memory and is not pre-filled, so the
-    /// [`UNWRITTEN`] sentinel does not apply to it: a kernel-zeroed BPF map
+    /// `UNWRITTEN` sentinel does not apply to it: a kernel-zeroed BPF map
     /// reads as `Some(0)` from the start. That is the intended reading — such a
     /// counter genuinely begins at zero, and membership for these groups is
     /// derived from the map's registered entries rather than from value
@@ -147,7 +147,7 @@ impl CounterGroup {
     ///
     /// If the entry has not been written yet, it is treated as `0` before the
     /// addition, so the first `add` lands the value itself rather than
-    /// wrapping from the [`UNWRITTEN`] sentinel.
+    /// wrapping from the `UNWRITTEN` sentinel.
     ///
     /// Returns `false` if `idx` is out of bounds.
     #[inline]
@@ -176,7 +176,7 @@ impl CounterGroup {
 
     /// Set the counter at `idx` to `value`.
     ///
-    /// Setting [`UNWRITTEN`] (`u64::MAX`) explicitly makes the entry read back
+    /// Setting `UNWRITTEN` (`u64::MAX`) explicitly makes the entry read back
     /// as never-written; there is no way to distinguish the two, which is the
     /// cost of a value sentinel.
     ///
@@ -206,7 +206,7 @@ impl CounterGroup {
     /// Load all counter values as a snapshot.
     ///
     /// Values are returned raw: an owned entry that has never been written
-    /// reads as the [`UNWRITTEN`] sentinel rather than being filtered out, so
+    /// reads as the `UNWRITTEN` sentinel rather than being filtered out, so
     /// the result stays index-aligned with the group. Use
     /// [`value`](CounterGroup::value) for a per-entry `Option`. Mirrors
     /// [`GaugeGroup::load`](crate::GaugeGroup::load).
@@ -322,7 +322,7 @@ impl CounterGroup {
     /// not the lock-free `set`/`add`/`increment` (see that method's torn-safety
     /// caveat; the enforced path is [`WindowedCounterGroup`](crate::WindowedCounterGroup)).
     /// The value is `None` if `idx` is out of bounds or the slot has never been
-    /// written (still the [`UNWRITTEN`] sentinel).
+    /// written (still the `UNWRITTEN` sentinel).
     pub fn load_with_window(&self, idx: usize) -> (Option<u64>, Option<Window>) {
         if idx >= self.entries {
             return (None, None);

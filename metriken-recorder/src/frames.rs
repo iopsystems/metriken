@@ -164,6 +164,7 @@ impl StreamSubscriber {
     }
 
     /// Record the interval the connection is served at on the handshake.
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     pub(crate) fn set_served_interval(&mut self, served: Option<std::time::Duration>) {
         if let Some(handshake) = &mut self.handshake {
             handshake.served_interval = served;
