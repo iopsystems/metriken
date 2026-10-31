@@ -26,7 +26,7 @@
 //!   and [`scan`], the decoded columns its batched rate path consumes.
 //! - [`parquet`]: one or more parquet files as a source. [`segmented`]: a
 //!   table of many segments as one source, with the segment store and
-//!   relabel. [`union`]: sources with disjoint metric names as one.
+//!   relabel. [`union`]: sources with disjoint series as one.
 //!   [`lazy`]: a composition child opened on first use. [`memory_store`] and
 //!   [`memory`]: an in-memory source.
 //! - [`buffer_pool`]: the cache of decoded blocks readers share.
