@@ -112,6 +112,11 @@ Requires histogram 1.6.4 (was 1.4.1).
 
 Requires histogram 1.6.4 (was 1.4.1).
 
+- **Changed:** `MsgpackToArchive` (feature `convert`) fails on a raw
+  recording holding a snapshot with an invalid histogram, which
+  `metriken_model::Snapshot` no longer decodes with histogram 1.6 (see
+  metriken-model 0.2.2). With histogram 1.4.1 such a snapshot decoded, and
+  `Snapshot::histograms` dropped or rebuilt the histogram.
 - **Fixed:** `UnionSource::try_new` accepts a metric name present in several
   children when their series of it carry different label sets, and a read
   of that name returns every such child's series. Before, any name in two
@@ -125,6 +130,7 @@ Requires histogram 1.6.4 (was 1.4.1).
 ### metriken-query 0.43.1
 
 Requires histogram 1.6.4 (was 1.4.1).
+Requires metriken-storage 0.6.1.
 
 - **Fixed:** an archive query naming a metric that two group tables of one
   sampler hold under different labels returns both tables' series instead of
