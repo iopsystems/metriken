@@ -17,7 +17,7 @@ members = [
 [workspace.dependencies]
 # Shared across multiple crates
 arrow = { version = "60.0.0", default-features = false }
-histogram = "1.6.3"
+histogram = "1.6.4"
 parquet = { version = "60.0.0", default-features = false }
 parking_lot = "0.12"
 serde = { version = "1.0", features = ["derive"] }
