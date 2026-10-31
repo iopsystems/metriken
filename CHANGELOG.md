@@ -20,12 +20,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### metriken 0.11.5
 
-- **Changed:** requires `histogram` 1.6.3 (was 1.4.1). 1.6.2 inlines the
+- **Changed:** requires `histogram` 1.6.4 (was 1.4.1). 1.6.2 inlines the
   recording path into callers in other crates: measured with 1.6.1 plus the
   same `#[inline]` attributes on that path, from a downstream crate without
   LTO, a per-thread sharded histogram (the layout of
   `ShardedCounterHistogram`) recorded 1.37x faster on one thread and 1.41x
-  on eight.
+  on eight. 1.6.4 computes the bucket index with fewer operations and uses
+  the bucket slice's bounds check as the range check. Measured against 1.6.3
+  on a Ryzen 7 7840HS, from a downstream crate without LTO and with
+  `codegen-units = 1`, median of 5 interleaved 2-second runs, threads
+  pinned one per core, values drawn from 50,000..150,000, per-thread
+  throughput with 1.6.4 divided by 1.6.3:
+
+  | Recording into | 1 thread | 8 threads |
+  | --- | --- | --- |
+  | `ShardedCounterHistogram` | 1.11x | 1.12x |
+  | `ShardedCounterHistogramGroup` (4 entries) | 1.22x | 1.23x |
+  | one `AtomicCounterHistogram` shared by all threads | 1.03x | 0.95x |
+
+  A bare `histogram::AtomicHistogram` per thread gained 1.06x in the same
+  runs. With values drawn log-uniformly from 1 to 2^40 the sharded types
+  gained 1.02x to 1.05x, and the shared `AtomicCounterHistogram` at 8
+  threads ran at 0.58x (63 to 37 million values/s per thread; 1.6.3's five
+  runs were 45 to 65). With values from 50,000..150,000 both versions
+  record 37 to 39 million values/s per thread in that case. We have not
+  found the cause of the drop.
 - **Added:** `ShardedCounterHistogram` and `ShardedCounterHistogramGroup`, the
   histogram counterparts to `ShardedCounterGroup`. Each thread records into
   its own shard, and reads merge the shards. A shard's buckets are allocated
@@ -63,11 +82,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### metriken-core 0.3.5
 
-Requires histogram 1.6.3 (was 1.4.1).
+Requires histogram 1.6.4 (was 1.4.1).
 
 ### metriken-model 0.2.2
 
-Requires histogram 1.6.3 (was 1.4.1).
+Requires histogram 1.6.4 (was 1.4.1).
 
 - **Changed:** a snapshot fails to decode as a whole if any histogram in it
   has a config that `histogram::Config::new` rejects, derived config fields
@@ -81,19 +100,19 @@ Requires histogram 1.6.3 (was 1.4.1).
 
 ### metriken-exposition 0.25.2
 
-Requires histogram 1.6.3 (was 1.4.1).
+Requires histogram 1.6.4 (was 1.4.1).
 
 ### metriken-storage 0.6.1
 
-Requires histogram 1.6.3 (was 1.4.1).
+Requires histogram 1.6.4 (was 1.4.1).
 
 ### metriken-query 0.43.1
 
-Requires histogram 1.6.3 (was 1.4.1).
+Requires histogram 1.6.4 (was 1.4.1).
 
 ### metriken-recorder 0.6.1
 
-Requires histogram 1.6.3 (was 1.4.1).
+Requires histogram 1.6.4 (was 1.4.1).
 
 ### metriken-recorder 0.6.0
 
