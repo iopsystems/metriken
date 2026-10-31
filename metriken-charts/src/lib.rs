@@ -10,10 +10,16 @@
 //! a chart needs from its page (a data layer, a theme version, events) comes
 //! through `charts/host.js`; see the README.
 //!
+//! - [`plot`]: the plot spec, the JSON a page gives a chart to say what it
+//!   draws, built in Rust and serialized with serde.
 //! - [`ASSETS`]: the `assets/` directory, embedded at build time.
 //! - [`ASSETS_PATH`]: the directory Cargo built from, on the build machine.
 //!   It is useful with a path dependency, to serve edits without a rebuild;
 //!   in a deployed binary it usually does not exist, so serve [`ASSETS`].
+
+pub mod plot;
+
+pub use plot::{Plot, PlotOpts, PlotWidth, Unit};
 
 use ::include_dir::Dir;
 /// The `include_dir` version [`ASSETS`] is a [`Dir`] of, so a caller names the

@@ -5,7 +5,9 @@ serve. These are the charts the rezolus viewer draws: line, multi-series,
 percentile scatter, heatmaps and histogram heatmaps, with zoom, tooltips,
 event markers and display-mode (decimated) data.
 
-The crate exports `ASSETS`, `ASSETS_PATH` and the `include_dir` crate.
+The crate exports `ASSETS`, `ASSETS_PATH`, the `include_dir` crate, and the
+`plot` module, which builds plot specs in Rust (see "Building a spec in
+Rust").
 `ASSETS` embeds `assets/` with `include_dir` 0.7 (re-exported as
 `metriken_charts::include_dir`), and `ASSETS_PATH` names the directory on the
 machine that built the crate:
@@ -60,6 +62,15 @@ machine that built the crate:
   | `eventEditingAllowed`, `openEventForm` | "+ Add Event" on a frozen tooltip | not offered |
   | `openEventInfo` | an event tag's popover | a click on a tag does nothing |
 
+  The comments in `host.js` give `executePromQLRangeQuery` one argument, and
+  do not say what `fetchQuantileSpectrumForPlot` receives as `plot`:
+
+  - `executePromQLRangeQuery(query, metadata, signal, rateMode, scope)`. The
+    line chart's total calls it with `metadata` and `signal` undefined,
+    `rateMode` `'grid'`, and `scope` set to the plot's `scope` or `null`.
+  - `fetchQuantileSpectrumForPlot(plot, quantiles)` receives a `plot` of
+    `{ promql_query, opts, scope }`.
+
   `setChartHost({ ... })` merges over what earlier calls set and refuses an
   unknown key or a value that is not a function.
 
@@ -93,6 +104,31 @@ entries between the first and the last.
 `data` (`[timestamps_s, values...]`), or display-mode data written by
 `applyDisplayToPlot` in `charts/display.js`. `ChartsState` holds zoom shared by
 the charts given the same instance.
+
+## Building a spec in Rust
+
+`metriken_charts::plot` builds the plot spec and serializes it with serde.
+`Plot::new(opts, promql_query)` makes a half-width plot, and the `PlotOpts`
+constructors (`gauge`, `counter`, `histogram`, `histogram_latency`) set the
+metric type and the unit system from a `Unit`. `Unit` lists the keys of
+`UNIT_SYSTEMS` in `charts/util/units.js`, and a test fails if the two differ.
+
+```rust
+use metriken_charts::{Plot, PlotOpts, PlotWidth, Unit};
+
+let mut plot = Plot::new(
+    PlotOpts::counter("Requests/s", "requests", Unit::Rate),
+    "sum(irate(requests[5m]))".to_string(),
+);
+plot.width = PlotWidth::Full;
+let spec = serde_json::to_string(&plot)?;
+```
+
+A serialized `Plot` has `data: []`. The page runs `promql_query`, wrapped by
+`buildHistogramQuery` in `charts/metric_types.js` for a histogram plot, and
+writes the result into `data` or, in display mode, through
+`applyDisplayToPlot`, before it hands the spec to a chart.
+Grouping plots into sections and pages is not in this crate.
 
 ## Display mode
 

@@ -11,12 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Added:** the crate. It holds the rezolus viewer's chart modules
   (`assets/charts/`) and `assets/charts.css`, copied from rezolus at
-  782383b0. ECharts 6.1.0 is bundled; NOTICE and LICENSE-d3 carry its
+  737e3ffb. ECharts 6.1.0 is bundled; NOTICE and LICENSE-d3 carry its
   notices. `ASSETS` embeds `assets/` as an `include_dir` 0.7 `Dir`, and
   `ASSETS_PATH` is the directory on the build machine. The modules import
   nothing outside `assets/charts/`; a page supplies its data layer, theme
   version and events through `charts/host.js`. 26 of rezolus's node test
   files came with them (`node --test metriken-charts/tests/*.mjs`).
+- **Added:** `metriken_charts::plot`, the plot spec types from rezolus's
+  `dashboard` crate. `Plot`, `PlotOpts`, `PlotWidth` and `Unit` are public.
+  They serialize to the same JSON as rezolus's at 737e3ffb.
+  `Plot::new(opts, promql_query)` builds a half-width plot; `Plot::opts` and
+  `PlotOpts::description` read back what was set; `promql_query`, like the
+  other query fields, is a pub field. `Unit` is `#[non_exhaustive]`, so a
+  unit system added to `units.js` is not a breaking change.
 
 ### metriken 0.11.5
 
