@@ -518,7 +518,7 @@ mod tests {
     /// one and not the other would be refused, or shown verbatim, by the charts.
     #[test]
     fn units_match_the_charts() {
-        let js = include_str!("../assets/charts/util/units.js");
+        let js = include_str!("../assets/charts/util/units.js").replace("\r\n", "\n");
         let block = &js[js.find("const UNIT_SYSTEMS = {").unwrap()..];
         let block = &block[..block.find("\n};").unwrap()];
         let charts: Vec<&str> = block
@@ -553,7 +553,7 @@ mod tests {
     /// throws on any other.
     #[test]
     fn chart_styles_match_the_dispatch() {
-        let js = include_str!("../assets/charts/chart.js");
+        let js = include_str!("../assets/charts/chart.js").replace("\r\n", "\n");
         let block = &js[js.find("// Handle different chart types").unwrap()..];
         let block = &block[..block.find("Unknown chart style").unwrap()];
         let mut charts: Vec<&str> = block
@@ -581,7 +581,8 @@ mod tests {
     /// name, `Display` and `FromStr` agree.
     #[test]
     fn histogram_views_match_metric_types() {
-        let js = include_str!("../assets/charts/metric_types.js");
+        // A Windows checkout has CRLF line endings.
+        let js = include_str!("../assets/charts/metric_types.js").replace("\r\n", "\n");
         for f in [
             "export function resolveStyle",
             "export function buildHistogramQuery",
