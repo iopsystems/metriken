@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### metriken 0.11.5
 
+- **Changed:** requires `histogram` 1.6.3 (was 1.4.1). 1.6.2 inlines the
+  recording path into callers in other crates: measured with 1.6.1 plus the
+  same `#[inline]` attributes on that path, from a downstream crate without
+  LTO, a per-thread sharded histogram (the layout of
+  `ShardedCounterHistogram`) recorded 1.37x faster on one thread and 1.41x
+  on eight.
 - **Added:** `ShardedCounterHistogram` and `ShardedCounterHistogramGroup`, the
   histogram counterparts to `ShardedCounterGroup`. Each thread records into
   its own shard, and reads merge the shards. A shard's buckets are allocated
@@ -43,6 +49,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with glibc 2.41, that address was the same modulo 4096 in every thread, so
   64 threads all wrote one shard; on macOS the addresses were equal modulo
   16, which left 4 of 64 shards in use.
+
+### metriken-core 0.3.5
+
+Requires histogram 1.6.3 (was 1.4.1).
+
+### metriken-model 0.2.2
+
+Requires histogram 1.6.3 (was 1.4.1).
+
+- **Changed:** a snapshot fails to decode as a whole if any histogram in it
+  has a config that `histogram::Config::new` rejects, derived config fields
+  that differ from what `Config::new` computes, or a bucket count that does
+  not match its config. `histogram`'s `Deserialize` validates since 1.6.0.
+  With 1.4.1 such a snapshot decoded; `Snapshot::histograms` dropped a
+  histogram whose config `Config::new` rejects or whose bucket count is
+  wrong, and rebuilt one whose only fault was a derived field. Builds that
+  already resolved `histogram` 1.6 behaved this way. Histograms written by `histogram` 0.8.2 through 0.11.3, whose `max`
+  differs from the current encoding, decode (histogram 1.6.3).
+
+### metriken-exposition 0.25.2
+
+Requires histogram 1.6.3 (was 1.4.1).
+
+### metriken-storage 0.6.1
+
+Requires histogram 1.6.3 (was 1.4.1).
+
+### metriken-query 0.43.1
+
+Requires histogram 1.6.3 (was 1.4.1).
+
+### metriken-recorder 0.6.1
+
+Requires histogram 1.6.3 (was 1.4.1).
 
 ### metriken-recorder 0.6.0
 
