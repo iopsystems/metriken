@@ -106,9 +106,36 @@ Requires histogram 1.6.4 (was 1.4.1).
 
 Requires histogram 1.6.4 (was 1.4.1).
 
+- **Fixed:** `UnionSource::try_new` accepts a metric name present in several
+  children when their series of it carry different label sets, and a read
+  of that name returns every such child's series. Before, any name in two
+  children was `UnionError::NonDisjoint`, so a metric family read in two
+  acquisition groups of one sampler, each over its own population and told
+  apart by a label, could not be queried. `NonDisjoint` now means one label
+  set of a name is in more than one child, or a child holding the name lists
+  no label sets for it. `UnionSource::new` is unchanged: the first child's
+  series of a name present in several.
+
 ### metriken-query 0.43.1
 
 Requires histogram 1.6.4 (was 1.4.1).
+
+- **Fixed:** an archive query naming a metric that two group tables of one
+  sampler hold under different labels returns both tables' series instead of
+  failing with "present in more than one acquisition-group table" (through
+  metriken-storage 0.6.1).
+- **Changed:** a query whose tables include tables of two samplers holding one
+  metric name reads every table's series of it when their labels differ, which
+  they do in recordings that carry the `sampler` label on every series (current
+  rezolus agents). Before, any such query was refused as ambiguous, including
+  `sum by (sampler) (rezolus_bpf_run_count)` and any query reading two BPF
+  samplers' tables. A name read from samplers of materially different cadence
+  is evaluated at the slower sampler's rows, as a query combining two such
+  samplers' metrics already is.
+  `sum(gpu_utilization)` on a host running both `gpu_nvidia` and
+  `gpu_amd_smi` now sums both vendors' series; `by (vendor)` keeps them apart.
+  One series (the same labels) in two tables is still refused. The errors say
+  the clash is a series with the same labels; they still list metric names.
 
 ### metriken-recorder 0.6.1
 

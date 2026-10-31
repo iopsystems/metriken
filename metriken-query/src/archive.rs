@@ -410,9 +410,9 @@ fn mark(plan: &Plan<'_>, table: &SamplerReader) -> Option<String> {
 /// points (S5). A query reaching no such group and no span is evaluated as
 /// before, as is an unspanned source of one epoch.
 ///
-/// Refused: a metric name held by two tables of one recording
-/// (`gpu_nvidia` and `gpu_amd_smi` both publish `gpu_utilization`), and a
-/// name that is a different kind in two recordings the query reaches.
+/// Refused: one series (a name with the same labels) in two tables of one
+/// recording, and a name that is a different kind in two recordings the
+/// query reaches.
 /// Errors too when the query references no known metric.
 fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryError> {
     // A metric the archive holds that no recording the query reaches holds
@@ -806,11 +806,14 @@ fn recording_source(
     //
     // `try_new`, not `new`: this composition set is derived from archive
     // bytes (table schemas plus parsed table keys), not hand-picked by
-    // trusted code, so a producer/archive bug that put the same metric name
-    // in two "disjoint" group tables of this sampler must be a loud error,
-    // not `UnionSource`'s silent first-wins. `filter_map`: on a live archive
-    // one of several tables can have been evicted between the probe and
-    // here, and the rest still answer.
+    // trusted code. A name held by several tables whose series carry
+    // different labels is read from all of them: one family read in two
+    // groups of a sampler, each over its own population, or one name
+    // published by two samplers, whose series differ at least by the
+    // `sampler` label the producer stamps. One series in two tables must be
+    // a loud error, not `UnionSource`'s silent first-wins. `filter_map`: on
+    // a live archive one of several tables can have been evicted between the
+    // probe and here, and the rest still answer.
     let children: Vec<UnionChild> = tables
         .iter()
         .filter_map(|t| {
@@ -825,32 +828,29 @@ fn recording_source(
         .map(|u| Some(Arc::new(u) as Arc<dyn DataSource>))
         .map_err(|e| match e {
             UnionError::NonDisjoint { duplicates } => {
-                // Two very different situations produce this, and conflating
-                // them tells the operator their archive is corrupt when it is
-                // not. Distinct SAMPLERS sharing a metric name is legitimate
-                // and shipped: `gpu_amd_smi` and `gpu_nvidia` both publish the
-                // vendor-neutral `gpu_utilization`, `gpu_temperature` and six
-                // more, because only one of them ever populates on a given
-                // host. Two group tables of ONE sampler sharing a name is a
-                // real archive defect.
-                let mut samplers: Vec<&str> =
-                    tables.iter().map(|t| table_sampler(t.sampler())).collect();
+                // The samplers whose tables hold a duplicated name, not every
+                // sampler the query reads.
+                let mut samplers: Vec<&str> = tables
+                    .iter()
+                    .filter(|t| duplicates.iter().any(|n| t.holds(n)))
+                    .map(|t| table_sampler(t.sampler()))
+                    .collect();
                 samplers.sort();
                 samplers.dedup();
                 if samplers.len() > 1 {
                     QueryError::ParseError(format!(
-                        "query {query} references metric name(s) published by more than one \
-                         sampler ({}), so it is ambiguous which is meant: {}. This is not an \
-                         archive fault — those samplers deliberately share vendor-neutral \
-                         names. Query one of them at a time.",
+                        "query {query} references metric name(s) with a series (the same \
+                         labels) in more than one table it reads (tables of {}): {}. No \
+                         matcher tells those series apart, so the query cannot be answered.",
                         samplers.join(", "),
                         duplicates.join(", ")
                     ))
                 } else {
                     QueryError::ParseError(format!(
-                        "query {query} references metric name(s) present in more than one \
-                         acquisition-group table of the same sampler — the archive's own \
-                         tables are not disjoint, which should never happen: {}",
+                        "query {query} references metric name(s) with a series (the same \
+                         labels) in more than one acquisition-group table of the same \
+                         sampler — the archive's own tables are not disjoint, which should \
+                         never happen: {}",
                         duplicates.join(", ")
                     ))
                 }
@@ -1913,9 +1913,10 @@ mod tests {
         );
     }
 
-    /// Within one recording a name two samplers share is still refused.
+    /// One series (the same, here empty, label set) in tables of two
+    /// samplers of one recording is refused.
     #[test]
-    fn a_name_two_samplers_share_is_still_refused_within_a_recording() {
+    fn one_series_two_samplers_hold_is_refused_within_a_recording() {
         let reader = archive(vec![recording(
             &[("source", "rezolus")],
             vec![
@@ -1927,7 +1928,190 @@ mod tests {
             .query_range_opts("gpu_ops", 1.0, 10.0, 1.0, &QueryOptions::default())
             .unwrap_err()
             .to_string();
-        assert!(err.contains("more than one sampler"), "{err}");
+        assert!(err.contains("more than one table it reads"), "{err}");
+    }
+
+    /// One group table of drivehealth's shape: counter `exceeded_time` and
+    /// gauge `queue_length`, each one series labelled `storage`, rising by
+    /// `counter` and `gauge` per row.
+    fn storage_group_table(storage: &str, counter: u64, gauge: u64) -> Vec<u8> {
+        use arrow::array::{ArrayRef, Int64Array, UInt64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        let rows = 10u64;
+        let field = |name: &str, kind: &str, data_type| {
+            Field::new(format!("{name}/{storage}"), data_type, true).with_metadata(HashMap::from([
+                ("metric".to_string(), name.to_string()),
+                ("metric_type".to_string(), kind.to_string()),
+                ("storage".to_string(), storage.to_string()),
+            ]))
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::UInt64, false),
+            field("exceeded_time", "counter", DataType::UInt64),
+            field("queue_length", "gauge", DataType::Int64),
+        ]));
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(UInt64Array::from(
+                (1..=rows).map(|i| i * S).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                (1..=rows).map(|r| r * counter).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                (1..=rows).map(|r| (r * gauge) as i64).collect::<Vec<_>>(),
+            )),
+        ];
+        let mut buf = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut buf, schema.clone(), Some(WriterProperties::default()))
+                .unwrap();
+        writer
+            .write(&RecordBatch::try_new(schema, columns).unwrap())
+            .unwrap();
+        writer.close().unwrap();
+        buf
+    }
+
+    /// One metric family read in two acquisition groups of one sampler, each
+    /// over its own population and told apart by a label, is queried as one
+    /// family: every series of both group tables.
+    #[test]
+    fn a_name_two_groups_of_one_sampler_split_by_label_is_queried_whole() {
+        let reader = archive(vec![recording(
+            &[("source", "rezolus")],
+            vec![
+                (
+                    "drivehealth/drivehealth_ebs",
+                    storage_group_table("ebs", 1, 2),
+                ),
+                (
+                    "drivehealth/drivehealth_instance_store",
+                    storage_group_table("instance_store", 3, 4),
+                ),
+            ],
+        )]);
+        let storage = |v| labels(&[("source", "rezolus"), ("storage", v)]);
+        assert_eq!(
+            series(&reader, "rate(exceeded_time[3s])"),
+            [(storage("ebs"), 1.0), (storage("instance_store"), 3.0)]
+        );
+        assert_eq!(
+            series(
+                &reader,
+                "rate(exceeded_time{storage=\"instance_store\"}[3s])"
+            ),
+            [(storage("instance_store"), 3.0)]
+        );
+        assert_eq!(
+            series(&reader, "queue_length"),
+            [(storage("ebs"), 20.0), (storage("instance_store"), 40.0)]
+        );
+        // Two names of the joined family in one query.
+        assert_eq!(
+            series(&reader, "sum(rate(exceeded_time[3s])) + sum(queue_length)"),
+            [(BTreeMap::new(), 64.0)]
+        );
+    }
+
+    /// Two samplers publishing one name are read together when their series
+    /// differ, as they do by the `sampler` and `vendor` labels a producer
+    /// stamps on them.
+    #[test]
+    fn a_name_two_samplers_share_under_different_labels_is_queried_whole() {
+        let reader = archive(vec![recording(
+            &[("source", "rezolus")],
+            vec![
+                (
+                    "gpu_nvidia",
+                    counter_table(
+                        "gpu_ops",
+                        &[(&[("sampler", "gpu_nvidia"), ("vendor", "nvidia")], 1)],
+                        10,
+                    ),
+                ),
+                (
+                    "gpu_amd_smi",
+                    counter_table(
+                        "gpu_ops",
+                        &[(&[("sampler", "gpu_amd_smi"), ("vendor", "amd")], 2)],
+                        10,
+                    ),
+                ),
+            ],
+        )]);
+        assert_eq!(
+            series(&reader, "sum by (sampler) (rate(gpu_ops[3s]))"),
+            [
+                (labels(&[("sampler", "gpu_amd_smi")]), 2.0),
+                (labels(&[("sampler", "gpu_nvidia")]), 1.0)
+            ]
+        );
+    }
+
+    /// One series in two group tables of one sampler is still an archive
+    /// defect.
+    #[test]
+    fn one_series_in_two_groups_of_one_sampler_is_refused() {
+        let reader = archive(vec![recording(
+            &[("source", "rezolus")],
+            vec![
+                (
+                    "drivehealth/drivehealth_ebs",
+                    counter_table("exceeded_time", &[(&[("storage", "ebs")], 1)], 10),
+                ),
+                (
+                    "drivehealth/drivehealth_instance_store",
+                    counter_table("exceeded_time", &[(&[("storage", "ebs")], 3)], 10),
+                ),
+            ],
+        )]);
+        let err = reader
+            .query_range_opts(
+                "rate(exceeded_time[3s])",
+                1.0,
+                10.0,
+                1.0,
+                &QueryOptions::default(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("acquisition-group table"), "{err}");
+    }
+
+    /// A series duplicated within one sampler is reported as that sampler's
+    /// defect even when the query also reads another sampler's table.
+    #[test]
+    fn a_duplicate_within_one_sampler_names_that_sampler_only() {
+        let reader = archive(vec![recording(
+            &[("source", "rezolus")],
+            vec![
+                (
+                    "drivehealth/drivehealth_ebs",
+                    counter_table("exceeded_time", &[(&[("storage", "ebs")], 1)], 10),
+                ),
+                (
+                    "drivehealth/drivehealth_instance_store",
+                    counter_table("exceeded_time", &[(&[("storage", "ebs")], 3)], 10),
+                ),
+                ("cpu_usage", counter_table("cpu_cycles", &[(&[], 5)], 10)),
+            ],
+        )]);
+        let err = reader
+            .query_range_opts(
+                "rate(exceeded_time[3s]) + on() rate(cpu_cycles[3s])",
+                1.0,
+                10.0,
+                1.0,
+                &QueryOptions::default(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("acquisition-group table of the same"), "{err}");
+        assert!(!err.contains("cpu_usage"), "{err}");
     }
 
     #[test]

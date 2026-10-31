@@ -19,8 +19,8 @@
 //!   binary operator's broadcast pairs series of one recording only.
 //!
 //! [`UnionSource`](crate::union::UnionSource) is the other composition: it
-//! joins tables holding different names of one recording, and
-//! `UnionSource::try_new` refuses a name two of them hold.
+//! joins tables holding different series of one recording, and
+//! `UnionSource::try_new` refuses a series two of them hold.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;

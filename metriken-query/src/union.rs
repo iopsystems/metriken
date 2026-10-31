@@ -1,5 +1,5 @@
 //! [`UnionMetricsSource`]: presents several readers with DISJOINT
-//! metric-name sets as one logical [`MetricsSource`] — e.g. one sampler's
+//! series as one logical [`MetricsSource`] — e.g. one sampler's
 //! several acquisition-group tables, each holding a different subset of
 //! that sampler's metrics (rezolus's `.rez` V3 container tables
 //! `<sampler>/<group>`, not `<sampler>`, once a sampler is split).
@@ -9,10 +9,10 @@
 //! files — the same metric, from several hosts/recordings — and
 //! deliberately keeps each file's series distinct (labeled/duplicated), not
 //! merged. `UnionMetricsSource` instead unions DIFFERENT identities into
-//! one namespace: a per-name accessor call dispatches to whichever single
-//! child owns that name, so `counters("cpu_cycles", ..)` and
-//! `counters("cpu_softirq", ..)` can each resolve from a different child
-//! transparently.
+//! one namespace: a per-name accessor call dispatches to the child that
+//! holds that name, or with `try_new` to every child holding series of it,
+//! so `counters("cpu_cycles", ..)` and `counters("cpu_softirq", ..)` can
+//! each resolve from a different child transparently.
 //!
 //! **No timestamp splicing or join.** Each child keeps its own samples,
 //! windows, and cadence exactly as it already reports them. The PromQL
@@ -31,12 +31,15 @@
 //! is a decision the CALLER makes (e.g. rezolus grouping a sampler's group
 //! tables) — but which children end up in that decision can still trace
 //! back to untrusted wire bytes (rezolus derives its composition set from
-//! archive table schemas), so a name present in more than one child can be
-//! a real producer/archive bug reaching this type, not merely a
+//! archive table schemas), so a series present in more than one child can
+//! be a real producer/archive bug reaching this type, not merely a
 //! caller-code bug. Two constructors, two policies:
 //! [`UnionMetricsSource::new`] trusts the caller and silently keeps the
-//! first child's series on a collision (see `build_index`; deterministic,
-//! never a panic); [`UnionMetricsSource::try_new`] checks first and returns
+//! first child's series of a name present in several (deterministic, never
+//! a panic). [`UnionMetricsSource::try_new`] checks first: a name whose
+//! children hold different label sets of it (one metric family read in two
+//! groups, each over its own population) is read from every one of them,
+//! and one label set of a name in two children returns
 //! [`UnionError::NonDisjoint`] instead of building anything. Prefer
 //! `try_new` whenever the composition set isn't hand-picked by code that
 //! can vouch for disjointness itself.
@@ -84,7 +87,7 @@ pub struct UnionMetricsSource {
 impl UnionMetricsSource {
     /// Build a union over `children`, trusting the caller's partitioning:
     /// a name present in more than one child silently keeps its FIRST
-    /// child's series (see `build_index`) rather than erroring. Order
+    /// child's series (see [`UnionSource::new`]) rather than erroring. Order
     /// matters only for that tie-break, which correctly-partitioned input
     /// never triggers.
     ///
@@ -101,7 +104,9 @@ impl UnionMetricsSource {
 
     /// Like [`new`](Self::new), but rejects `children` up front instead of
     /// building a union that would silently drop series: empty input, or
-    /// any metric name (within one kind) present in more than one child.
+    /// a series (a metric name within one kind, with one label set) present
+    /// in more than one child. A name whose children hold different series
+    /// of it is read from all of them.
     pub fn try_new(children: Vec<UnionChild>) -> Result<Self, UnionError> {
         let source = UnionSource::try_new(children)?;
         Ok(Self {
@@ -515,17 +520,150 @@ mod tests {
         assert_eq!(err, UnionError::Empty);
     }
 
+    /// A one-column table of `metric` labelled `key=value`, `n` rows, values
+    /// `0, step, 2 * step, ..`. A counter when `gauge` is false.
+    fn labeled_table(
+        metric: &str,
+        key: &str,
+        value: &str,
+        step: u64,
+        gauge: bool,
+    ) -> ParquetReader {
+        let n = 5;
+        let ts: Vec<u64> = (1..=n).map(|i| i * 1_000_000_000).collect();
+        let column = format!("{metric}/{value}");
+        let (kind, data_type, array): (&str, DataType, ArrayRef) = if gauge {
+            let vals: Vec<i64> = (0..n).map(|i| (i * step) as i64).collect();
+            ("gauge", DataType::Int64, Arc::new(Int64Array::from(vals)))
+        } else {
+            let vals: Vec<u64> = (0..n).map(|i| i * step).collect();
+            (
+                "counter",
+                DataType::UInt64,
+                Arc::new(UInt64Array::from(vals)),
+            )
+        };
+        let field = Field::new(&column, data_type, true).with_metadata(HashMap::from([
+            ("metric".to_string(), metric.to_string()),
+            ("metric_type".to_string(), kind.to_string()),
+            (key.to_string(), value.to_string()),
+        ]));
+        let mut fields = vec![(
+            Field::new("timestamp", DataType::UInt64, false),
+            Arc::new(UInt64Array::from(ts.clone())) as ArrayRef,
+        )];
+        fields.push((field, array));
+        fields.extend(window_cols(&column, &ts));
+        ParquetReader::open_bytes_with_pool(build_table(fields), pool()).unwrap()
+    }
+
+    /// The `storage` label of each result series, with its last value.
+    fn last_by_storage(r: &QueryResult) -> BTreeMap<String, f64> {
+        let json = serde_json::to_value(r).unwrap();
+        json["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                let storage = s["metric"]["storage"].as_str().unwrap().to_string();
+                let last = s["values"].as_array().unwrap().last().unwrap()[1]
+                    .as_f64()
+                    .unwrap();
+                (storage, last)
+            })
+            .collect()
+    }
+
     #[test]
-    fn try_new_rejects_a_name_present_in_more_than_one_child() {
+    fn try_new_joins_a_name_whose_children_hold_different_series() {
+        // One metric family read in two acquisition groups, each over its own
+        // population: the same name, told apart by a label.
+        let ebs = labeled_table("drive_exceeded_time", "storage", "ebs", 10, false);
+        let local = labeled_table(
+            "drive_exceeded_time",
+            "storage",
+            "instance_store",
+            30,
+            false,
+        );
+        let union =
+            UnionMetricsSource::try_new(vec![UnionChild::from(&ebs), UnionChild::from(&local)])
+                .expect("two children holding different series of one name are disjoint");
+
+        assert_eq!(union.counter_names(), ["drive_exceeded_time"]);
+        assert_eq!(union.counter_labels("drive_exceeded_time").len(), 2);
+        let r = union
+            .query_range("rate(drive_exceeded_time[2s])", 2.0, 5.0, 1.0)
+            .unwrap();
+        assert_eq!(
+            last_by_storage(&r),
+            BTreeMap::from([
+                ("ebs".to_string(), 10.0),
+                ("instance_store".to_string(), 30.0)
+            ])
+        );
+        // A selector matching one child's series reads that child alone.
+        let r = union
+            .query_range(
+                "rate(drive_exceeded_time{storage=\"ebs\"}[2s])",
+                2.0,
+                5.0,
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(
+            last_by_storage(&r),
+            BTreeMap::from([("ebs".to_string(), 10.0)])
+        );
+    }
+
+    #[test]
+    fn try_new_joins_a_gauge_whose_children_hold_different_series() {
+        let ebs = labeled_table("drive_queue_length", "storage", "ebs", 1, true);
+        let local = labeled_table("drive_queue_length", "storage", "instance_store", 2, true);
+        let union =
+            UnionMetricsSource::try_new(vec![UnionChild::from(&ebs), UnionChild::from(&local)])
+                .expect("two children holding different series of one name are disjoint");
+        let r = union
+            .query_range("drive_queue_length", 1.0, 5.0, 1.0)
+            .unwrap();
+        assert_eq!(
+            last_by_storage(&r),
+            BTreeMap::from([
+                ("ebs".to_string(), 4.0),
+                ("instance_store".to_string(), 8.0)
+            ])
+        );
+    }
+
+    #[test]
+    fn try_new_rejects_one_series_present_in_more_than_one_child() {
+        let a = labeled_table("drive_exceeded_time", "storage", "ebs", 10, false);
+        let b = labeled_table("drive_exceeded_time", "storage", "ebs", 30, false);
+        let Err(err) =
+            UnionMetricsSource::try_new(vec![UnionChild::from(&a), UnionChild::from(&b)])
+        else {
+            panic!("one series in two children must be rejected");
+        };
+        assert_eq!(
+            err,
+            UnionError::NonDisjoint {
+                duplicates: vec!["drive_exceeded_time".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn try_new_rejects_an_unlabelled_series_present_in_more_than_one_child() {
         // I2: the checking constructor must catch what `new`'s first-wins
         // policy would otherwise hide — a producer/archive bug that put the
-        // same metric name in two "disjoint" children.
+        // same series (here the unlabelled one) in two "disjoint" children.
         let a = counter_table("cpu_cycles", 3);
         let b = counter_table("cpu_cycles", 3); // same name, different child
         let Err(err) =
             UnionMetricsSource::try_new(vec![UnionChild::from(&a), UnionChild::from(&b)])
         else {
-            panic!("a name present in two children must be rejected");
+            panic!("an unlabelled series present in two children must be rejected");
         };
         assert_eq!(
             err,
