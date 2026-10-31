@@ -1,0 +1,18 @@
+[package]
+name = "metriken-charts"
+version = "0.1.0"
+edition = "2021"
+authors = [
+    "Brian Martin <brian@iop.systems>",
+]
+license = "Apache-2.0"
+description = "Browser chart modules for metriken recordings, as files a server can embed and serve"
+homepage = "https://github.com/iopsystems/metriken"
+repository = "https://github.com/iopsystems/metriken"
+build = "build.rs"
+# The node tests are for working on the chart code; a dependent needs only
+# the assets and the crate.
+exclude = ["tests/*.mjs"]
+
+[dependencies]
+include_dir = "0.7.4"

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-charts 0.1.0
+
+- **Added:** the crate. It holds the rezolus viewer's chart modules
+  (`assets/charts/`) and `assets/charts.css`, copied from rezolus at
+  782383b0. ECharts 6.1.0 is bundled; NOTICE and LICENSE-d3 carry its
+  notices. `ASSETS` embeds `assets/` as an `include_dir` 0.7 `Dir`, and
+  `ASSETS_PATH` is the directory on the build machine. The modules import
+  nothing outside `assets/charts/`; a page supplies its data layer, theme
+  version and events through `charts/host.js`. 26 of rezolus's node test
+  files came with them (`node --test metriken-charts/tests/*.mjs`).
+
 ### metriken 0.11.5
 
 - **Changed:** requires `histogram` 1.6.3 (was 1.4.1). 1.6.2 inlines the
