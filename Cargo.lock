@@ -1339,6 +1339,8 @@ name = "metriken-charts"
 version = "0.1.0"
 dependencies = [
  "include_dir",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

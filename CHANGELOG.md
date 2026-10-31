@@ -11,12 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Added:** the crate. It holds the rezolus viewer's chart modules
   (`assets/charts/`) and `assets/charts.css`, copied from rezolus at
-  782383b0. ECharts 6.1.0 is bundled; NOTICE and LICENSE-d3 carry its
+  3ca68c43. ECharts 6.1.0 is bundled; NOTICE and LICENSE-d3 carry its
   notices. `ASSETS` embeds `assets/` as an `include_dir` 0.7 `Dir`, and
   `ASSETS_PATH` is the directory on the build machine. The modules import
   nothing outside `assets/charts/`; a page supplies its data layer, theme
   version and events through `charts/host.js`. 26 of rezolus's node test
   files came with them (`node --test metriken-charts/tests/*.mjs`).
+- **Added:** `metriken_charts::plot`, which builds the plot spec a chart
+  renders, from the types in rezolus's `dashboard` crate. `Plot::gauge`,
+  `Plot::counter`, `Plot::histogram` and `Plot::histogram_latency` return
+  a `PlotBuilder`, whose `build(query)` returns the `Plot`. `query`,
+  `total_query` and `scope` read a `Plot`, and `queries_mut` and
+  `set_scope` are for a page that rewrites queries after building. `Unit`,
+  `HistogramView` (the `Plot::histogram` view) and `ChartStyle` (for
+  `with_style`) name what the chart modules accept; each is
+  `#[non_exhaustive]`, so a value added on the JS side is not a breaking
+  change. The spec's JSON is the same as rezolus's at 3ca68c43 for the
+  fields `Plot` holds; a plot's width in the page grid and the A/B
+  experiment query are not part of `Plot`.
 
 ### metriken 0.11.5
 

@@ -5,7 +5,9 @@ serve. These are the charts the rezolus viewer draws: line, multi-series,
 percentile scatter, heatmaps and histogram heatmaps, with zoom, tooltips,
 event markers and display-mode (decimated) data.
 
-The crate exports `ASSETS`, `ASSETS_PATH` and the `include_dir` crate.
+The crate exports `ASSETS`, `ASSETS_PATH`, the `include_dir` crate, and the
+`plot` module, which builds plot specs in Rust (see "Building a spec in
+Rust").
 `ASSETS` embeds `assets/` with `include_dir` 0.7 (re-exported as
 `metriken_charts::include_dir`), and `ASSETS_PATH` names the directory on the
 machine that built the crate:
@@ -93,6 +95,48 @@ entries between the first and the last.
 `data` (`[timestamps_s, values...]`), or display-mode data written by
 `applyDisplayToPlot` in `charts/display.js`. `ChartsState` holds zoom shared by
 the charts given the same instance.
+
+## Building a spec in Rust
+
+A `Plot` describes what one chart shows and how: its query, metric type, unit
+system and axis format. A `Chart` renders it. `metriken_charts::plot` builds
+a `Plot` and serializes it with serde, as the `spec` a `Chart` takes.
+
+`Plot::gauge`, `Plot::counter`, `Plot::histogram` and `Plot::histogram_latency`
+return a `PlotBuilder`. Its methods set the presentation (`with_description`,
+`with_log_scale`, `range` and the rest), the total query (`with_total_query`)
+and the scope (`with_scope`), and `build(query)` returns the `Plot`. Three
+enums name what the chart modules accept, and tests fail if they differ from
+the JS:
+
+- `Unit`: the keys of `UNIT_SYSTEMS` in `charts/util/units.js`.
+- `HistogramView`: how a histogram plot is drawn (`percentiles`, `buckets`,
+  `quantile_heatmap`), passed to `Plot::histogram`.
+- `ChartStyle`: the styles `charts/chart.js` dispatches on, passed to
+  `with_style`.
+
+Each is `#[non_exhaustive]` and parses from its JSON name with `FromStr`.
+
+```rust
+use metriken_charts::{Plot, Unit};
+
+let plot = Plot::counter("Requests/s", "requests", Unit::Rate)
+    .with_description("All endpoints")
+    .build("sum(irate(requests[5m]))");
+let spec = serde_json::to_string(&plot)?;
+```
+
+A serialized `Plot` has `data: []`. The page runs the query, wrapped by
+`buildHistogramQuery` in `charts/metric_types.js` for a histogram plot, and
+writes the result into `data` or, in display mode, through
+`applyDisplayToPlot`, before it hands the spec to a chart.
+
+Placing plots on a page is not in this crate: grouping them into sections, a
+plot's width in the page's grid, and a second query for comparing two
+recordings. A page that needs extra fields in the spec can serialize a
+struct that holds the `Plot` under `#[serde(flatten)]` beside them.
+`charts/source_metric.js` sets `width: 'full'` in the spec it builds, for a
+page whose layout reads it.
 
 ## Display mode
 
