@@ -21,26 +21,18 @@ use crate::Metric;
 /// This type is thread-safe and can be used in statics.
 ///
 /// # Example
-/// In this example, [`Heatmap`] does not have a const `new` function so it
-/// must be constructed using [`Lazy`].
+/// A metric in a [`Lazy`] is not exported until it is first written:
+/// before then [`Metric::is_enabled`] is `false`.
 /// ```
-/// # #[cfg(feature = "heatmap")]
-/// # fn main() {
-/// # use metriken::*;
-/// #[metric]
-/// static HEATMAP: Lazy<Heatmap> = Lazy::new(|| {
-///     Heatmap::new(
-///         100,
-///         2,
-///         Duration::<Nanoseconds<u64>>::from_secs(30),
-///         Duration::<Nanoseconds<u64>>::from_secs(1),
-///     )
-/// });
-/// # }
-/// # #[cfg(not(feature = "heatmap"))] fn main() {}
-/// ```
+/// use metriken::{metric, Counter, Lazy, Metric};
 ///
-/// [`Heatmap`]: crate::Heatmap;
+/// #[metric(name = "example.requests")]
+/// static REQUESTS: Lazy<Counter> = Lazy::new(Counter::new);
+///
+/// assert!(!REQUESTS.is_enabled());
+/// REQUESTS.increment();
+/// assert!(REQUESTS.is_enabled());
+/// ```
 pub struct Lazy<T, F = fn() -> T> {
     cell: OnceCell<T>,
     func: Cell<Option<F>>,

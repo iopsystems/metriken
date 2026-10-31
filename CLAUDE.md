@@ -24,11 +24,12 @@ rustfmt.toml settings: `wrap_comments = true`, `imports_granularity = "module"`,
 
 ## Workspace Crates
 
-Nine crates. Each depends (normal dependencies, optional ones included) on the crates after its arrow:
+Ten crates. Each depends (normal dependencies, optional ones included) on the crates after its arrow:
 
 ```
 metriken-types
 metriken-derive
+metriken-charts
 metriken-core        -> metriken-types
 metriken-model       -> metriken-types
 metriken             -> metriken-core, metriken-derive, metriken-types
@@ -41,6 +42,7 @@ metriken-recorder    -> metriken, metriken-exposition, metriken-model, metriken-
 `metriken-storage` also has a path-only dev-dependency on `metriken-query`, which `cargo publish` strips. Regenerate the list with `cargo metadata --format-version 1 --no-deps` when a dependency changes (filter `.packages[].dependencies` to workspace members whose `kind` is null).
 
 - **metriken-types** — Types shared by the metriken registry and the readers of what it records.
+- **metriken-charts** — Browser chart modules (ES modules on ECharts) and their stylesheet, embedded with `include_dir` for a server to serve. Its node tests run with `node --test metriken-charts/tests/*.mjs`.
 - **metriken-model** — The observation model: snapshots, group schemas, the rows a recording stores, and the stream's wire names.
 - **metriken-storage** — Storage for recordings: the segment format, column readers, and the dendro and `.rez` archives.
 - **metriken-core** — `Metric` trait, `Value` enum, `MetricEntry`, global `METRICS` distributed slice (linkme), dynamic metrics registry, type-based request/provide system. Uses `links = "metriken-core"` to enforce single version at compile time.

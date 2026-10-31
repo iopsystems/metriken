@@ -319,11 +319,13 @@ pub enum Snapshot {
 
 /// Rebuild a decoded histogram through the validating constructor,
 /// returning `None` if the embedded config/bucket data violates an
-/// invariant that raw `Deserialize` cannot enforce (e.g. `grouping_power >=
-/// max_value_power`, or a bucket count that disagrees with the config).
-/// Used by [`Snapshot::histograms`] (all versions) so a malformed decoded
-/// histogram is dropped rather than handed to a caller, where it could
-/// panic in `iter()`/`quantiles()` or produce garbage bounds.
+/// invariant (e.g. `grouping_power >= max_value_power`, or a bucket count
+/// that disagrees with the config). `histogram`'s `Deserialize` (since
+/// 1.6.0) runs these checks and also rejects derived config fields that
+/// differ from `Config::new`'s (1.6.3 accepts the pre-0.11.4 `max`), so a
+/// decoded histogram always passes; this is a second check, used by [`Snapshot::histograms`] (all versions) so a
+/// malformed histogram is never handed to a caller, where it could panic in
+/// `iter()`/`quantiles()` or produce garbage bounds.
 fn canonicalize_histogram(value: histogram::Histogram) -> Option<histogram::Histogram> {
     let cfg = value.config();
     histogram::Histogram::from_buckets(
@@ -449,15 +451,15 @@ impl Snapshot {
     // borrows `g.schema`, so calling all three in sequence on one snapshot
     // is safe and produces no duplication.
     //
-    // Histograms get one more layer of hardening, applied for ALL versions
-    // (V1/V2/V3): `histogram::Histogram`'s `Deserialize` is a naive derive
-    // over raw fields, so a decoded value can violate invariants that only
-    // the validating constructors (`Config::new`/`from_buckets`) enforce —
-    // this produces shift-overflow panics in `iter()`/`quantiles()` (debug),
-    // garbage bounds (release), or downstream `unwrap` panics. Every
-    // histogram handed out by `histograms()` is rebuilt through
-    // `histogram::Histogram::from_buckets` first; one that fails is dropped
-    // rather than exposed. See [`canonicalize_histogram`].
+    // Histograms: `histogram::Histogram`'s `Deserialize` (since 1.6.0)
+    // rebuilds the value through `Config::new`/`from_buckets`, so a snapshot
+    // that carries an invariant-violating histogram fails to decode as a
+    // whole. A value that violated them would
+    // produce shift-overflow panics in `iter()`/`quantiles()` (debug),
+    // garbage bounds (release), or downstream `unwrap` panics. As a second
+    // check, applied for ALL versions (V1/V2/V3), every histogram handed out
+    // by `histograms()` is rebuilt through `from_buckets` first and dropped if
+    // that fails. See [`canonicalize_histogram`].
 
     pub fn counters(&mut self) -> Vec<Counter> {
         match self {
@@ -1206,55 +1208,36 @@ mod v3_tests {
     }
 
     #[test]
-    fn malformed_histogram_is_dropped_at_expansion() {
-        // `histogram::Histogram`'s fields are private, so there is no public
-        // constructor that lets a test build an invariant-violating value
-        // directly. The route in: rmp-serde encodes a plain struct exactly
-        // like a same-arity tuple (positionally, compact msgpack — the same
-        // trick `truncated_arrays_error_not_misdecode` above relies on), so
-        // a tuple shaped like `(Config's 8 private fields, buckets)` decodes
-        // as a `Histogram` without ever passing through
-        // `Config::new`/`from_buckets`. Set `grouping_power` (200) >=
-        // `max_value_power` (64) — exactly the invariant those constructors
-        // reject.
+    fn malformed_histogram_is_rejected_at_decode() {
+        // `histogram::Histogram`'s fields are private, so the only way to
+        // present an invariant-violating value is on the wire. rmp-serde
+        // encodes a plain struct exactly like a same-arity tuple
+        // (positionally, compact msgpack — the same trick
+        // `truncated_arrays_error_not_misdecode` above relies on), so a tuple
+        // shaped like `(Config's 8 fields, buckets)` is read as a `Histogram`.
+        // Set `grouping_power` (200) >= `max_value_power` (64), the invariant
+        // `Config::new` rejects. `histogram`'s `Deserialize` validates, so
+        // the value is refused at decode and never reaches
+        // `Snapshot::histograms`.
         #[allow(clippy::type_complexity)]
         type FakeConfig = (u64, u8, u8, u8, u64, u32, u32, u32);
         let fake_config: FakeConfig = (0, 200, 64, 0, 0, 0, 0, 0);
         let fake: (FakeConfig, Vec<u64>) = (fake_config, vec![0; 4]);
         let bytes = rmp_serde::to_vec(&fake).unwrap();
-        let bad: histogram::Histogram = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(rmp_serde::from_slice::<histogram::Histogram>(&bytes).is_err());
 
-        let mut good = histogram::Histogram::new(3, 64).unwrap();
-        good.increment(10).unwrap();
+        // Inside a containing value, the whole decode fails.
+        let outer = rmp_serde::to_vec(&(7u8, fake)).unwrap();
+        assert!(rmp_serde::from_slice::<(u8, histogram::Histogram)>(&outer).is_err());
 
-        let schema = GroupSchema {
-            counters: vec![],
-            gauges: vec![],
-            histograms: vec![desc("0", "bad"), desc("1", "good")],
-            gauge_histograms: Vec::new(),
-        };
-        let group = GroupSnapshot {
-            name: "hist/group".to_string(),
-            schema_hash: schema.hash(),
-            schema: Some(Arc::new(schema)),
-            window: None,
-            counters: vec![],
-            gauges: vec![],
-            histograms: vec![Some(bad), Some(good.clone())],
-            gauge_histograms: Vec::new(),
-        };
-        let s = SnapshotV3 {
-            systemtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
-            duration: Duration::from_millis(10),
-            metadata: HashMap::new(),
-            groups: vec![group],
-        };
-        let mut snap = Snapshot::V3(s);
-
-        let histograms = snap.histograms(); // must not panic on the bad one
-        assert_eq!(histograms.len(), 1, "the malformed histogram is dropped");
-        assert_eq!(histograms[0].name, "1");
-        assert_eq!(histograms[0].value, good);
+        // The same encoding with a valid config decodes, so the rejection
+        // above is the invariant check and not a layout mismatch.
+        let good = histogram::Histogram::new(3, 64).unwrap();
+        let good_bytes = rmp_serde::to_vec(&good).unwrap();
+        let decoded: histogram::Histogram = rmp_serde::from_slice(&good_bytes).unwrap();
+        assert_eq!(decoded, good);
+        let (cfg_fields, _): (FakeConfig, Vec<u64>) = rmp_serde::from_slice(&good_bytes).unwrap();
+        assert_eq!((cfg_fields.1, cfg_fields.2), (3, 64));
     }
 
     #[test]

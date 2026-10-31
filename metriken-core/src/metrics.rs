@@ -34,8 +34,8 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    /// A list containing all metrics that were registered via the [`metric`]
-    /// attribute macro.
+    /// A list containing all metrics that were registered via the `metric`
+    /// attribute macro (`metriken::metric`).
     ///
     /// Note that the entries may be in any order and that this order may
     /// change depending on compiler settings and the linker you are using.

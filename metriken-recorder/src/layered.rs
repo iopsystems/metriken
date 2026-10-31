@@ -226,6 +226,7 @@ pub(crate) fn producer(
 /// (`metriken.producer.name`), else its `source` label, which a producer
 /// written before the identity keys declares itself by. `None` when it
 /// names none.
+#[cfg_attr(not(feature = "http"), allow(dead_code))]
 pub(crate) fn producer_name(
     labels: &BTreeMap<String, String>,
     metadata: &BTreeMap<String, String>,

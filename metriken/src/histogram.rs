@@ -7,8 +7,8 @@ use parking_lot::RwLock;
 use crate::{HistogramMetric, Metric, Value};
 
 /// A histogram that uses free-running atomic counters to track the distribution
-/// of values. They are only useful for recording values and producing
-/// [`crate::Snapshot`]s of the histogram state which can then be used for
+/// of values. It is only useful for recording values and producing snapshots
+/// ([`Histogram`]) of the histogram state, which can then be used for
 /// reporting.
 ///
 /// The `AtomicCounterHistogram` should be preferred when individual events are being
@@ -20,7 +20,7 @@ pub struct AtomicCounterHistogram {
 }
 
 impl AtomicCounterHistogram {
-    /// Create a new [`::histogram::AtomicHistogram`] with the given parameters.
+    /// Create a new `AtomicCounterHistogram` with the given parameters.
     ///
     /// # Panics
     /// This will panic if the `grouping_power` and `max_value_power` do not
@@ -100,9 +100,9 @@ struct HistogramState {
 }
 
 /// A histogram that uses free-running non-atomic counters to track the
-/// distribution of values. They are only useful for bulk recording of values
-/// and producing [`crate::Snapshot`]s of the histogram state which can then be
-/// used for reporting.
+/// distribution of values. It is only useful for bulk recording of values and
+/// producing snapshots ([`Histogram`]) of the histogram state, which can then
+/// be used for reporting.
 ///
 /// The `AtomicCounterHistogram` should be preferred when individual events are being
 /// recorded. The `RwLockCounterHistogram` should be preferred when bulk-updating the
@@ -113,7 +113,7 @@ pub struct RwLockCounterHistogram {
 }
 
 impl RwLockCounterHistogram {
-    /// Create a new [`::histogram::AtomicHistogram`] with the given parameters.
+    /// Create a new `RwLockCounterHistogram` with the given parameters.
     ///
     /// # Panics
     /// This will panic if the `grouping_power` and `max_value_power` do not
