@@ -43,8 +43,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gained 1.02x to 1.05x, and the shared `AtomicCounterHistogram` at 8
   threads ran at 0.58x (63 to 37 million values/s per thread; 1.6.3's five
   runs were 45 to 65). With values from 50,000..150,000 both versions
-  record 37 to 39 million values/s per thread in that case. We have not
-  found the cause of the drop.
+  record 37 to 39 million values/s per thread in that case. In a second set
+  of runs with 2 or 4 threads sharing one histogram, 1.6.4 ran at 0.81x to
+  0.87x on either value range. We think the shorter index computation puts
+  each thread's locked adds closer together, so the threads contend more on
+  the shared buckets; added work between increments supported this on the
+  wide range and not on the narrow one, so the cause is not confirmed. A
+  histogram written from several threads on a hot path should use
+  `ShardedCounterHistogram`.
 - **Added:** `ShardedCounterHistogram` and `ShardedCounterHistogramGroup`, the
   histogram counterparts to `ShardedCounterGroup`. Each thread records into
   its own shard, and reads merge the shards. A shard's buckets are allocated
