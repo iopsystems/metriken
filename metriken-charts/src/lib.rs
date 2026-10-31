@@ -19,7 +19,7 @@
 
 pub mod plot;
 
-pub use plot::{Plot, PlotOpts, PlotWidth, Unit};
+pub use plot::{ChartStyle, HistogramView, Plot, PlotBuilder, Unit};
 
 use ::include_dir::Dir;
 /// The `include_dir` version [`ASSETS`] is a [`Dir`] of, so a caller names the
