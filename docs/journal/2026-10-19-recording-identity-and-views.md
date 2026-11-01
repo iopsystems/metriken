@@ -9,14 +9,17 @@ S9 in metriken" below) are done, and built for histograms (2b); the producer ide
 `producer_identity!`, the identity layers in metriken-storage (#326),
 metriken-recorder writing them (step 2), and the catalog index's names and
 label listings (step 2), the label overlay, the query scope, conflicts (S4)
-and the template evaluation rule are built and unreleased; nothing else is
-built. The
+and the template evaluation rule are built and unreleased; in rezolus,
+the engine scope in the combined view (step 3.2), the upgrade split and the
+registry templates without `source=` (rezolus #1634, #1635) are built and
+unreleased; nothing else is built. The
 owner decided on 2026-10-28 that the next metriken-storage release is a minor
 version (0.6.0), since 0.5.4 and earlier do not read the names index. The owner
 decided Q1, Q2, Q7 and Q8 on 2026-10-26, and amended A8 and
 decided Q3, the layer entries and Q40 on 2026-10-27; Q1 was amended with the
 producer identity keys on 2026-10-27. Q9 and Q37 were decided on
-2026-10-28. "Step N" means this entry's order of work.
+2026-10-28. Q19 was decided on 2026-10-31. "Step N" means this entry's
+order of work.
 Follows the metriken-viewer entry's Q11 (how an archive of several
 recordings from one run opens) and Q12 (templates travel in the producer's
 handshake) ([metriken-viewer](2026-10-12-metriken-viewer.md)), and rezolus's
@@ -692,9 +695,10 @@ Names:
   read rule below reads a legacy `source` (a registry match, else `alias`). The
   probe hook's `source=rezolus` is the recorder's own and is not written; the
   agent's handshake declares the same value in the producer layer. A registry
-  template's `source=` matchers keep matching a user-given name through step
-  3.3. A 5.x reader's template lookup by `source` is not kept working; this
-  work does not provide forward compatibility (Q3).
+  template's `source=` matchers keep matching a user-given name until step
+  3.3 removes them (rezolus #1635). A 5.x reader's template lookup by
+  `source` is not kept working; this work does not provide forward
+  compatibility (Q3).
 - **Read rule for recordings made before this.** An old recording does not say
   who set its `source`: metriken-recorder reports `inferred` in `Event::Active`
   only (`recorder.rs:201-207`), and nothing in the archive records it. So
@@ -2027,18 +2031,25 @@ export; W12 → MCP, `recording check`, P7; W13 → static site.
   by `scope_matchers` and `restrict_query`, to be replaced by the engine
   scope of D1). MCP evaluates templates only in `run_checks`
   (`src/mcp/server.rs`), which goes through `recording check`'s
-  per-recording path. Unrestricted today: a combined parquet
-  (`label_parquet_by_source`, `combined.rs:1310`, returns the reader
-  unchanged when `source` is a JSON array), A/B tarballs, and every released
-  rezolus (5.x, through v5.28.0; no 6.0 prerelease is tagged). Any of those
-  evaluates a template without `source=` against series it was not written
-  for, and one reading several recordings sums them. So templates keep their
-  `source=` matchers until a recording declares a template schema that only
-  restricting readers accept (Q19). The order is: the restriction
-  everywhere, released; then templates without `source=`, dropping the 215
-  matchers and the cachecannon and llm-perf tests that require them
-  (cachecannon's `every_metric_selects_the_handshakes_source`,
-  `src/admin/template.rs:125`, is one).
+  per-recording path. In rezolus 6.x (checked 2026-10-31, at alpha.103)
+  every path restricts except `view --tui` (corrected 2026-11-01: the TUI
+  dropped each plot's scope and read the joined reader; fixed in rezolus
+  #1635): the combined view gives each built-in and
+  `/service/` route its recording's scope (`build_combined_context`), in
+  both viewers; `recording check`, MCP `run_checks` and `recording
+  annotate`'s KPI probe each open one reader per read group
+  (`RezReader::open_recordings`); a comparison's arms are separate read
+  groups, and attaching an experiment over a combined baseline is refused;
+  MCP's joined reader runs no template. 6.x opens no parquet, `.rez` or A/B
+  tarball until `recording upgrade` converts it, and the upgrade splits a
+  combined parquet into its inputs (Q19). Released readers (5.x) are not
+  protected (Q19). The order is: the upgrade split; then templates without
+  `source=`, dropping the 215 matchers in the registry templates
+  (`crates/dashboard/templates/`) and the cachecannon and llm-perf tests
+  that require them (cachecannon's
+  `every_metric_selects_the_handshakes_source`, `src/admin/template.rs:125`,
+  is one). The rezolus agent's own section template, which it sends in its
+  stream handshake under `dashboard` (#1497), has no `source=` matchers.
 - **Producer-layer and registry-layer templates are evaluated against the
   series' own labels, falling back to the recording's labels for a key the
   series does not carry; on a key both carry, the template matches the
@@ -2722,6 +2733,34 @@ Templates:
   combined parquet by each `per_source_metadata` source, `:302-311`; for a
   single file by the top-level `source`, `:313-320`), so (c) degrades to
   (b) without a notice.
+  Decided 2026-10-31: no schema and no marker; released readers are not
+  protected. The cases a released reader can still meet are narrow. 5.x
+  opens no archive dendro 0.6 writes (Closed, was V9 below), so a template
+  carried in a 6.x `.dendro` never reaches it. A single-source parquet
+  holds one source's series, so evaluating its template unrestricted
+  gives the restricted result. 5.x `recording combine`, and 5.x `record`
+  of several endpoints, which combines through the same function, drop a
+  single input's top-level `service_queries` (v5.29.2 `merge_metadata`),
+  so a 5.x-combined parquet carries no producer template. What remains: a
+  parquet combined by a rezolus main build between rezolus #1501 (combine
+  carries templates) and #1538 (combine writes `.dendro` only), holding an
+  updated producer's template without `source=`, viewed in 5.x or upgraded
+  before #1634; and a 5.x-combined parquet that 5.x `recording annotate
+  --queries` has given a template without `source=`, which 5.x reads
+  first. In either the template reads every input's series of the metrics
+  it names. Those cases are accepted: the first needs a main build from
+  that window (6.0.0-alpha.62 to .64), and no 6.0 alpha was released. The
+  owner decided the same day that no 6.x prerelease is needed before
+  templates drop `source=`. `service_queries` keeps its name and format,
+  and producers drop `source=` from their own templates when they choose.
+  Raised with it and decided the same day: `recording upgrade` splits a
+  5.x combined parquet into one source per input file (rezolus #1634).
+  The converter had written it as one source, a single read group whose
+  series carry their own `source` labels, so its services' templates were
+  evaluated against every input's series and only their `source=`
+  matchers kept them apart. The alternatives were the readers restricting
+  by `source` within one read group, in each of the viewer, `recording
+  check` and MCP, or accepting the sum.
 - **Q20.** Where the registry layer sits in the stack. Candidates: (a) the
   registry layer is present only when the producer layer is absent or does
   not parse, which is today's whole-template fallback and keeps an old
@@ -2891,7 +2930,7 @@ Views:
   editable or removable; (b) the scope is written into the text as
   matchers on copy, which brings back the splicing D1 removes for this one
   path; (c) the scope is dropped and the query reads every recording. (a)
-  is the proposed answer.
+  is the proposed answer. Decided 2026-10-30: (a), built in rezolus #1622.
 - **Q34.** Retried attempts. Each attempt of a retried systemslab job is a
   separate set of recordings. Candidates for marking a superseded attempt:
   (a) a user label (`superseded=true`) as a user entry on the superseded
@@ -3186,14 +3225,23 @@ written by the new dendro.
      archive. rezolus does not call them yet (step 3).
 3. rezolus, in this order:
    1. ~~Open and merge the combined view.~~ Done: #1504.
-   2. The restriction as the engine scope (D1) in both viewers' query APIs
-      and the frontend (replacing `applyScope`'s use of `injectLabel` and
-      `metadata.scope`), stored queries carrying their scope, combined
-      parquets and A/B tarballs (or retire `--ab` tarballs), with
-      `restrict_query`'s pin rule removed; released. Needs: step 2's scope,
-      Q30, Q32.
+   2. ~~The restriction as the engine scope (D1) in both viewers' query
+      APIs and the frontend, stored queries carrying their scope, with
+      `restrict_query`'s pin rule removed.~~ Done: #1620 (a range query's
+      scope), #1621 (a combined view's charts read through a scope;
+      `applyScope` removed; selections and reports keep the scope), #1622
+      (the expanded chart's scope, Q32). Combined parquets and A/B tarballs
+      are opened only after `recording upgrade`; the upgrade split is step
+      3.3's first change. Not released: the owner decided on 2026-10-31 that
+      no prerelease is needed for step 3.3 (Q19). Q30 is still open.
    3. Templates without `source=` (cachecannon and llm-perf in the same
-      step), behind the template schema of Q19. Needs: Q19.
+      step): `recording upgrade` splitting a combined parquet (rezolus
+      #1634); then the registry templates' 215 `source=` matchers
+      removed, and the tests that require them changed (rezolus #1635,
+      which also makes `view --tui` read each plot through its scope: the
+      matchers had kept a TUI service section to its recording); the same
+      for cachecannon (cachecannon #272) and llm-perf (llm-perf #203), both
+      open as of 2026-11-01.
    4. `alias`, `tier`, `service_kind` and per-endpoint labels in `record`, and
       the layers; the template-to-recording binding in `recording check` by
       kind; template lookup by kind for the registry layer; template and label
