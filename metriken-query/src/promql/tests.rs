@@ -4950,3 +4950,259 @@ fn an_escape_or_a_comment_does_not_hide_a_histogram_call() {
         assert_eq!(result.len(), 1, "{q}: {result:?}");
     }
 }
+
+/// Counters `cgroup_cpu_usage{name, state}` climbing by `rate`/s, each
+/// read through a 10 ms acquisition window, and gauges
+/// `thread_info{pid, name}` = 1 beside counters `task_cpu_usage{pid, comm}`.
+fn create_relabel_source() -> Memory {
+    let mut source = Memory::new(1000);
+    let ts: Vec<u64> = (0u64..6).map(|s| (1000 + s) * 1_000_000_000).collect();
+    let windows: Vec<(u64, u64)> = ts.iter().map(|t| (t - 10_000_000, *t)).collect();
+    let counter = |labels: &[(&str, &str)], rate: u64| Counter {
+        labels: make_labels(labels),
+        timestamps: ts.clone(),
+        values: (0u64..6).map(|s| s * rate).collect(),
+        windows: Some(windows.clone()),
+    };
+    for (name, rate) in [
+        ("/system.slice/a.service", 1u64),
+        ("/system.slice/a.service/x", 2),
+        ("/system.slice/a.service/y", 4),
+        ("/system.slice/b.service", 8),
+        ("/user.slice", 16),
+    ] {
+        for (state, scale) in [("user", 1), ("system", 100)] {
+            source.add_counter(
+                "cgroup_cpu_usage",
+                counter(&[("name", name), ("state", state)], rate * scale),
+            );
+        }
+    }
+    for (pid, comm, name, rate) in [
+        ("10", "java", "pool-1-thread-1", 3u64),
+        ("11", "java", "pool-1-thread-2", 5),
+        ("12", "java", "", 7),
+    ] {
+        source.add_counter(
+            "task_cpu_usage",
+            counter(&[("pid", pid), ("comm", comm)], rate),
+        );
+        if !name.is_empty() {
+            source.add_gauge(
+                "thread_info",
+                Gauge {
+                    labels: make_labels(&[("pid", pid), ("name", name)]),
+                    timestamps: ts.clone(),
+                    values: vec![1; ts.len()],
+                    windows: None,
+                },
+            );
+        }
+    }
+    source
+}
+
+/// A series' labels (without `__name__`), its last value and whether every
+/// value carries a band.
+type Relabeled = (Vec<(String, String)>, f64, bool);
+
+/// Each series of `query` over [`create_relabel_source`], sorted by labels.
+fn relabel_query(query: &str) -> Result<Vec<Relabeled>, QueryError> {
+    let engine = QueryEngine::new(Arc::new(create_relabel_source()));
+    let QueryResult::Matrix { result, .. } = engine.query_range(query, 1002.0, 1005.0, 1.0)? else {
+        panic!("{query}: not a matrix");
+    };
+    let mut out: Vec<_> = result
+        .into_iter()
+        .map(|m| {
+            let mut labels: Vec<(String, String)> = m
+                .metric
+                .into_iter()
+                .filter(|(k, _)| k != "__name__")
+                .collect();
+            labels.sort();
+            let last = m.values.last().map_or(f64::NAN, |&(_, v)| v);
+            (labels, last, m.intervals.is_some())
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+fn kv(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    v.sort();
+    v
+}
+
+/// `label_replace` sets `dst` from the expanded replacement where `src`
+/// matches, anchored, leaves other series alone, and keeps values, bands
+/// and the metric name.
+#[test]
+fn label_replace_sets_a_label_where_the_source_matches() {
+    let q = r#"label_replace(irate(cgroup_cpu_usage{state="user"}[5s]), "unit", "$1", "name", "/system.slice/([^/]+)(/.*)?")"#;
+    let got = relabel_query(q).unwrap();
+    let plain = relabel_query(r#"irate(cgroup_cpu_usage{state="user"}[5s])"#).unwrap();
+    assert_eq!(got.len(), plain.len());
+    for ((labels, v, banded), (plain_labels, pv, plain_banded)) in got.iter().zip(&plain) {
+        assert_eq!((v, banded), (pv, plain_banded), "{labels:?}");
+        assert!(banded, "{labels:?}: the band survives");
+        let name = &plain_labels.iter().find(|(k, _)| k == "name").unwrap().1;
+        let unit = labels
+            .iter()
+            .find(|(k, _)| k == "unit")
+            .map(|(_, u)| u.as_str());
+        let want = name
+            .strip_prefix("/system.slice/")
+            .map(|rest| rest.split('/').next().unwrap());
+        assert_eq!(unit, want, "{name}");
+    }
+    let engine = QueryEngine::new(Arc::new(create_relabel_source()));
+    let QueryResult::Matrix { result, .. } = engine.query_range(q, 1002.0, 1005.0, 1.0).unwrap()
+    else {
+        panic!("not a matrix");
+    };
+    assert!(result
+        .iter()
+        .all(|m| m.metric.get("__name__").map(String::as_str) == Some("cgroup_cpu_usage")));
+    // `${name}` and a missing source label, which reads as "".
+    assert_eq!(
+        relabel_query(
+            r#"label_replace(irate(task_cpu_usage{pid="10"}[5s]), "who", "${c}-x", "missing", "(?P<c>)")"#
+        )
+        .unwrap(),
+        vec![(kv(&[("comm", "java"), ("pid", "10"), ("who", "-x")]), 3.0, true)]
+    );
+}
+
+/// The regex is anchored at both ends: a substring of the source value is
+/// not a match.
+#[test]
+fn label_replace_anchors_its_regex() {
+    assert_eq!(
+        relabel_query(
+            r#"label_replace(irate(task_cpu_usage{pid="10"}[5s]), "x", "y", "comm", "jav")"#
+        )
+        .unwrap(),
+        vec![(kv(&[("comm", "java"), ("pid", "10")]), 3.0, true)]
+    );
+}
+
+/// A replacement that expands to "" removes the label.
+#[test]
+fn label_replace_with_an_empty_result_removes_the_label() {
+    assert_eq!(
+        relabel_query(
+            r#"label_replace(irate(task_cpu_usage{pid="10"}[5s]), "comm", "", "comm", "java")"#
+        )
+        .unwrap(),
+        vec![(kv(&[("pid", "10")]), 3.0, true)]
+    );
+}
+
+/// Two series left with one label set are an error, as in Prometheus; a
+/// new label keeps them apart, and an aggregation by it sums a unit's
+/// cgroups (the query rezolus's cgroup selector needs).
+#[test]
+fn label_replace_refuses_two_series_with_one_label_set() {
+    let err = relabel_query(
+        r#"label_replace(irate(cgroup_cpu_usage{state="user"}[5s]), "name", "a", "name", "/system.slice/a.service(/.*)?")"#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("same labelset"), "{err}");
+    let grouped = relabel_query(
+        r#"sum by (group) (
+            label_replace(
+                label_replace(irate(cgroup_cpu_usage{state="user"}[5s]), "group", "$1", "name", "(.*)"),
+                "group", "/system.slice/a.service/", "name", "/system.slice/a.service(/.*)?"
+            )
+        )"#,
+    )
+    .unwrap();
+    assert_eq!(
+        grouped
+            .iter()
+            .map(|(l, v, banded)| (l[0].1.as_str(), *v, *banded))
+            .collect::<Vec<_>>(),
+        vec![
+            ("/system.slice/a.service/", 7.0, true),
+            ("/system.slice/b.service", 8.0, true),
+            ("/user.slice", 16.0, true),
+        ]
+    );
+}
+
+#[test]
+fn label_replace_refuses_bad_arguments() {
+    for (q, want) in [
+        (
+            r#"label_replace(irate(task_cpu_usage[5s]), "1x", "a", "pid", ".*")"#,
+            "invalid destination label name",
+        ),
+        (
+            r#"label_replace(irate(task_cpu_usage[5s]), "x", "a", "pid", "(")"#,
+            "invalid regular expression",
+        ),
+        (
+            r#"label_replace(irate(task_cpu_usage[5s]), "__name__", "a", "pid", ".*")"#,
+            "__name__ is not supported",
+        ),
+    ] {
+        let err = relabel_query(q).unwrap_err().to_string();
+        assert!(err.contains(want), "{q}: {err}");
+    }
+}
+
+/// `group_left(name)` attaches each thread's application name from
+/// `thread_info` to its CPU time, the join #290 asks for; a thread
+/// without a `thread_info` series is dropped, and the band survives the
+/// multiplication by an exact 1.
+#[test]
+fn group_left_joins_thread_names_onto_cpu_time() {
+    assert_eq!(
+        relabel_query("irate(task_cpu_usage[5s]) * on(pid) group_left(name) thread_info").unwrap(),
+        vec![
+            (
+                kv(&[("comm", "java"), ("name", "pool-1-thread-1"), ("pid", "10")]),
+                3.0,
+                true
+            ),
+            (
+                kv(&[("comm", "java"), ("name", "pool-1-thread-2"), ("pid", "11")]),
+                5.0,
+                true
+            ),
+        ]
+    );
+    // group_right puts the many side on the right: `thread_info * on(pid)
+    // group_right(name) irate(...)` is the same join.
+    assert_eq!(
+        relabel_query("thread_info * on(pid) group_right(name) irate(task_cpu_usage[5s])").unwrap(),
+        relabel_query("irate(task_cpu_usage[5s]) * on(pid) group_left(name) thread_info").unwrap()
+    );
+    // Without group_left, two cgroups of one state matching one series are
+    // refused; with it, each is divided by its state's total.
+    let err = relabel_query(
+        "irate(cgroup_cpu_usage[5s]) / on(state) sum by (state) (irate(cgroup_cpu_usage[5s]))",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("multiple matches"), "{err}");
+    let shares = relabel_query(
+        "irate(cgroup_cpu_usage[5s]) / on(state) group_left sum by (state) (irate(cgroup_cpu_usage[5s]))",
+    )
+    .unwrap();
+    assert_eq!(shares.len(), 10);
+    for state in ["user", "system"] {
+        let total: f64 = shares
+            .iter()
+            .filter(|(l, _, _)| l.contains(&("state".to_string(), state.to_string())))
+            .map(|(_, v, _)| v)
+            .sum();
+        assert!((total - 1.0).abs() < 1e-9, "{state}: {total}");
+    }
+}

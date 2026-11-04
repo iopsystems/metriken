@@ -21,15 +21,17 @@
 //!   `GaugeAvgOverTime`, `GaugeIdelta`, `GaugeDeriv`.
 //! * Aggregations: `MergeReduce` reducer driven by [`AggOp`]
 //!   (sum/avg/min/max/count) with [`GroupBy`] (by/without).
-//! * Binary ops: `ScalarBroadcast` (matrix×scalar) and
-//!   `matrix_matrix_op` (matrix×matrix with on/ignoring).
+//! * Binary ops: `ScalarBroadcast` (matrix×scalar), `matrix_matrix_op`
+//!   (matrix×matrix with on/ignoring) and `matrix_grouped_op`
+//!   (`group_left`/`group_right`).
 //! * Histogram quantiles: `histogram::quantiles`.
 //!
 //! The dispatcher (`dispatch::try_streaming`) walks the parsed AST
-//! and assembles the pipeline for each recognised shape. Eager
-//! handlers in `promql::mod` cover the residual cases (heatmaps,
-//! one-side-eager binary ops, group_left/right, scalar/vector
-//! wrappers).
+//! and assembles the pipeline for each recognised shape. The histogram
+//! functions (`histogram_quantiles`, `histogram_percentiles`,
+//! `histogram_heatmap`, `histogram_irate`, `histogram_mean`,
+//! `histogram_count`, `histogram_sum`) are handled in `promql::mod` before
+//! dispatch.
 
 use std::collections::HashMap;
 
@@ -52,7 +54,8 @@ mod tests;
 pub(crate) use aggregate::derive_group_labels;
 pub(crate) use aggregate::{aggregate, AggOp, GroupBy};
 pub(crate) use binary::{
-    interval_binop, matrix_matrix_op, matrix_scalar_op, scalar_point, BinOp, MatchSpec,
+    braces, distinct_label_sets, interval_binop, matrix_grouped_op, matrix_matrix_op,
+    matrix_scalar_op, scalar_point, BinOp, MatchSpec, OneSide,
 };
 pub(crate) use gauge::{AtPoints, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid};
 pub(crate) use rate::{range_start, CounterGridRate, CounterPairwiseRate, SPACING_PROBE};

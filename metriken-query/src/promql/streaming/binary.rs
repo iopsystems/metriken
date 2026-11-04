@@ -19,10 +19,12 @@
 //! one unmatched right series of its recording, when there is exactly
 //! one ([`RightLookupBinary`] or [`Replay`]).
 //!
+//! * **Grouped joining** — [`matrix_grouped_op`] (`group_left`,
+//!   `group_right`) reads each series of the one side into memory once and
+//!   replays it against every series of the many side matching it.
+//!
 //! What's NOT covered here:
 //!
-//! * `group_left` / `group_right` (one-to-many matching) — needs an
-//!   iterator-tee mechanism that defeats streaming.
 //! * Comparison operators (`==`, `!=`, `<`, `>`, `<=`, `>=`) and
 //!   the `bool` modifier — not implemented in the eager engine
 //!   today either.
@@ -586,8 +588,8 @@ pub fn matrix_matrix_op<'a>(
         |(key, a, b)| {
             QueryError::EvaluationError(format!(
                 "multiple matches for labels: the left side holds {} and {}, which share the \
-             match group {}; group_left is not supported, so match on more labels or \
-             aggregate the left side",
+             match group {}; match on more labels, aggregate the left side, or use \
+             group_left",
                 braces(&a.inner),
                 braces(&b.inner),
                 braces(&key)
@@ -659,6 +661,113 @@ pub fn matrix_matrix_op<'a>(
         out.push(LabeledSeries::new(left.labels, iter));
     }
     Ok(out)
+}
+
+/// Which side of a grouped binary op has one series per match group:
+/// `group_left` makes it the right side, `group_right` the left.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum OneSide {
+    Right,
+    Left,
+}
+
+/// `left OP right` with `group_left(include)` ([`OneSide::Right`]) or
+/// `group_right(include)` ([`OneSide::Left`]), joined by the `spec`-derived
+/// match key.
+///
+/// The one side holds at most one series with points in the range per
+/// match key; each series of the other side (the many side) is paired with
+/// the one-side series of its key, and a many-side series without one is
+/// dropped. The result carries the many-side series' labels, and each label
+/// in `include` set to the one-side series' value, or removed where that
+/// series does not carry it. Two results with the same labels and points in
+/// the range are an error. As in [`matrix_matrix_op`], both checks cover
+/// the whole range where Prometheus checks each step.
+///
+/// Each one-side series is read once, into memory, whatever the number of
+/// many-side series paired with it.
+#[allow(clippy::too_many_arguments)]
+pub fn matrix_grouped_op<'a>(
+    left_set: SeriesSet<'a>,
+    right_set: SeriesSet<'a>,
+    op: BinOp,
+    spec: MatchSpec<'_>,
+    one_side: OneSide,
+    include: &[String],
+    join: Join,
+    start_ns: u64,
+) -> Result<SeriesSet<'a>, QueryError> {
+    let hold = match join {
+        Join::Latest(hold) => hold,
+        Join::Exact => 0,
+    };
+    let (many_set, one_set, side) = match one_side {
+        OneSide::Right => (left_set, right_set, "right"),
+        OneSide::Left => (right_set, left_set, "left"),
+    };
+    let one =
+        unique_by_key(keyed(one_set, spec), start_ns, hold, |_| true).map_err(|(key, a, b)| {
+            QueryError::EvaluationError(format!(
+                "many-to-many matching not allowed: the {side} side holds {} and {}, which \
+                 share the match group {}; matching labels must be unique on the {side} side",
+                braces(&a.inner),
+                braces(&b.inner),
+                braces(&key)
+            ))
+        })?;
+    let mut ones: HashMap<BTreeMap<String, String>, (Labels, Option<PointIter<'a>>)> = one
+        .into_iter()
+        .map(|(key, ls)| (key, (ls.labels, Some(ls.iter))))
+        .collect();
+    let mut shared: HashMap<BTreeMap<String, String>, Rc<[Point]>> = HashMap::new();
+
+    let mut out: SeriesSet<'a> = Vec::new();
+    for (key, many) in keyed(many_set, spec) {
+        let Some((one_labels, iter)) = ones.get_mut(&key) else {
+            continue;
+        };
+        let points = shared
+            .entry(key)
+            .or_insert_with(|| iter.take().expect("read once").collect());
+        let replay: PointIter<'a> = Box::new(Replay {
+            points: Rc::clone(points),
+            next: 0,
+        });
+        let iter = match one_side {
+            OneSide::Right => pair(many.iter, replay, op, join),
+            OneSide::Left => pair(replay, many.iter, op, join),
+        };
+        let mut labels = many.labels;
+        for name in include {
+            match one_labels.inner.get(name) {
+                Some(value) => labels.inner.insert(name.clone(), value.clone()),
+                None => labels.inner.remove(name),
+            };
+        }
+        out.push(LabeledSeries::new(labels, iter));
+    }
+    distinct_label_sets(out, start_ns, hold).map_err(|labels| {
+        QueryError::EvaluationError(format!(
+            "multiple matches for labels: two results carry {}; grouping labels must \
+             ensure unique matches",
+            braces(&labels.inner)
+        ))
+    })
+}
+
+/// `set`, or an error naming a label set two of its series carry where both
+/// have points in the range from `start_ns` (see [`unique_by_key`]).
+pub(crate) fn distinct_label_sets<'a>(
+    set: SeriesSet<'a>,
+    start_ns: u64,
+    hold_ns: u64,
+) -> Result<SeriesSet<'a>, Labels> {
+    let keyed = set
+        .into_iter()
+        .map(|ls| (ls.labels.inner.clone(), ls))
+        .collect();
+    let unique = unique_by_key(keyed, start_ns, hold_ns, |_| true).map_err(|(_, a, _)| a)?;
+    Ok(unique.into_iter().map(|(_, ls)| ls).collect())
 }
 
 type Keyed<'a> = Vec<(BTreeMap<String, String>, LabeledSeries<'a>)>;
@@ -751,7 +860,7 @@ fn with_points(
 }
 
 /// A label set as PromQL writes one: `{a="1", b="2"}`.
-fn braces(labels: &BTreeMap<String, String>) -> String {
+pub(crate) fn braces(labels: &BTreeMap<String, String>) -> String {
     let inner: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v:?}")).collect();
     format!("{{{}}}", inner.join(", "))
 }
@@ -1208,8 +1317,8 @@ mod broadcast_tests {
         );
     }
 
-    /// Two left series matching one right series need `group_left`, which
-    /// is not supported, so they are refused.
+    /// Two left series matching one right series are refused without
+    /// `group_left`.
     #[test]
     fn two_left_series_matching_one_right_are_refused() {
         let err = on(
@@ -1287,5 +1396,195 @@ mod timing_tests {
         assert!(held.at(11).is_some());
         held.advance_to(13);
         assert!(held.at(13).is_none());
+    }
+}
+
+#[cfg(test)]
+mod grouped_tests {
+    use super::*;
+
+    fn series<'a>(pairs: &[(&str, &str)], v: f64) -> LabeledSeries<'a> {
+        LabeledSeries::new(
+            Labels::from(pairs),
+            (1..=3u64).map(move |t| Point::at(t, v)),
+        )
+    }
+
+    fn run(
+        left: SeriesSet<'_>,
+        right: SeriesSet<'_>,
+        one_side: OneSide,
+        include: &[&str],
+    ) -> Result<Vec<(Labels, Vec<f64>)>, QueryError> {
+        let on = ["source".to_string()];
+        let include: Vec<String> = include.iter().map(|s| s.to_string()).collect();
+        let mut out: Vec<(Labels, Vec<f64>)> = matrix_grouped_op(
+            left,
+            right,
+            BinOp::Div,
+            MatchSpec::Include(&on),
+            one_side,
+            &include,
+            Join::Exact,
+            0,
+        )?
+        .into_iter()
+        .map(|ls| (ls.labels, ls.iter.map(|p| p.v).collect()))
+        .collect();
+        out.sort_by(|a, b| a.0.inner.cmp(&b.0.inner));
+        Ok(out)
+    }
+
+    /// `group_left(model)`: each left series is divided by the right series
+    /// of its group, keeps its labels and takes `model` from the right.
+    #[test]
+    fn group_left_pairs_many_left_with_one_right() {
+        let out = run(
+            vec![
+                series(&[("cpu", "0"), ("source", "a")], 8.0),
+                series(&[("cpu", "1"), ("source", "a")], 6.0),
+                series(&[("cpu", "0"), ("source", "b")], 9.0),
+            ],
+            vec![
+                series(&[("source", "a"), ("model", "x")], 2.0),
+                series(&[("source", "b"), ("model", "y")], 3.0),
+            ],
+            OneSide::Right,
+            &["model"],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                (
+                    Labels::from([("cpu", "0"), ("model", "x"), ("source", "a")]),
+                    vec![4.0; 3]
+                ),
+                (
+                    Labels::from([("cpu", "0"), ("model", "y"), ("source", "b")]),
+                    vec![3.0; 3]
+                ),
+                (
+                    Labels::from([("cpu", "1"), ("model", "x"), ("source", "a")]),
+                    vec![3.0; 3]
+                ),
+            ]
+        );
+    }
+
+    /// `group_right`: the left side is the one side, the operands keep
+    /// their order (`one / many`), and the result carries the right
+    /// series' labels.
+    #[test]
+    fn group_right_keeps_the_operand_order() {
+        let out = run(
+            vec![series(&[("source", "a"), ("model", "x")], 12.0)],
+            vec![
+                series(&[("cpu", "0"), ("source", "a")], 4.0),
+                series(&[("cpu", "1"), ("source", "a")], 3.0),
+            ],
+            OneSide::Left,
+            &["model"],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                (
+                    Labels::from([("cpu", "0"), ("model", "x"), ("source", "a")]),
+                    vec![3.0; 3]
+                ),
+                (
+                    Labels::from([("cpu", "1"), ("model", "x"), ("source", "a")]),
+                    vec![4.0; 3]
+                ),
+            ]
+        );
+    }
+
+    /// A listed label the one-side series lacks is removed from the result;
+    /// a many-side series with no one-side series is dropped.
+    #[test]
+    fn a_missing_include_label_is_removed_and_unmatched_are_dropped() {
+        let out = run(
+            vec![
+                series(&[("cpu", "0"), ("model", "old"), ("source", "a")], 8.0),
+                series(&[("cpu", "0"), ("source", "c")], 8.0),
+            ],
+            vec![series(&[("source", "a")], 2.0)],
+            OneSide::Right,
+            &["model"],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![(Labels::from([("cpu", "0"), ("source", "a")]), vec![4.0; 3])]
+        );
+    }
+
+    /// Two series of the one side in one group are refused, naming the side.
+    #[test]
+    fn two_one_side_series_in_a_group_are_refused() {
+        for (one_side, side) in [(OneSide::Right, "right"), (OneSide::Left, "left")] {
+            let many = vec![series(&[("cpu", "0"), ("source", "a")], 8.0)];
+            let one = vec![
+                series(&[("source", "a"), ("model", "x")], 2.0),
+                series(&[("source", "a"), ("model", "y")], 2.0),
+            ];
+            let (left, right) = match one_side {
+                OneSide::Right => (many, one),
+                OneSide::Left => (one, many),
+            };
+            let err = run(left, right, one_side, &[]).unwrap_err().to_string();
+            assert!(err.contains("many-to-many matching not allowed"), "{err}");
+            assert!(err.contains(&format!("unique on the {side} side")), "{err}");
+        }
+    }
+
+    /// A listed label that overwrites what told two many-side series apart
+    /// gives two results with one label set, which is refused.
+    #[test]
+    fn results_with_one_label_set_are_refused() {
+        let err = run(
+            vec![
+                series(&[("model", "p"), ("source", "a")], 8.0),
+                series(&[("model", "q"), ("source", "a")], 6.0),
+            ],
+            vec![series(&[("source", "a"), ("model", "x")], 2.0)],
+            OneSide::Right,
+            &["model"],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("grouping labels must ensure unique matches"),
+            "{err}"
+        );
+    }
+
+    /// A one-side series without a point in the range does not count as a
+    /// second series of its group.
+    #[test]
+    fn a_one_side_series_without_points_is_not_a_duplicate() {
+        let out = run(
+            vec![series(&[("cpu", "0"), ("source", "a")], 8.0)],
+            vec![
+                series(&[("source", "a"), ("model", "x")], 2.0),
+                LabeledSeries::new(
+                    Labels::from([("source", "a"), ("model", "y")]),
+                    std::iter::empty(),
+                ),
+            ],
+            OneSide::Right,
+            &["model"],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![(
+                Labels::from([("cpu", "0"), ("model", "x"), ("source", "a")]),
+                vec![4.0; 3]
+            )]
+        );
     }
 }

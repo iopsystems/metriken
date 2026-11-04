@@ -22,7 +22,9 @@
 //!   literal. Honors `on(..)` and `ignoring(..)` matching modifiers.
 //!   With no modifier, an unmatched left set is broadcast against a
 //!   single unmatched right series (eager-engine parity). `group_left`
-//!   / `group_right` are NOT supported.
+//!   and `group_right` match many series of one side to one of the other.
+//! * `label_replace(v, dst, replacement, src, regex)` — sets or removes a
+//!   label on each series of `v`.
 //! * `NumberLiteral` — produces a `Built::Scalar`; usable on either
 //!   side of a binary op.
 //! * Parenthesised expressions are unwrapped.
@@ -33,9 +35,10 @@ use promql_parser::parser::{self, Expr};
 
 use crate::promql::extract_filter_labels;
 use crate::promql::streaming::{
-    aggregate, collect_to_matrix, interval_binop, matrix_matrix_op, matrix_scalar_op, AggOp,
-    AtPoints, BinOp, CounterGridRate, CounterPairwiseRate, GaugeAvgOverTime, GaugeDeriv,
-    GaugeIdelta, GaugeStepGrid, GroupBy, Join, LabeledSeries, MatchSpec, SeriesSet,
+    aggregate, braces, collect_to_matrix, distinct_label_sets, interval_binop, matrix_grouped_op,
+    matrix_matrix_op, matrix_scalar_op, AggOp, AtPoints, BinOp, CounterGridRate,
+    CounterPairwiseRate, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid, GroupBy, Join,
+    LabeledSeries, MatchSpec, OneSide, SeriesSet,
 };
 use crate::promql::{nothing_read, MatrixSample, MetricKind, QueryError, QueryResult};
 use crate::{DataSource, QueryOptions, RateMode};
@@ -853,13 +856,22 @@ where
         )));
     };
 
-    if let Some(modifier) = &bin.modifier {
-        if modifier.card != parser::VectorMatchCardinality::OneToOne {
+    let grouped = match bin.modifier.as_ref().map(|m| &m.card) {
+        None | Some(parser::VectorMatchCardinality::OneToOne) => None,
+        Some(parser::VectorMatchCardinality::ManyToOne(include)) => {
+            Some((OneSide::Right, include.labels.as_slice()))
+        }
+        Some(parser::VectorMatchCardinality::OneToMany(include)) => {
+            Some((OneSide::Left, include.labels.as_slice()))
+        }
+        // The parser gives this only to `and`, `or` and `unless`, which
+        // `BinOp::from_token` has refused above.
+        Some(parser::VectorMatchCardinality::ManyToMany) => {
             return Err(QueryError::Unsupported(
-                "group_left / group_right (one-to-many matching) not supported".to_string(),
+                "many-to-many matching (and, or, unless) not supported".to_string(),
             ));
         }
-    }
+    };
 
     let spec = match bin.modifier.as_ref().and_then(|m| m.matching.as_ref()) {
         None => MatchSpec::Default,
@@ -891,15 +903,27 @@ where
                 ..
             },
         ) => Ok(Built::Series {
-            series: matrix_matrix_op(
-                left_series,
-                right_series,
-                op,
-                spec,
-                &ctx.recording_keys,
-                Join::for_mode(ctx.rate_mode, ctx.raw_hold_ns),
-                ctx.start_ns,
-            )?,
+            series: match grouped {
+                None => matrix_matrix_op(
+                    left_series,
+                    right_series,
+                    op,
+                    spec,
+                    &ctx.recording_keys,
+                    Join::for_mode(ctx.rate_mode, ctx.raw_hold_ns),
+                    ctx.start_ns,
+                )?,
+                Some((one_side, include)) => matrix_grouped_op(
+                    left_series,
+                    right_series,
+                    op,
+                    spec,
+                    one_side,
+                    include,
+                    Join::for_mode(ctx.rate_mode, ctx.raw_hold_ns),
+                    ctx.start_ns,
+                )?,
+            },
             metric_name: None,
             metric_name_for_error: None,
         }),
@@ -976,6 +1000,103 @@ fn scalar_op_matrix(
     result
 }
 
+/// `label_replace(v, dst, replacement, src, regex)`: each series of `v`
+/// whose `src` value (`""` where it has none) matches `regex`, anchored at
+/// both ends, gets `dst` set to `replacement` with `$1` and `${name}`
+/// expanded from the match, or removed where that expands to `""`. Other
+/// series pass unchanged, and values and bands are untouched. Two series
+/// left with one label set and points anywhere in the range are an error,
+/// where Prometheus checks each step. The regex and the expansion are the
+/// `regex` crate's: `.` does not match a newline, `\d` and `\w` are
+/// Unicode classes, and `$01` is group 1. `dst` or `src` naming `__name__`
+/// is not supported.
+fn build_label_replace<'a, 'expr>(
+    ctx: &'a Ctx<'a>,
+    call: &'expr parser::Call,
+) -> Result<Built<'a>, QueryError>
+where
+    'expr: 'a,
+{
+    let args = &call.args.args;
+    let string = |i: usize| match args.get(i).map(|a| &**a) {
+        Some(Expr::StringLiteral(s)) => Ok(s.val.as_str()),
+        _ => Err(QueryError::ParseError(format!(
+            "label_replace takes a vector and four strings; argument {} is not a string",
+            i + 1
+        ))),
+    };
+    if args.len() != 5 {
+        return Err(QueryError::ParseError(format!(
+            "label_replace takes 5 arguments, not {}",
+            args.len()
+        )));
+    }
+    let (dst, replacement, src, pattern) = (string(1)?, string(2)?, string(3)?, string(4)?);
+    let valid_name = |name: &str| {
+        let mut chars = name.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    if !valid_name(dst) {
+        return Err(QueryError::ParseError(format!(
+            "label_replace: invalid destination label name {dst:?}"
+        )));
+    }
+    if dst == "__name__" || src == "__name__" {
+        return Err(QueryError::Unsupported(
+            "label_replace reading or writing __name__ is not supported".to_string(),
+        ));
+    }
+    let regex = regex::Regex::new(&format!("^(?:{pattern})$")).map_err(|e| {
+        QueryError::ParseError(format!(
+            "label_replace: invalid regular expression {pattern:?}: {e}"
+        ))
+    })?;
+    let Built::Series {
+        series,
+        metric_name,
+        metric_name_for_error,
+    } = build(ctx, &args[0])?
+    else {
+        return Err(QueryError::Unsupported(
+            "label_replace requires a series-typed first argument".to_string(),
+        ));
+    };
+    let series = series
+        .into_iter()
+        .map(|mut ls| {
+            let value = ls.labels.inner.get(src).map_or("", String::as_str);
+            if let Some(captures) = regex.captures(value) {
+                let mut expanded = String::new();
+                captures.expand(replacement, &mut expanded);
+                if expanded.is_empty() {
+                    ls.labels.inner.remove(dst);
+                } else {
+                    ls.labels.inner.insert(dst.to_string(), expanded);
+                }
+            }
+            ls
+        })
+        .collect();
+    let hold = match Join::for_mode(ctx.rate_mode, ctx.raw_hold_ns) {
+        Join::Latest(hold) => hold,
+        Join::Exact => 0,
+    };
+    let series = distinct_label_sets(series, ctx.start_ns, hold).map_err(|labels| {
+        QueryError::EvaluationError(format!(
+            "label_replace: vector cannot contain metrics with the same labelset {}",
+            braces(&labels.inner)
+        ))
+    })?;
+    Ok(Built::Series {
+        series,
+        metric_name,
+        metric_name_for_error,
+    })
+}
+
 fn build_call<'a, 'expr>(
     ctx: &'a Ctx<'a>,
     call: &'expr parser::Call,
@@ -985,6 +1106,9 @@ where
 {
     if call.func.name == "histogram_quantile" {
         return build_histogram_quantile(ctx, call);
+    }
+    if call.func.name == "label_replace" {
+        return build_label_replace(ctx, call);
     }
     if let Some(groups) = ctx.groups {
         if matches!(

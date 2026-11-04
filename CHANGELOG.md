@@ -63,6 +63,30 @@ Requires metriken-storage 0.7.0.
   a `__name__` matcher. A selector PromQL does not parse (a metric name
   holding `/`) is still split by hand; there `=~` is a regex, where it was
   read as `=`, and a pattern that does not compile is an error.
+- **Added:** `group_left(labels...)` and `group_right(labels...)` (#290).
+  Each series of the many side is paired with the series of the other side
+  that shares its match key, under `on(...)` or `ignoring(...)`, and keeps
+  its labels, with each listed label taken from the one side or removed
+  where the one side does not carry it. A many-side series with no match is
+  dropped. Two one-side series with points in the range sharing a key are
+  "many-to-many matching not allowed", and two results with one label set
+  are "multiple matches for labels"; both are checked over the whole range,
+  where Prometheus checks each step, as one-to-one matching already is.
+  `rate(task_cpu_usage[1m]) * on(pid) group_left(name) thread_info` joins
+  an application's thread names onto per-thread CPU time. Each one-side
+  series is read into memory once.
+- **Added:** `label_replace(v, dst, replacement, src, regex)` (#290),
+  following Prometheus's `label_replace`: where a series' `src` value (`""`
+  if it has none) matches `regex`, anchored at both ends, `dst` is set to
+  `replacement` with `$1` and `${name}` expanded, or removed if that is
+  empty. Values and uncertainty bands pass through unchanged. Two series
+  left with one label set are an error ("vector cannot contain metrics with
+  the same labelset") when both have points anywhere in the range, where
+  Prometheus checks each step. The regex and the `$` expansion are the
+  `regex` crate's: `.` does not match a newline, `\d` and `\w` are Unicode
+  classes, and `$01` is group 1. An invalid `dst` name or regex is an
+  error, and `src` or `dst` naming `__name__` is not supported.
+
 
 ### metriken-charts 0.1.0
 
