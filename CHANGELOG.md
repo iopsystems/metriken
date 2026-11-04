@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### metriken-recorder 0.7.0
 
+Requires histogram 1.6.5 (was 1.6.4).
+
 - **Changed:** the recorder layer's label for the URL a source was
   recorded from is `endpoint`, not `instance`. Its value is unchanged:
   the URL as parsed, without a user name or password. Outside a query
