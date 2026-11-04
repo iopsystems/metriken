@@ -90,7 +90,7 @@ async fn a_split_with_the_same_labels_does_not_warn_about_them() {
     );
     assert!(!log.contains("carry identical labels"), "{log}");
 
-    // Two endpoints given one label set (the caller sets `instance` and
+    // Two endpoints given one label set (the caller sets `endpoint` and
     // `source` on both): the second warns at its add, and when the first changes
     // producer its new recording warns again, against the second.
     let before = captured.0.lock().unwrap().len();
@@ -103,7 +103,7 @@ async fn a_split_with_the_same_labels_does_not_warn_about_them() {
     let steady = serve(stream_only(&[("source", "a")], &[])).await;
     let shared = |url: &url::Url| {
         EndpointSpec::new(url.clone())
-            .with_label("instance", "shared")
+            .with_label("endpoint", "shared")
             .with_label("source", "mine")
     };
     let detected = detect(

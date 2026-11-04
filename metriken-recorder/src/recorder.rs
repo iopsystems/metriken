@@ -1045,7 +1045,7 @@ impl Endpoint {
     /// Take the handshake's word on the timeline, epoch, labels and
     /// metadata of a subscription detection opened.
     fn begin_stream(&mut self, sub: &Subscription, interval: Duration) {
-        let url = layered::instance(&self.spec.url);
+        let url = layered::endpoint(&self.spec.url);
         self.served_interval = sub.served_interval();
         if let Some(served) = self.served_interval.filter(|served| *served > interval) {
             info!(
@@ -1106,7 +1106,7 @@ impl Endpoint {
                 warn!(
                     "{}: the producer restarted mid-recording (producer epoch {known} -> \
                      {seen}); every cumulative counter reset at this point",
-                    layered::instance(&self.spec.url)
+                    layered::endpoint(&self.spec.url)
                 );
                 self.epoch = Some(seen.to_string());
                 self.restarts.push(Restart {
@@ -1198,8 +1198,8 @@ impl Slot {
             Kind::Local { .. } => self.id.to_string(),
             #[cfg(feature = "http")]
             Kind::Endpoint(ep) => match &self.name {
-                Some(name) => format!("{name} ({})", layered::instance(&ep.spec.url)),
-                None => layered::instance(&ep.spec.url),
+                Some(name) => format!("{name} ({})", layered::endpoint(&ep.spec.url)),
+                None => layered::endpoint(&ep.spec.url),
             },
         }
     }
@@ -1232,7 +1232,7 @@ impl Slot {
             ),
             #[cfg(feature = "http")]
             Kind::Endpoint(ep) => (
-                Some(layered::instance(&ep.spec.url)),
+                Some(layered::endpoint(&ep.spec.url)),
                 self.name
                     .clone()
                     .or_else(|| ep.spec.labels.get(keys::SOURCE).cloned()),
@@ -1696,7 +1696,7 @@ impl Driver {
                 entries.push((
                     Layer::Recorder,
                     layered::opened(
-                        Some(&layered::instance(&ep.spec.url)),
+                        Some(&layered::endpoint(&ep.spec.url)),
                         wire,
                         interval_ms,
                         &ep.hook_labels,
@@ -2814,7 +2814,7 @@ impl Driver {
                     let outcome = task.await.unwrap_or_else(|e| {
                         Outcome::Pending(format!(
                             "endpoint {}: detection failed: {e}",
-                            layered::instance(&url)
+                            layered::endpoint(&url)
                         ))
                     });
                     match outcome {
@@ -2829,7 +2829,7 @@ impl Driver {
                             info!(
                                 "endpoint {} now reachable, subscribed to its replication stream; \
                                  reading its metadata",
-                                layered::instance(&url)
+                                layered::endpoint(&url)
                             );
                             ep.begin_stream(&sub, self.settings.interval);
                             let epoch = ep.epoch.clone();
@@ -2850,8 +2850,8 @@ impl Driver {
                         Outcome::Scraped(scrape) => {
                             info!(
                                 "endpoint {} now reachable, scraped as Prometheus at {}",
-                                layered::instance(&url),
-                                layered::instance(&scrape)
+                                layered::endpoint(&url),
+                                layered::endpoint(&scrape)
                             );
                             ep.mode = Mode::Scraped {
                                 url: scrape,
@@ -2975,7 +2975,7 @@ fn adopt_enrich(ep: &mut Endpoint, reply: Result<probe::Enriched, String>) {
             warn!(
                 "{}: {why}; its recording is added without the probe hook's labels and \
                  metadata, and its metadata is asked for again",
-                layered::instance(&ep.spec.url)
+                layered::endpoint(&ep.spec.url)
             );
             ep.late_enrich = Some(LateEnrich {
                 retries: 0,

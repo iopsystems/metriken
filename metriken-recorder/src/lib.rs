@@ -13,7 +13,7 @@
 //!   ([`RegistrySource`] with feature `registry`).
 //!
 //! A source's labels and metadata are its identity layers
-//! (metriken-storage's `layers`): the recorder's entries (`instance`,
+//! (metriken-storage's `layers`): the recorder's entries (`endpoint`,
 //! `transport`, `sampling_interval_ms`, the probe hook's reply, and one
 //! entry per producer epoch), the producer's (its handshake, or a local
 //! source's [`SourceIdentity`], with a producer identity written as

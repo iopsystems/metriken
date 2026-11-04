@@ -506,7 +506,7 @@ async fn a_stream_and_a_scrape_are_recorded_into_one_archive() {
         layers.recorder.metadata.contains_key("descriptions"),
         "the HELP text is a recorder entry"
     );
-    assert_eq!(scraped["svc"].labels["instance"], prom.url.as_str());
+    assert_eq!(scraped["svc"].labels["endpoint"], prom.url.as_str());
 
     for id in [SourceId(0), SourceId(1)] {
         assert!(
@@ -549,7 +549,7 @@ async fn a_producers_handshake_names_its_recording() {
     let recordings = recordings(&run.path, "fake/ops");
     let r = &recordings["cachecannon"];
     assert_eq!(r.labels["source"], "cachecannon");
-    assert_eq!(r.labels["instance"], fake.url.as_str());
+    assert_eq!(r.labels["endpoint"], fake.url.as_str());
     assert!(
         !r.metadata.contains_key("source"),
         "the recorder writes no source of its own"
@@ -608,7 +608,7 @@ async fn a_handshakes_producer_identity_is_written_as_producer_keys() {
 }
 
 /// An endpoint nobody names is recorded with no `source`: its labels are
-/// the recorder's `instance`. It is shown under the name inferred from its
+/// the recorder's `endpoint`. It is shown under the name inferred from its
 /// URL.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unnamed_scrape_is_recorded_without_a_source() {
@@ -630,7 +630,7 @@ async fn an_unnamed_scrape_is_recorded_without_a_source() {
     let r = &scraped[""];
     assert_eq!(
         r.labels,
-        BTreeMap::from([("instance".to_string(), prom.url.to_string())])
+        BTreeMap::from([("endpoint".to_string(), prom.url.to_string())])
     );
     assert!(!r.metadata.contains_key("source"));
     assert!(run
@@ -2826,7 +2826,7 @@ async fn a_handshake_naming_no_producer_does_not_split() {
     );
 }
 
-/// A scrape URL's user name and password reach neither the `instance` label
+/// A scrape URL's user name and password reach neither the `endpoint` label
 /// nor the summary.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_scrape_urls_credentials_are_left_out() {
@@ -2855,7 +2855,7 @@ async fn a_scrape_urls_credentials_are_left_out() {
     let summary = run.summary.expect("finished");
     assert_eq!(summary.sources[0].endpoint.as_deref(), Some(plain.as_str()));
     let r = &recordings(&run.path, PROMETHEUS_GROUP)["svc"];
-    assert_eq!(r.labels["instance"], plain);
+    assert_eq!(r.labels["endpoint"], plain);
     assert!(!format!("{:?}", r.metadata).contains("secret"));
 }
 
