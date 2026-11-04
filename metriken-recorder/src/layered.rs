@@ -21,12 +21,12 @@ use crate::keys;
 pub(crate) const TRANSPORT: &str = "transport";
 
 /// The recorder layer's label naming the endpoint a source was recorded
-/// from: its URL as parsed ([`instance`]), without a user name or password.
-pub(crate) const INSTANCE: &str = "instance";
+/// from: its URL as parsed ([`endpoint`]), without a user name or password.
+pub(crate) const ENDPOINT: &str = "endpoint";
 
 /// Keys the recorder sets in the recorder layer itself, which a probe hook's
 /// reply does not replace.
-const RECORDER_LABELS: [&str; 1] = [INSTANCE];
+const RECORDER_LABELS: [&str; 1] = [ENDPOINT];
 const RECORDER_METADATA: [&str; 2] = [keys::SAMPLING_INTERVAL_MS, TRANSPORT];
 
 /// dendro's timeline-events key. A caller writes it whole (`rezolus record`
@@ -65,12 +65,12 @@ impl Maps {
     }
 }
 
-/// The `instance` label for an endpoint at `url`: the URL as parsed, without
+/// The `endpoint` label for an endpoint at `url`: the URL as parsed, without
 /// the user name and password the recorder may have sent, since a recording
 /// is read by others. The query string is kept: it can name what is
 /// scraped (a blackbox exporter's `module`).
 #[cfg(feature = "http")]
-pub(crate) fn instance(url: &url::Url) -> String {
+pub(crate) fn endpoint(url: &url::Url) -> String {
     let mut url = url.clone();
     let _ = url.set_username("");
     let _ = url.set_password(None);
@@ -118,11 +118,11 @@ fn random_id() -> String {
     format!("{:016x}{:016x}", half(), half())
 }
 
-/// The recorder's entry for a source as it is added: `instance` (an
+/// The recorder's entry for a source as it is added: `endpoint` (an
 /// endpoint's URL), `transport`, `sampling_interval_ms`, and the probe
 /// hook's labels and metadata under those, without a hook `source` label.
 pub(crate) fn opened(
-    instance: Option<&str>,
+    endpoint: Option<&str>,
     transport: &str,
     interval_ms: String,
     hook_labels: &BTreeMap<String, String>,
@@ -131,8 +131,8 @@ pub(crate) fn opened(
     let mut e = entry("recorder");
     e.labels = hook(hook_labels, true);
     e.metadata = hook(hook_metadata, false);
-    if let Some(instance) = instance {
-        e.labels.insert(INSTANCE.to_string(), instance.to_string());
+    if let Some(endpoint) = endpoint {
+        e.labels.insert(ENDPOINT.to_string(), endpoint.to_string());
     }
     e.metadata
         .insert(TRANSPORT.to_string(), transport.to_string());
@@ -166,7 +166,7 @@ pub(crate) fn late_hook(hook_metadata: &BTreeMap<String, String>) -> Entry {
 }
 
 /// The probe hook's keys the recorder layer takes: not `source` (the
-/// recorder writes none), not the recorder's own keys (the `instance` label;
+/// recorder writes none), not the recorder's own keys (the `endpoint` label;
 /// `transport` and `sampling_interval_ms`), and no metadata key
 /// `layers::forbidden_metadata` names (`metriken.` keys, the flat epoch
 /// keys, dendro's `events`, `encoder` and `writer_sessions`).
@@ -191,7 +191,7 @@ fn hook(map: &BTreeMap<String, String>, labels: bool) -> BTreeMap<String, String
 /// given as `identity`, becomes metadata `producer_name`, `version` and
 /// `build` and the label `host`; the identity's version and name replace
 /// the declared `version` and `producer_name`. Left out: the recorder's own
-/// keys (the `instance` label; `transport` and `sampling_interval_ms`),
+/// keys (the `endpoint` label; `transport` and `sampling_interval_ms`),
 /// which are its observation and not the producer's to replace, and the
 /// metadata keys `layers::forbidden_metadata` names.
 pub(crate) fn producer(
@@ -321,14 +321,14 @@ mod tests {
                 ("source", "rezolus"),
                 ("zone", "a"),
                 ("metriken.x", "y"),
-                ("instance", "theirs"),
+                ("endpoint", "theirs"),
                 ("transport", "udp"),
             ]),
             &map(&[
                 ("sampling_interval_ms", "5"),
                 ("transport", "x"),
                 ("source", "rezolus"),
-                ("instance", "kept"),
+                ("endpoint", "kept"),
                 ("agent_version", "5.2"),
                 ("metriken.x", "y"),
                 ("events", "{}"),
@@ -337,7 +337,7 @@ mod tests {
         assert_eq!(
             e.labels,
             map(&[
-                ("instance", "http://h:4241"),
+                ("endpoint", "http://h:4241"),
                 ("transport", "udp"),
                 ("zone", "a")
             ])
@@ -346,7 +346,7 @@ mod tests {
             e.metadata,
             map(&[
                 ("agent_version", "5.2"),
-                ("instance", "kept"),
+                ("endpoint", "kept"),
                 ("sampling_interval_ms", "1000"),
                 ("transport", "stream")
             ])
@@ -368,7 +368,7 @@ mod tests {
     fn a_handshake_does_not_replace_the_recorders_keys() {
         let e = producer(
             &map(&[
-                ("instance", "theirs"),
+                ("endpoint", "theirs"),
                 ("zone", "a"),
                 ("transport", "udp"),
                 ("metriken.x", "y"),
@@ -376,7 +376,7 @@ mod tests {
             &map(&[
                 ("sampling_interval_ms", "5"),
                 ("transport", "x"),
-                ("instance", "kept"),
+                ("endpoint", "kept"),
                 ("note", "n"),
             ]),
             None,
@@ -384,14 +384,14 @@ mod tests {
             None,
         );
         assert_eq!(e.labels, map(&[("transport", "udp"), ("zone", "a")]));
-        assert_eq!(e.metadata, map(&[("instance", "kept"), ("note", "n")]));
+        assert_eq!(e.metadata, map(&[("endpoint", "kept"), ("note", "n")]));
     }
 
     #[cfg(feature = "http")]
     #[test]
-    fn instance_leaves_out_credentials() {
+    fn endpoint_leaves_out_credentials() {
         let url = url::Url::parse("http://user:secret@Host:9090/metrics?module=x").unwrap();
-        assert_eq!(instance(&url), "http://host:9090/metrics?module=x");
+        assert_eq!(endpoint(&url), "http://host:9090/metrics?module=x");
     }
 
     #[cfg(feature = "http")]

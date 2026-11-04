@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-recorder 0.7.0
+
+- **Changed:** the recorder layer's label for the URL a source was
+  recorded from is `endpoint`, not `instance`. Its value is unchanged:
+  the URL as parsed, without a user name or password. Outside a query
+  scope, a series' own `instance` label (a federated target's, for
+  example) is no longer moved to `exported_instance` by the recorder's,
+  and a series' own `endpoint` is moved to `exported_endpoint`. A
+  handshake's or a probe hook's `endpoint` label does not replace the
+  recorder's, and their `instance` label is now kept. A label `endpoint`
+  given to `EndpointSpec::with_label` replaces the recorded URL, and a
+  label `instance` no longer does. Recordings written by 0.6.0 and 0.6.1
+  keep `instance`; nothing reads it as `endpoint`.
+
 ### metriken-charts 0.1.0
 
 - **Added:** the crate. It holds the rezolus viewer's chart modules
