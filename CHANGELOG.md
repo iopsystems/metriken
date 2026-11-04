@@ -30,6 +30,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fields `Plot` holds; a plot's width in the page grid and the A/B
   experiment query are not part of `Plot`.
 
+### metriken 0.11.6
+
+- **Changed:** the workspace requires `histogram` 1.6.5 (was 1.6.4). On
+  x86_64, 1.6.5 computes the bucket index for its atomic histograms with
+  the formula used before 1.6.4, which `AtomicCounterHistogram` and the
+  sharded counting histograms record through. On AMD Zen 1 and Zen 2,
+  1.6.4 had lowered single-thread recording into one shared
+  `AtomicCounterHistogram` to 0.88x to 0.97x of 1.6.3; the formula 1.6.5
+  uses measured 1.02x to 1.15x of 1.6.4 on those hosts. Other targets, and
+  `histogram::Histogram`, are unchanged from 1.6.4. histogram's CHANGELOG
+  has the measurements for six hosts.
+
 ### metriken 0.11.5
 
 - **Changed:** requires `histogram` 1.6.4 (was 1.4.1). 1.6.2 inlines the
