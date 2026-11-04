@@ -23,6 +23,47 @@ Requires histogram 1.6.5 (was 1.6.4).
   label `instance` no longer does. Recordings written by 0.6.0 and 0.6.1
   keep `instance`; nothing reads it as `endpoint`.
 
+### metriken-storage 0.7.0
+
+- **Breaking:** for a series that carries the label, a filter's matchers
+  (`Labels::matches`) compare as Prometheus's do. `~pattern` and `!pattern`
+  are regular expressions (the `regex` crate) anchored at both ends, where
+  each was split on `|` and compared literally, so
+  `name=~"/system.slice/.*"` matched nothing. A caller building `!value` or
+  `~value` by hand escapes the value as a regex (`regex::escape`). A plain
+  value is compared whole after one leading `=` is removed, where a value
+  containing `|` was read as alternatives: `=x` matches `x`. A label a
+  series does not carry fails `=` and `=~` and passes `!=` and `!~`, where
+  Prometheus compares a missing label as `""`. A pattern that does not
+  compile matches nothing. Each thread keeps up to 256 compiled patterns,
+  and a pattern of literals and `|` is decided without a regex.
+- **Added:** `MatchOp`, whose `encode` writes a matcher's filter value. An
+  `=` operand starting with `!`, `~` or `=` is written after an `=`, which
+  `Labels::matches` strips, so it is no longer read as a negation or a
+  regex. `!=` is written as the operand escaped as a regex.
+
+### metriken-query 0.44.0
+
+Requires metriken-storage 0.7.0.
+
+- **Breaking:** `=~` and `!~` in a label matcher are regular expressions
+  anchored at both ends, as in Prometheus, where each was a list of literal
+  alternatives (#323). `{name=~"/system.slice/.*"}` selects every cgroup
+  under `/system.slice`, and `{name!~"/system.slice/.*"}` excludes them; a
+  `.` in a pattern matches any character. A series without the label is
+  still not matched by `=~` and still kept by `!~`. `=` and `!=` compare
+  the whole value whatever characters it holds. `selector_filter` and the
+  `*_labels_matching` methods take the same matchers, and matching on a
+  recording label (`ArchiveReader`) follows the same rules.
+- **Fixed:** the histogram functions read a selector that PromQL parses as
+  PromQL does, where they split it on `,` and took each quoted value
+  without unescaping it, so `cpu=~"\\d"` and `cpu=~"[0,1]"` matched nothing
+  or failed. They refuse an `offset` or `@` on it, as they did on a
+  `{__name__="x"}` selector, and a selector with neither a metric name nor
+  a `__name__` matcher. A selector PromQL does not parse (a metric name
+  holding `/`) is still split by hand; there `=~` is a regex, where it was
+  read as `=`, and a pattern that does not compile is an error.
+
 ### metriken-charts 0.1.0
 
 - **Added:** the crate. It holds the rezolus viewer's chart modules

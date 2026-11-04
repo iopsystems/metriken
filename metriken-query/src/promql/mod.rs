@@ -2,12 +2,12 @@ use crate::promql::streaming::histogram::{HistogramOps, Stride};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use promql_parser::label::Matcher;
+use promql_parser::label::{MatchOp as PromMatchOp, Matcher};
 use promql_parser::parser::{self, Expr};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::labels::Labels;
+use crate::labels::{Labels, MatchOp};
 use crate::{DataSource, QueryOptions};
 
 mod columns;
@@ -767,19 +767,16 @@ fn name_selector(sel: &mut parser::VectorSelector) {
     sel.name = Some(name);
 }
 
-/// A histogram function's selector that carries a `__name__` matcher,
-/// parsed as PromQL and named by `name_selector`: its metric name and the
-/// filter of its other matchers. `None` when `selector` does not parse as a
-/// PromQL vector selector with a `__name__` matcher; the caller parses it by
+/// A histogram function's selector parsed as PromQL, with a `__name__`
+/// matcher named by `name_selector`: its metric name and the filter of its
+/// other matchers. `None` when `selector` does not parse as a PromQL vector
+/// selector (a metric name holding `/`, for one); the caller parses it by
 /// hand. An error for an `offset` or `@`, or for `__name__` matchers that do
 /// not name one metric.
-fn name_matcher_selector(selector: &str) -> Option<Result<(String, Labels), QueryError>> {
+fn promql_selector(selector: &str) -> Option<Result<(String, Labels), QueryError>> {
     let Ok(Expr::VectorSelector(mut sel)) = parser::parse(selector) else {
         return None;
     };
-    if !sel.matchers.matchers.iter().any(|m| m.name == "__name__") {
-        return None;
-    }
     let refused = |why: &str| Some(Err(QueryError::ParseError(format!("{selector}: {why}"))));
     if sel.offset.is_some() || sel.at.is_some() {
         return refused("a histogram function's selector takes no `offset` or `@`");
@@ -788,8 +785,8 @@ fn name_matcher_selector(selector: &str) -> Option<Result<(String, Labels), Quer
     match sel.name {
         Some(name) => Some(Ok((name, extract_filter_labels(&sel.matchers.matchers)))),
         None => refused(
-            "`__name__` is accepted only as a single `__name__=\"x\"` matcher on a \
-             selector with no metric name",
+            "a histogram function's selector names one metric: a metric name, or a single \
+             `__name__=\"x\"` matcher",
         ),
     }
 }
@@ -986,6 +983,19 @@ fn refuse_archive_options(opts: &QueryOptions) -> Result<(), QueryError> {
     Ok(())
 }
 
+/// The pattern a filter carries for a regex matcher written as `written`,
+/// which promql-parser compiled to `compiled`: `written`, unless
+/// promql-parser had to escape it, as it escapes Go's literal `{` (`a{b}`)
+/// for the regex crate. Then the compiled source, which is anchored
+/// already; anchoring it again changes nothing.
+fn pattern(written: &str, compiled: &regex::Regex) -> String {
+    if compiled.as_str() == format!("^(?:{written})$") {
+        written.to_string()
+    } else {
+        compiled.as_str().to_string()
+    }
+}
+
 /// Extract label filter from parsed PromQL matchers, skipping `__name__`.
 pub(crate) fn extract_filter_labels(matchers: &[Matcher]) -> Labels {
     let mut filter_labels = Labels::default();
@@ -993,20 +1003,13 @@ pub(crate) fn extract_filter_labels(matchers: &[Matcher]) -> Labels {
         if matcher.name == "__name__" {
             continue;
         }
-        let op = matcher.op.to_string();
-        if op == "=" {
-            filter_labels
-                .inner
-                .insert(matcher.name.clone(), matcher.value.clone());
-        } else if op == "=~" {
-            filter_labels
-                .inner
-                .insert(matcher.name.clone(), format!("~{}", matcher.value));
-        } else if op == "!=" || op == "!~" {
-            filter_labels
-                .inner
-                .insert(matcher.name.clone(), format!("!{}", matcher.value));
-        }
+        let value = match &matcher.op {
+            PromMatchOp::Equal => MatchOp::Equal.encode(&matcher.value),
+            PromMatchOp::NotEqual => MatchOp::NotEqual.encode(&matcher.value),
+            PromMatchOp::Re(regex) => MatchOp::Regex.encode(&pattern(&matcher.value, regex)),
+            PromMatchOp::NotRe(regex) => MatchOp::NotRegex.encode(&pattern(&matcher.value, regex)),
+        };
+        filter_labels.inner.insert(matcher.name.clone(), value);
     }
     filter_labels
 }
@@ -1156,7 +1159,7 @@ impl QueryEngine {
     }
 
     fn parse_metric_selector(&self, selector: &str) -> Result<(String, Labels), QueryError> {
-        if let Some(named) = name_matcher_selector(selector) {
+        if let Some(named) = promql_selector(selector) {
             return named;
         }
         if let Some(brace_pos) = selector.find('{') {
@@ -1170,32 +1173,28 @@ impl QueryEngine {
                     continue;
                 }
 
-                let (key, value, negate) = if let Some(pos) = part.find("!=") {
-                    (&part[..pos], part[pos + 2..].trim().trim_matches('"'), true)
+                let (key, value, op) = if let Some(pos) = part.find("!=") {
+                    (&part[..pos], &part[pos + 2..], MatchOp::NotEqual)
                 } else if let Some(pos) = part.find("!~") {
-                    (&part[..pos], part[pos + 2..].trim().trim_matches('"'), true)
+                    (&part[..pos], &part[pos + 2..], MatchOp::NotRegex)
                 } else if let Some(pos) = part.find("=~") {
-                    (
-                        &part[..pos],
-                        part[pos + 2..].trim().trim_matches('"'),
-                        false,
-                    )
+                    (&part[..pos], &part[pos + 2..], MatchOp::Regex)
                 } else if let Some(pos) = part.find('=') {
-                    (
-                        &part[..pos],
-                        part[pos + 1..].trim().trim_matches('"'),
-                        false,
-                    )
+                    (&part[..pos], &part[pos + 1..], MatchOp::Equal)
                 } else {
                     continue;
                 };
-
-                let key = key.trim().to_string();
-                if negate {
-                    labels.inner.insert(key, format!("!{value}"));
-                } else {
-                    labels.inner.insert(key, value.to_string());
+                let value = value.trim().trim_matches('"');
+                if matches!(op, MatchOp::Regex | MatchOp::NotRegex)
+                    && regex::Regex::new(&format!("^(?:{value})$")).is_err()
+                {
+                    return Err(QueryError::ParseError(format!(
+                        "{selector}: {value} is not a regular expression"
+                    )));
                 }
+                labels
+                    .inner
+                    .insert(key.trim().to_string(), op.encode(value));
             }
             Ok((metric_name, labels))
         } else {

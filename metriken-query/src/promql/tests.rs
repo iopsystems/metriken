@@ -408,6 +408,169 @@ fn test_sum_by_name_with_regex_match() {
     assert!(names.contains(&"/system.slice/bar.service".to_string()));
 }
 
+/// The cgroups of `cgroup_cpu_usage` that `query` selects, sorted.
+fn selected_cgroups(names: &[&str], query: &str) -> Vec<String> {
+    let mut source = Memory::new(1000);
+    for name in names {
+        source.add_counter(
+            "cgroup_cpu_usage",
+            Counter {
+                labels: make_labels(&[("name", name)]),
+                timestamps: (0u64..3).map(|s| (1000 + s) * 1_000_000_000).collect(),
+                values: vec![0, 100, 200],
+                windows: None,
+            },
+        );
+    }
+    let engine = QueryEngine::new(Arc::new(source));
+    let result = engine
+        .query_range(query, 1000.0, 1002.0, 1.0)
+        .unwrap_or_else(|e| panic!("{query}: {e}"));
+    let mut names = get_matrix_series_names(&result);
+    names.sort();
+    names
+}
+
+/// `=~` and `!~` are regular expressions anchored at both ends, as in
+/// Prometheus, and `=` and `!=` compare the whole value.
+#[test]
+fn label_matchers_follow_prometheus() {
+    let names = [
+        "/system.slice",
+        "/system.slice/a.service",
+        "/system.slice/a.service/child",
+        "/system.slice/axservice",
+        "/user.slice",
+        "a|b",
+        "~x",
+        "!x",
+        "=x",
+    ];
+    let q = |m: &str| selected_cgroups(&names, &format!("irate(cgroup_cpu_usage{{{m}}}[5s])"));
+    let all = |list: &[&str]| {
+        let mut v: Vec<String> = list.iter().map(|s| s.to_string()).collect();
+        v.sort();
+        v
+    };
+    let others = |except: &[&str]| {
+        all(&names
+            .iter()
+            .copied()
+            .filter(|n| !except.contains(n))
+            .collect::<Vec<_>>())
+    };
+    // A prefix: a unit and everything under it.
+    assert_eq!(
+        q(r#"name=~"/system.slice/a\\.service(/.*)?""#),
+        all(&["/system.slice/a.service", "/system.slice/a.service/child"])
+    );
+    assert_eq!(
+        q(r#"name!~"/system.slice/.*""#),
+        others(&[
+            "/system.slice/a.service",
+            "/system.slice/a.service/child",
+            "/system.slice/axservice",
+        ])
+    );
+    // An unescaped `.` matches any character.
+    assert_eq!(
+        q(r#"name=~"/system.slice/a.service""#),
+        all(&["/system.slice/a.service", "/system.slice/axservice"])
+    );
+    // Anchored: a substring is not a match.
+    assert_eq!(q(r#"name=~"system""#), all(&[]));
+    assert_eq!(q(r#"name=~"[/]user[.]slice""#), all(&["/user.slice"]));
+    assert_eq!(q(r#"name=~"a|b""#), all(&[]));
+    assert_eq!(q(r#"name=~"a\\|b""#), all(&["a|b"]));
+    // A Go literal `{`, which the regex crate refuses unescaped.
+    assert_eq!(q(r#"name=~"x{y}|~x""#), all(&["~x"]));
+    // `=` and `!=` compare the whole value, whatever characters it holds.
+    for value in ["a|b", "~x", "!x", "=x", "/system.slice"] {
+        assert_eq!(q(&format!(r#"name="{value}""#)), all(&[value]), "= {value}");
+        assert_eq!(
+            q(&format!(r#"name!="{value}""#)),
+            others(&[value]),
+            "!= {value}"
+        );
+    }
+    assert_eq!(q(r#"name="a""#), all(&[]));
+}
+
+/// The histogram functions parse a selector without a `__name__` matcher
+/// apart from PromQL; their regex matchers are regular expressions too, and
+/// one that does not compile is an error.
+#[test]
+fn a_histogram_functions_regex_matcher_is_a_regex() {
+    let engine = QueryEngine::new(Arc::new(create_hist_source(&[0, 10, 20, 30, 40])));
+    let cpus = |q: &str| {
+        let QueryResult::Matrix { result, .. } = engine
+            .query_range(q, 1001.0, 1004.0, 1.0)
+            .unwrap_or_else(|e| panic!("{q}: {e}"))
+        else {
+            panic!("{q}: not a matrix");
+        };
+        let mut cpus: Vec<String> = result
+            .iter()
+            .filter_map(|m| m.metric.get("cpu").cloned())
+            .collect();
+        cpus.sort();
+        cpus.dedup();
+        cpus
+    };
+    assert_eq!(
+        cpus(r#"histogram_irate by (cpu) (req_latency{cpu=~".*0"})"#),
+        ["0"]
+    );
+    assert_eq!(
+        cpus(r#"histogram_irate by (cpu) (req_latency{cpu!~".*0"})"#),
+        ["1"]
+    );
+    assert_eq!(
+        cpus(r#"histogram_irate by (cpu) (req_latency{cpu=~"0|1"})"#),
+        ["0", "1"]
+    );
+    assert_eq!(
+        cpus(r#"histogram_irate by (cpu) (req_latency{cpu!="0"})"#),
+        ["1"]
+    );
+    // Read as PromQL reads them: an escape, and a comma or brace inside the
+    // quoted pattern.
+    for (matcher, want) in [
+        (r#"cpu=~"\\d""#, &["0", "1"][..]),
+        (r#"cpu=~"1,|0""#, &["0"]),
+        (r#"cpu=~"[0,1]""#, &["0", "1"]),
+        (r#"cpu=~"0{1,2}""#, &["0"]),
+    ] {
+        assert_eq!(
+            cpus(&format!(
+                "histogram_irate by (cpu) (req_latency{{{matcher}}})"
+            )),
+            want,
+            "{matcher}"
+        );
+    }
+    let err = engine
+        .query_range(
+            r#"histogram_irate(req_latency{cpu=~"(")"#,
+            1001.0,
+            1004.0,
+            1.0,
+        )
+        .expect_err("an unclosed group")
+        .to_string();
+    assert!(err.contains("not a regular expression"), "{err}");
+    let err = engine
+        .query_range(
+            "histogram_irate(req_latency offset 1s)",
+            1001.0,
+            1004.0,
+            1.0,
+        )
+        .expect_err("an offset")
+        .to_string();
+    assert!(err.contains("takes no `offset` or `@`"), "{err}");
+}
+
 #[test]
 fn test_sum_with_negative_match_excludes() {
     let source = Arc::new(create_cgroup_source());
@@ -4121,10 +4284,11 @@ fn a_histogram_function_reads_a_name_matcher_by_the_promql_rule() {
         r#"histogram_mean({__name__="", __name__="req_latency"})"#,
         r#"histogram_mean({__name__="req_latency", __name__="req_latency"})"#,
         r#"histogram_mean({__name__=~"req_latency"})"#,
+        r#"histogram_mean({cpu="1"})"#,
     ] {
         let err = range(q).expect_err(q).to_string();
         assert!(
-            err.contains("accepted only as a single `__name__"),
+            err.contains("names one metric: a metric name, or a single `__name__"),
             "{q}: {err}"
         );
     }

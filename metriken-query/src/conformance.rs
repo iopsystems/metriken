@@ -846,12 +846,24 @@ fn parse_matchers(m: &str) -> Vec<(String, String, String)> {
 fn matches(labels: &Labels, matchers: &[(String, String, String)]) -> bool {
     matchers.iter().all(|(k, op, v)| {
         let have = labels.get(k).map(String::as_str).unwrap_or("");
-        let alternatives = || v.split('|').any(|a| a == have);
+        let regex = || {
+            thread_local! {
+                static COMPILED: std::cell::RefCell<std::collections::HashMap<String, regex::Regex>> =
+                    Default::default();
+            }
+            COMPILED.with(|compiled| {
+                compiled
+                    .borrow_mut()
+                    .entry(v.clone())
+                    .or_insert_with(|| regex::Regex::new(&format!("^(?:{v})$")).unwrap())
+                    .is_match(have)
+            })
+        };
         match op.as_str() {
             "=" => have == v,
             "!=" => have != v,
-            "=~" => alternatives(),
-            "!~" => !alternatives(),
+            "=~" => regex(),
+            "!~" => !regex(),
             _ => unreachable!(),
         }
     })
@@ -1733,6 +1745,9 @@ fn cases() -> Vec<E> {
             r#"state!="user""#,
             r#"cpu!~"2""#,
             r#"cpu="9""#,
+            r#"cpu=~"[01]""#,
+            r#"state=~"us.*""#,
+            r#"state!~"u.+""#,
         ] {
             out.push(sel(f, "c", m));
         }

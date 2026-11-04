@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
+
+use regex::Regex;
 
 /// Keys in a column's field metadata that describe the column rather than
 /// the series, and so never become labels.
@@ -95,25 +98,79 @@ impl Labels {
     }
 }
 
-fn match_pattern(value: &str, pattern: &str) -> bool {
-    if pattern.contains('|') {
-        let inner = if pattern.starts_with('(') && pattern.ends_with(')') {
-            &pattern[1..pattern.len() - 1]
-        } else {
-            pattern
-        };
-        inner.split('|').any(|option| {
-            if option.contains("\\.") {
-                value == option.replace("\\.", ".")
-            } else {
-                value == option
-            }
-        })
-    } else if pattern.contains("\\.") {
-        value == pattern.replace("\\.", ".")
-    } else {
-        value == pattern
+/// How a matcher of a filter compares a label value.
+///
+/// A filter ([`Labels::matches`]) holds one matcher per label, encoded in the
+/// value: [`MatchOp::encode`] writes it and [`Labels::matches`] reads it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MatchOp {
+    /// `=`: the value equals the operand.
+    Equal,
+    /// `!=`: the value does not equal the operand, or the label is absent.
+    NotEqual,
+    /// `=~`: the value matches the operand, a regular expression anchored at
+    /// both ends.
+    Regex,
+    /// `!~`: the value does not match the operand, or the label is absent.
+    NotRegex,
+}
+
+impl MatchOp {
+    /// The filter value for this matcher with `operand`.
+    ///
+    /// `=` is the operand itself, or the operand after `=` when it starts
+    /// with `!`, `~` or `=`. `=~` is `~` and the pattern, `!~` is `!` and the
+    /// pattern, and `!=` is `!` and the operand escaped as a regex.
+    pub fn encode(self, operand: &str) -> String {
+        match self {
+            MatchOp::Equal if operand.starts_with(['!', '~', '=']) => format!("={operand}"),
+            MatchOp::Equal => operand.to_string(),
+            MatchOp::NotEqual => format!("!{}", regex::escape(operand)),
+            MatchOp::Regex => format!("~{operand}"),
+            MatchOp::NotRegex => format!("!{operand}"),
+        }
     }
+}
+
+/// The most patterns [`PATTERNS`] holds; reaching it clears them.
+const PATTERN_CACHE: usize = 256;
+
+/// Whether `c` is special in a regex outside a character class, without the
+/// `x` flag (which needs `(` to set).
+fn is_meta(c: char) -> bool {
+    matches!(
+        c,
+        '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$'
+    )
+}
+
+thread_local! {
+    /// Patterns compiled on this thread, so a filter's pattern is compiled
+    /// once and not once per series; `None` for one that does not compile.
+    static PATTERNS: RefCell<HashMap<String, Option<Regex>>> = RefCell::new(HashMap::new());
+}
+
+/// Whether `value` matches `pattern`, anchored at both ends. A pattern that
+/// does not compile matches nothing.
+fn match_pattern(value: &str, pattern: &str) -> bool {
+    // A list of literals, the common case, is decided without a regex.
+    let literal = |alternative: &str| !alternative.contains(is_meta);
+    if pattern.split('|').all(literal) {
+        return pattern.split('|').any(|alternative| alternative == value);
+    }
+    PATTERNS.with(|patterns| {
+        let mut patterns = patterns.borrow_mut();
+        if !patterns.contains_key(pattern) {
+            if patterns.len() >= PATTERN_CACHE {
+                patterns.clear();
+            }
+            let compiled = Regex::new(&format!("^(?:{pattern})$")).ok();
+            patterns.insert(pattern.to_string(), compiled);
+        }
+        patterns[pattern]
+            .as_ref()
+            .is_some_and(|regex| regex.is_match(value))
+    })
 }
 
 impl From<&[(&str, &str)]> for Labels {
@@ -178,6 +235,9 @@ impl From<&mut dyn Iterator<Item = (&str, &str)>> for Labels {
 }
 
 impl Labels {
+    /// Whether this label set satisfies every matcher of the filter `other`,
+    /// one per label, encoded as [`MatchOp::encode`] writes them. A label
+    /// this set does not carry fails `=` and `=~` and passes `!=` and `!~`.
     pub fn matches(&self, other: &Labels) -> bool {
         for (label, value) in other.inner.iter() {
             if let Some(pattern) = value.strip_prefix('!') {
@@ -194,7 +254,8 @@ impl Labels {
                     return false;
                 }
             } else if let Some(v) = self.inner.get(label) {
-                if !match_pattern(v, value) {
+                let operand = value.strip_prefix('=').unwrap_or(value);
+                if v != operand {
                     return false;
                 }
             } else {
@@ -208,6 +269,78 @@ impl Labels {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn filter(op: MatchOp, operand: &str) -> Labels {
+        Labels::from([("k", op.encode(operand))])
+    }
+
+    fn value(v: &str) -> Labels {
+        Labels::from([("k", v)])
+    }
+
+    /// Each operator decides as Prometheus's does for a series carrying the
+    /// label, for operands holding the characters the encoding uses.
+    #[test]
+    fn an_encoded_matcher_decides_as_its_operator() {
+        let values = ["", "a", "a|b", "!a", "~a", "=a", "!=a", "a.b", "axb", "(a)"];
+        for operand in values {
+            for v in values {
+                assert_eq!(
+                    value(v).matches(&filter(MatchOp::Equal, operand)),
+                    v == operand,
+                    "{v} = {operand}"
+                );
+                assert_eq!(
+                    value(v).matches(&filter(MatchOp::NotEqual, operand)),
+                    v != operand,
+                    "{v} != {operand}"
+                );
+            }
+        }
+        let regex = |p: &str, v: &str| {
+            regex::Regex::new(&format!("^(?:{p})$"))
+                .unwrap()
+                .is_match(v)
+        };
+        for pattern in ["a", "a|b", "a.b", "a\\.b", "[!~=]a", "", ".*", "\\(a\\)"] {
+            for v in values {
+                assert_eq!(
+                    value(v).matches(&filter(MatchOp::Regex, pattern)),
+                    regex(pattern, v),
+                    "{v} =~ {pattern}"
+                );
+                assert_eq!(
+                    value(v).matches(&filter(MatchOp::NotRegex, pattern)),
+                    !regex(pattern, v),
+                    "{v} !~ {pattern}"
+                );
+            }
+        }
+    }
+
+    /// A series without the label: only the negative operators match it.
+    #[test]
+    fn an_absent_label_matches_only_a_negative_matcher() {
+        let none = Labels::from([("other", "a")]);
+        assert!(!none.matches(&filter(MatchOp::Equal, "a")));
+        assert!(!none.matches(&filter(MatchOp::Regex, ".*")));
+        assert!(none.matches(&filter(MatchOp::NotEqual, "a")));
+        assert!(none.matches(&filter(MatchOp::NotRegex, "a")));
+    }
+
+    /// A pattern that does not compile matches nothing, so `!~` with it
+    /// matches everything; more patterns than the cache holds still match.
+    #[test]
+    fn a_bad_pattern_matches_nothing_and_the_cache_is_bounded() {
+        assert!(!value("(").matches(&filter(MatchOp::Regex, "(")));
+        assert!(value("(").matches(&filter(MatchOp::NotRegex, "(")));
+        for i in 0..PATTERN_CACHE * 2 + 1 {
+            let pattern = format!("v{i}w?");
+            assert!(value(&format!("v{i}")).matches(&filter(MatchOp::Regex, &pattern)));
+            assert!(!value("v").matches(&filter(MatchOp::Regex, &pattern)));
+        }
+        assert!(PATTERNS.with(|p| p.borrow().len()) <= PATTERN_CACHE);
+    }
 
     /// The list is the contract both loaders read. A key added to one loader
     /// and not the other is how the histogram configuration keys became
