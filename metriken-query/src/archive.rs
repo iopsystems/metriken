@@ -128,8 +128,7 @@ impl<'a> Plan<'a> {
             return Err(QueryError::ParseError(format!(
                 "query {query} matches label {label} more than once in one selector, and \
                  only one matcher per label is applied; use one matcher per label (to \
-                 exclude several values, {label}!~\"a|b\"; regex matchers take literal \
-                 alternatives only)"
+                 exclude several values, {label}!~\"a|b\")"
             )));
         }
         let referenced: Vec<String> = crate::referenced_metrics(query)?.into_iter().collect();
@@ -1601,10 +1600,18 @@ mod tests {
             series(&reader, r#"rate(ops{source!="vllm"}[3s])"#),
             [(labels(&[("source", "rezolus")]), 2.0)]
         );
-        // The filter's regex form is literals and alternations.
         assert_eq!(
             series(&reader, r#"rate(ops{source=~"rezolus|other"}[3s])"#).len(),
             1
+        );
+        // A matcher on a recording label is a regex there as well.
+        assert_eq!(
+            series(&reader, r#"rate(ops{source=~"v.*"}[3s])"#),
+            [(labels(&[("source", "vllm")]), 3.0)]
+        );
+        assert_eq!(
+            series(&reader, r#"rate(ops{source!~"v.*"}[3s])"#),
+            [(labels(&[("source", "rezolus")]), 2.0)]
         );
         assert_eq!(
             series(&reader, r#"sum(rate(ops{source="vllm"}[3s]))"#),
