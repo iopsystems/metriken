@@ -144,7 +144,7 @@ pub use display::{DisplayOptions, DisplayResult, DisplaySeries, EnvPoint, Reduce
 pub use memory_store::{MemoryStore, MemoryStoreBuilder};
 /// metriken-storage's label set: the labels `ParquetBuilder`'s `*_labeled`
 /// methods take, and the filter the `*_labels_matching` methods take, one
-/// matcher per label as `v`, `~v` (`=~`) or `!v` (`!=`, `!~`).
+/// matcher per label as `metriken_storage::MatchOp::encode` writes it.
 /// [`selector_filter`] builds a filter.
 pub use metriken_storage::Labels;
 pub use parquet::{ParquetBuilder, ParquetReader};

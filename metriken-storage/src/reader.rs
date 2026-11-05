@@ -2422,8 +2422,8 @@ impl ArchiveReader {
 
     /// The label sets of counter `name` that `filter` matches, as a query's
     /// selector `name{...}` would select them: `filter` holds the
-    /// selector's matchers as [`Labels::matches`] reads them (`v`, `~v` for
-    /// `=~`, `!v` for `!=` and `!~`). A table whose recording's labels no
+    /// selector's matchers as [`Labels::matches`] reads them, each value as
+    /// [`MatchOp::encode`](crate::MatchOp::encode) writes it. A table whose recording's labels no
     /// series of it can carry under `filter` (`translate_filter`) is not
     /// read, so a filter naming one recording reads only that recording's
     /// tables.
