@@ -263,7 +263,7 @@ export function configureLineChart(chart) {
         ...baseOption,
         ...(xAxisOverride ? { xAxis: xAxisOverride } : {}),
         dataZoom: getDataZoomConfig(calculateMinZoomSpan(widestTimeData, chart.interval)),
-        yAxis: getBaseYAxisOption(logScale, unitSystem),
+        yAxis: getBaseYAxisOption(logScale, unitSystem, format),
         tooltip: {
             ...baseOption.tooltip,
             formatter: getTooltipFormatter(unitSystem ?
