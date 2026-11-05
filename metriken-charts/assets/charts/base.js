@@ -271,7 +271,9 @@ export function getBaseOption() {
  * The y-axis bounds for values from `lo` to `hi` on a chart with
  * `format.min_y_span`, or null when the chart's usual axis applies. Values
  * closer together than the span get an axis that wide, centred on them and
- * kept inside `format.range`. Values outside the range get the usual axis.
+ * kept inside `format.range`, so a narrower range sets the width. Values
+ * outside the range, such as a percentile chart's OOB dots, get the usual
+ * axis.
  */
 export function minSpanBounds(lo, hi, format) {
     const span = format.min_y_span;
@@ -280,7 +282,7 @@ export function minSpanBounds(lo, hi, format) {
     const ceiling = format.range?.max ?? Infinity;
     if (lo < floor || hi > ceiling) return null;
     const min = Math.max(floor, Math.min((lo + hi - span) / 2, ceiling - span));
-    return { min, max: min + span };
+    return { min, max: Math.min(ceiling, min + span) };
 }
 
 /**

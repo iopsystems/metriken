@@ -6,7 +6,11 @@ import { createRequire } from 'node:module';
 // range. The tests read the axis extent from the vendored ECharts, which
 // computes it from the option the chart modules build. Most use a percentage
 // chart, whose values are fractions, so 1.0 is 100%.
-globalThis.document = globalThis.document || { documentElement: { getAttribute: () => null } };
+globalThis.document = globalThis.document || {
+    documentElement: { getAttribute: () => null },
+    addEventListener() {},
+    removeEventListener() {},
+};
 globalThis.getComputedStyle = globalThis.getComputedStyle || (() => ({ getPropertyValue: () => '' }));
 
 const echarts = createRequire(import.meta.url)('../assets/charts/echarts.min.js');
@@ -14,6 +18,9 @@ const echarts = createRequire(import.meta.url)('../assets/charts/echarts.min.js'
 echarts.setPlatformAPI({ measureText: (text) => ({ width: text.length * 7 }) });
 const { getBaseYAxisOption, minSpanBounds } = await import('../assets/charts/base.js');
 const { Chart, ChartsState } = await import('../assets/charts/chart.js');
+const { configureLineChart } = await import('../assets/charts/line.js');
+const { configureMultiSeriesChart } = await import('../assets/charts/multi.js');
+const { configureScatterChart } = await import('../assets/charts/scatter.js');
 
 const T0 = 1_700_000_000;
 const ONE_POINT = { unit_system: 'percentage', min_y_span: 0.01, range: { min: 0, max: 1 } };
@@ -101,6 +108,98 @@ test('an extent with no values has no bounds', () => {
     assert.equal(minSpanBounds(NaN, NaN, ONE_POINT), null);
 });
 
+// A chart drawn by its real chart module, as a page would have it. A span
+// that does not reach the module's axis leaves ECharts' usual extent.
+function configured(configure, data, format, style, spec = {}) {
+    const echart = echarts.init(null, null, { renderer: 'svg', ssr: true, width: 600, height: 300 });
+    rendered.push(echart);
+    const chart = new Chart({
+        spec: { opts: { id: 'c', title: 't', type: 'line', style, format }, data, series_names: data.slice(1).map(() => 'a'), ...spec },
+        chartsState: new ChartsState(),
+        interval: 1,
+    });
+    chart.echart = echart;
+    chart.domNode = {
+        classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+        style: {},
+        querySelector: () => null,
+        querySelectorAll: () => [],
+        appendChild: () => {},
+        addEventListener() {},
+    };
+    configure(chart);
+    return chart;
+}
+
+const times = (n = 60) => Array.from({ length: n }, (_, i) => T0 + i);
+
+for (const [name, configure, style] of [
+    ['line', configureLineChart, 'line'],
+    ['multi-series', configureMultiSeriesChart, 'multi'],
+    ['percentile', configureScatterChart, 'scatter'],
+]) {
+    test(`a ${name} chart draws its span at the default zoom`, () => {
+        const chart = configured(configure, [times(), flat(1)], ONE_POINT, style);
+        assertExtent(yExtent(chart.echart), [0.99, 1]);
+    });
+}
+
+function decimated(median, max) {
+    return [{
+        metric: {},
+        t: times(),
+        min: Float64Array.from(median),
+        lo: Float64Array.from(median),
+        median: Float64Array.from(median),
+        hi: Float64Array.from(median),
+        max: Float64Array.from(max),
+    }];
+}
+
+test('a decimated percentile chart draws its span', () => {
+    const spec = { boxplot: decimated(flat(1), flat(1)), boxplotDecimated: true };
+    const chart = configured(configureScatterChart, [times(), flat(1)], ONE_POINT, 'scatter', spec);
+    assertExtent(yExtent(chart.echart), [0.99, 1]);
+});
+
+test('a decimated percentile chart with an OOB band keeps its span function', () => {
+    const format = { ...ONE_POINT, range: { min: 0, max: 0.1 } };
+    const spec = { boxplot: decimated(flat(0.1), [...flat(0.1, 59), 0.5]), boxplotDecimated: true };
+    const chart = configured(configureScatterChart, [times(), flat(0.1)], format, 'scatter', spec);
+    assert.equal(typeof chart.echart.getOption().yAxis[0].min, 'function');
+});
+
+test('a line chart clamps to the range before it measures the span', () => {
+    const chart = configured(configureLineChart, [times(), flat(1.5)], ONE_POINT, 'line');
+    assertExtent(yExtent(chart.echart), [0.99, 1]);
+});
+
+test('a percentile chart with values in its OOB band keeps the usual axis', () => {
+    const values = [...flat(0.5, 59), 2];
+    const format = { ...ONE_POINT, range: { min: 0, max: 0.51 } };
+    const chart = configured(configureScatterChart, [times(), values], format, 'scatter');
+    const [min] = yExtent(chart.echart);
+    assert.ok(min <= 0.5 && min !== 0.495, `min ${min}`);
+});
+
+test('a range narrower than the span sets the axis at every zoom', () => {
+    const format = { ...ONE_POINT, range: { min: 0, max: 0.005 } };
+    const values = flat(0.002);
+    const echart = renderedChart(values, { format });
+    assertExtent(yExtent(echart), [0, 0.005]);
+    chartOn(echart, values, { start: 25, end: 75 }, format)._rescaleYAxis();
+    assertExtent(yExtent(echart), [0, 0.005]);
+});
+
+test('resetting the zoom on a log axis leaves ECharts to choose its bounds', () => {
+    const format = { ...ONE_POINT, log_scale: true };
+    const values = flat(0.5);
+    const echart = renderedChart(values, { format, logScale: true });
+    const chart = chartOn(echart, values, { start: 0, end: 100 }, format);
+    chart._rescaleYAxis();
+    assert.equal(echart.getOption().yAxis[0].min, null);
+});
+
 test('a chart with no span is left alone', () => {
     const [min, max] = yExtent(renderedChart(flat(0.5), { format: {} }));
     assert.ok(max - min > 0.1, `extent ${min},${max}`);
@@ -111,7 +210,7 @@ test('values just over a point apart keep the axis ECharts chooses', () => {
     assert.deepEqual(yExtent(renderedChart(values)), yExtent(renderedChart(values, { format: {} })));
 });
 
-test('values outside the range keep the axis ECharts chooses', () => {
+test('unclamped values outside the range keep the axis ECharts chooses', () => {
     for (const v of [1.5, -0.5]) {
         assert.deepEqual(yExtent(renderedChart(flat(v))), yExtent(renderedChart(flat(v), { format: {} })));
     }

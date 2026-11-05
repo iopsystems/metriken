@@ -993,8 +993,9 @@ export class Chart {
     }
 
     /**
-     * The lowest and highest y value ECharts holds between two times. An
-     * unstacked series the legend hides counts and a stacked one does not.
+     * The lowest and highest y value ECharts holds between two times. A series
+     * the legend hides counts, except a stacked one hidden since its data was
+     * set, which has no stack result.
      * Unlike the scan in _rescaleYAxis this includes bands, at their stacked
      * height, and the clamped values of a line or scatter series. It reads raw
      * data, because `lttb` thins a series' shown data for the full time range
