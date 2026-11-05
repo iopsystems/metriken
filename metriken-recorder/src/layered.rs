@@ -2,9 +2,10 @@
 //! (metriken-storage's [`layers`](metriken_storage::layers)).
 //!
 //! A source's labels and metadata are the layers merged: what the recorder
-//! observed (the recorder layer), what the producer declared (the producer
-//! layer), and what the caller gave (the user layer), the last winning on a
-//! key. The recorder writes no `source` of its own.
+//! observed and the caller's defaults (the recorder layer), what the
+//! producer declared (the producer layer), and what the caller gave (the
+//! user layer), the last winning on a key. The recorder writes no `source`
+//! of its own.
 
 use std::collections::hash_map::RandomState;
 use std::collections::BTreeMap;
@@ -27,7 +28,7 @@ pub(crate) const ENDPOINT: &str = "endpoint";
 /// Keys the recorder sets in the recorder layer itself, which a probe hook's
 /// reply does not replace.
 const RECORDER_LABELS: [&str; 1] = [ENDPOINT];
-const RECORDER_METADATA: [&str; 2] = [keys::SAMPLING_INTERVAL_MS, TRANSPORT];
+pub(crate) const RECORDER_METADATA: [&str; 2] = [keys::SAMPLING_INTERVAL_MS, TRANSPORT];
 
 /// dendro's timeline-events key. A caller writes it whole (`rezolus record`
 /// writes its run markers there); the recorder stores it as given, outside
@@ -119,18 +120,21 @@ fn random_id() -> String {
 }
 
 /// The recorder's entry for a source as it is added: `endpoint` (an
-/// endpoint's URL), `transport`, `sampling_interval_ms`, and the probe
-/// hook's labels and metadata under those, without a hook `source` label.
+/// endpoint's URL), `transport`, `sampling_interval_ms`, the probe hook's
+/// labels and metadata under those, without a hook `source` label, and the
+/// caller's `defaults` under the hook's metadata.
 pub(crate) fn opened(
     endpoint: Option<&str>,
     transport: &str,
     interval_ms: String,
     hook_labels: &BTreeMap<String, String>,
     hook_metadata: &BTreeMap<String, String>,
+    defaults: &BTreeMap<String, String>,
 ) -> Entry {
     let mut e = entry("recorder");
     e.labels = hook(hook_labels, true);
-    e.metadata = hook(hook_metadata, false);
+    e.metadata = hook(defaults, false);
+    e.metadata.extend(hook(hook_metadata, false));
     if let Some(endpoint) = endpoint {
         e.labels.insert(ENDPOINT.to_string(), endpoint.to_string());
     }
@@ -165,7 +169,8 @@ pub(crate) fn late_hook(hook_metadata: &BTreeMap<String, String>) -> Entry {
     e
 }
 
-/// The probe hook's keys the recorder layer takes: not `source` (the
+/// The probe hook's keys, or the caller's defaults, the recorder layer
+/// takes: not `source` (the
 /// recorder writes none), not the recorder's own keys (the `endpoint` label;
 /// `transport` and `sampling_interval_ms`), and no metadata key
 /// `layers::forbidden_metadata` names (`metriken.` keys, the flat epoch
@@ -333,6 +338,7 @@ mod tests {
                 ("metriken.x", "y"),
                 ("events", "{}"),
             ]),
+            &BTreeMap::new(),
         );
         assert_eq!(
             e.labels,

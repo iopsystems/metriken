@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-recorder 0.8.1
+
+- **Added:** `EndpointSpec::default_metadata` and
+  `EndpointSpec::with_default_metadata`: metadata the caller writes into
+  the recording's recorder layer, beneath the probe hook's reply there and
+  beneath the producer's and the caller's metadata in the merge, for a
+  default the caller ships, such as a KPI template for producers that
+  send none. `descriptions` is unioned by metric name, as in the other
+  layers. `Recorder::start` refuses the keys it refuses in `metadata`,
+  and `source`, `events`, `transport` and `sampling_interval_ms`.
+
 ### metriken-recorder 0.7.0
 
 Requires histogram 1.6.5 (was 1.6.4).
