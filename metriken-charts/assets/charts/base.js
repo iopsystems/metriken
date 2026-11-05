@@ -267,13 +267,43 @@ export function getBaseOption() {
     };
 }
 
+// The narrowest y-axis for percentage values inside 0..1, as a fraction: one
+// percentage point.
+const MIN_PERCENTAGE_SPAN = 0.01;
+
+/**
+ * The y-axis bounds for percentage values from `lo` to `hi`, or null when the
+ * chart's usual axis applies. Values within one point of each other get a span
+ * of one point, centred on them and kept inside 0..1. Without it ECharts draws
+ * a flat 100% on 40-160%. Values outside 0..1, such as the usage of several
+ * CPUs, have no upper limit to keep the span inside and get the usual axis.
+ */
+export function percentageAxisBounds(lo, hi) {
+    if (!(lo >= 0 && hi <= 1 && lo <= hi) || hi - lo >= MIN_PERCENTAGE_SPAN) return null;
+    const min = Math.max(0, Math.min((lo + hi - MIN_PERCENTAGE_SPAN) / 2, 1 - MIN_PERCENTAGE_SPAN));
+    return { min, max: min + MIN_PERCENTAGE_SPAN };
+}
+
+/**
+ * The `min` and `max` of a y-axis at the default zoom. For a percentage chart
+ * they are functions, so ECharts passes them the extent of the series the
+ * legend shows, across the whole time range, with stacked bands at their
+ * stacked height. A log axis keeps the bounds ECharts chooses.
+ */
+export function defaultYAxisBounds(logScale, unitSystem) {
+    if (logScale || unitSystem !== 'percentage') return { min: null, max: null };
+    return {
+        min: ({ min, max }) => percentageAxisBounds(min, max)?.min ?? null,
+        max: ({ min, max }) => percentageAxisBounds(min, max)?.max ?? null,
+    };
+}
+
 export function getBaseYAxisOption(logScale, unitSystem) {
     return {
         type: logScale ? 'log' : 'value',
         logBase: 10,
         scale: true,
-        min: null,
-        max: null,
+        ...defaultYAxisBounds(logScale, unitSystem),
         axisLine: { show: false },
         axisTick: { show: false },
         axisLabel: {

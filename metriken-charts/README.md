@@ -23,8 +23,8 @@ machine that built the crate:
 
 - `echarts` as a global: load `charts/echarts.min.js` before the modules,
   or your own ECharts. The modules were checked by hand against the bundled
-  6.1.0 in the rezolus viewer (iopsystems/rezolus#1613); the node tests do
-  not load ECharts.
+  6.1.0 in the rezolus viewer (iopsystems/rezolus#1613); of the node tests,
+  only `tests/percentage_axis.test.mjs` loads ECharts.
 - CSS custom properties on `document.documentElement`:
   - every property named in `CSS_MAP` in `charts/util/colormap.js`, with no
     fallback: an unset property reads as an empty string. The modules read

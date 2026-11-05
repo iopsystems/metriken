@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-charts 0.1.1
+
+- **Fixed:** a percentage chart whose values stay in 0..100% and within
+  one percentage point draws a y-axis one point wide, inside 0..100%.
+  A band or OOB value wider than that in the visible window keeps the
+  usual axis, an OOB chart zoomed away from its OOB values keeps the top
+  of the OOB band, and a range ceiling inside the span trims it when
+  zoomed. A flat 100% drew on 40-160% and a flat 0% on 0-100%. Values
+  that vary by under a point now use the same span, so a small change
+  draws smaller than it did: an error rate of 0 with a 0.05% spike
+  fills 5% of the plot height. Log axes and values outside 0..100% are
+  unchanged.
+
 ### metriken-recorder 0.8.1
 
 - **Added:** `EndpointSpec::default_metadata` and

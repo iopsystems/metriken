@@ -20,7 +20,7 @@ import {
 import globalColorMapper, { COLORS } from './util/colormap.js';
 import { resolveStyle, resolvedStyle } from './metric_types.js';
 import { buildMarkLine, buildRangeSpans, formatDuration, isRangeEvent } from './event_markers.js';
-import { buildFreezeFooterContent } from './base.js';
+import { buildFreezeFooterContent, defaultYAxisBounds, percentageAxisBounds } from './base.js';
 import { chartHost } from './host.js';
 
 
@@ -893,8 +893,9 @@ export class Chart {
 
         // If at default zoom and no pins active, restore original bounds
         if (this.chartsState.isDefaultZoom() && !(hasPins && labels)) {
+            const bounds = defaultYAxisBounds(isLog, format.unit_system);
             this.echart.setOption({
-                yAxis: { min: null, max: this._oobAxisMax ?? null }
+                yAxis: { min: bounds.min, max: this._oobAxisMax ?? bounds.max }
             });
             return;
         }
@@ -949,6 +950,12 @@ export class Chart {
 
         if (yMin === Infinity || yMax === -Infinity) return;
 
+        const span = !isLog && format.unit_system === 'percentage'
+            ? percentageAxisBounds(...this._drawnYExtent(visibleMinMs, visibleMaxMs))
+            : null;
+        // A boxplot's columns are not clamped, so a span can sit above the range.
+        const percentage = span && !(span.min >= (format.range?.max ?? Infinity)) ? span : null;
+
         // Handle flat line (all same value)
         if (yMin === yMax) {
             const pad = yMin !== 0 ? Math.abs(yMin * 0.1) : 1;
@@ -958,7 +965,10 @@ export class Chart {
 
         // Add padding — multiplicative for log scale, additive for linear
         let newMin, newMax;
-        if (isLog) {
+        if (percentage) {
+            newMin = percentage.min;
+            newMax = percentage.max;
+        } else if (isLog) {
             newMin = yMin / 1.2;
             newMax = yMax * 1.2;
         } else {
@@ -982,6 +992,33 @@ export class Chart {
                 max: yAxisMax,
             }
         });
+    }
+
+    /**
+     * The lowest and highest y value ECharts holds between two times, for
+     * every series on the chart, including an unstacked series the legend
+     * hides. Unlike the scan in _rescaleYAxis this includes bands, at their stacked height, and
+     * the clamped values of a line or scatter series. An unstacked series is
+     * read from its raw data, because `lttb` thins its shown data for the
+     * full time range and a narrow window can hold one point of it.
+     */
+    _drawnYExtent(minMs, maxMs) {
+        let lo = Infinity;
+        let hi = -Infinity;
+        for (const series of this.echart.getModel().getSeries()) {
+            const shown = series.getData();
+            const stacked = shown.getCalculationInfo('stackedDimension');
+            const data = stacked ? shown : series.getRawData();
+            const y = stacked
+                ? shown.getCalculationInfo('stackResultDimension')
+                : data.mapDimension('y');
+            data.each([data.mapDimension('x'), y], (t, v) => {
+                if (t < minMs || t > maxMs || Number.isNaN(v)) return;
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+            });
+        }
+        return [lo, hi];
     }
 
     _chartScope() {
