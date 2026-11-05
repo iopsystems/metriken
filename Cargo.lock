@@ -1402,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-query"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "arrow",
  "bytes",
@@ -1425,7 +1425,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-recorder"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1453,7 +1453,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-storage"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "arrow",
  "bytes",

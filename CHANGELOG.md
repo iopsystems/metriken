@@ -87,6 +87,14 @@ Requires metriken-storage 0.7.0.
   classes, and `$01` is group 1. An invalid `dst` name or regex is an
   error, and `src` or `dst` naming `__name__` is not supported.
 
+### metriken-recorder 0.8.0
+
+Requires metriken-storage 0.7.0.
+
+- **Breaking:** takes metriken-storage 0.7 (was 0.6), whose `WriterConfig`
+  this crate re-exports. A caller that also depends on metriken-storage
+  moves to 0.7 with it.
+
 
 ### metriken-charts 0.1.0
 
