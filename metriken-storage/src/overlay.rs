@@ -33,12 +33,15 @@ pub enum SourceSelector {
     /// The source with this uuid, and its copies, which keep it.
     Uuid(String),
     /// The sources whose labels, as the archive stores them, `Labels::matches`
-    /// this filter: one matcher per label, `v` for `=`, `~v` for `=~`, `!v`
-    /// for `!=` and `!~`. No matcher is a regex: `~v` matches as `v` does, a
-    /// value containing `|` (optionally in parentheses) is a list of literal
-    /// alternatives, and `\.` is a literal `.`; every other character is
-    /// literal. A value under `=` cannot start with `!` or `~`, and `k=v`
-    /// and `k=~v` do not match a source without `k`.
+    /// this filter: one matcher per label, each value as [`MatchOp::encode`]
+    /// writes it. `~re` and `!re` are regular expressions anchored at both
+    /// ends (`=~` and `!~`; `!=` is `!` with the value escaped as a regex),
+    /// and any other value is compared whole after one leading `=` is
+    /// removed. `k=v` and `k=~re` do not match a source without `k`; `!=`
+    /// and `!~` do. A pattern that does not compile matches no value, so
+    /// `~` with it selects no source and `!` selects every source.
+    ///
+    /// [`MatchOp::encode`]: crate::MatchOp::encode
     Matching(Labels),
 }
 
