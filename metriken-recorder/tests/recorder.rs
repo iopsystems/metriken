@@ -718,6 +718,92 @@ async fn the_handshakes_identity_outranks_the_hooks() {
     );
 }
 
+/// The caller's default metadata is the recorder layer's, beneath the
+/// probe hook's there and beneath the handshake's and the caller's own
+/// metadata in the merge.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_callers_defaults_are_beneath_the_hook_the_handshake_and_the_caller() {
+    let fake = serve(Behaviour {
+        banner: Some("Rezolus 6.0.0 Agent\n".into()),
+        ..stream_only(&[], &[("version", "handshake"), ("dashboard", "producer")])
+    })
+    .await;
+    let endpoint = spec(&fake.url)
+        .with_metadata("role", "mine")
+        .with_default_metadata("service_queries", "default")
+        .with_default_metadata("dashboard", "default")
+        .with_default_metadata("version", "default")
+        .with_default_metadata("role", "default");
+    let probe = Arc::new(AgentProbe(client()));
+    let detected = detect(&client(), &detect_cfg(), vec![endpoint], probe.as_ref()).await;
+    let run = record(
+        detected,
+        probe,
+        Vec::new(),
+        |_| {},
+        Duration::from_millis(500),
+        Stop::Grace(INTERVAL),
+    )
+    .await;
+    run.summary.expect("finished");
+    let r = &recordings(&run.path, "fake/ops")[""];
+    assert_eq!(r.metadata["service_queries"], "default", "nothing above it");
+    assert_eq!(r.metadata["dashboard"], "producer", "the handshake's");
+    assert_eq!(r.metadata["version"], "handshake");
+    assert_eq!(r.metadata["role"], "mine", "the caller's");
+    let layers = metriken_storage::layers::Layers::read(&r.metadata)
+        .unwrap()
+        .unwrap();
+    assert_eq!(layers.recorder.metadata["service_queries"], "default");
+    assert_eq!(layers.recorder.metadata["dashboard"], "default");
+    assert_eq!(
+        layers.recorder.metadata["version"], "6.0.0",
+        "the hook's, over the default"
+    );
+}
+
+/// A default the recorder layer holds of its own, or one a caller's
+/// metadata may not set, is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_default_cannot_set_the_recorders_keys() {
+    for (key, says) in [
+        (
+            "source",
+            "source is a label, so it cannot be a default; set it",
+        ),
+        ("events", "events is stored as given outside the layers, so"),
+        ("transport", "transport is a key the recorder writes"),
+        (
+            "sampling_interval_ms",
+            "sampling_interval_ms is a key the recorder",
+        ),
+        ("producer_epoch", "producer_epoch"),
+        ("metriken.x", "metriken.x"),
+        ("encoder", "encoder"),
+    ] {
+        let endpoint = spec(&unused_url()).with_default_metadata(key, "mine");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.dendro");
+        let started = Recorder::start(
+            RecorderConfig::new(&path, INTERVAL),
+            client(),
+            Arc::new(NoProbe),
+            vec![Detected::Pending {
+                spec: endpoint,
+                reason: "down".into(),
+            }],
+            Vec::new(),
+        )
+        .await;
+        match started {
+            Err(StartError::Reserved(e)) => assert!(e.starts_with(says), "{e}"),
+            Err(e) => panic!("{e}"),
+            Ok(_) => panic!("{key} accepted"),
+        }
+        assert!(!path.exists());
+    }
+}
+
 /// GO check 3, mid-run: an agent too old to stream that comes up after the
 /// recording started is refused on activation; the exporter beside it is
 /// recorded and the archive finalized.

@@ -53,6 +53,17 @@ pub struct EndpointSpec {
     /// epoch keys, `encoder` and `writer_sessions` are refused; `events` is
     /// stored as given, outside the layers.
     pub metadata: BTreeMap<String, String>,
+    /// The recording's recorder-layer metadata the caller supplies: a
+    /// default the producer's metadata and the user layer win over (a KPI
+    /// template the caller ships for producers that send none). Written in
+    /// the recorder's entry for the source as it is added, beneath the probe
+    /// hook's metadata: a key the hook's reply also carries, `descriptions`
+    /// among them, is the reply's. `descriptions` is unioned by metric name
+    /// across the layers, so a default's names stay beside the producer's. A
+    /// `metriken.` key, the flat epoch keys, `encoder`, `writer_sessions`,
+    /// `source`, `events`, `transport` and `sampling_interval_ms` are
+    /// refused.
+    pub default_metadata: BTreeMap<String, String>,
 }
 
 impl EndpointSpec {
@@ -63,6 +74,7 @@ impl EndpointSpec {
             transport: Transport::Auto,
             labels: BTreeMap::new(),
             metadata: BTreeMap::new(),
+            default_metadata: BTreeMap::new(),
         }
     }
 
@@ -82,6 +94,17 @@ impl EndpointSpec {
     /// With the metadata `key=value`.
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.metadata.insert(key.into(), value.into());
+        self
+    }
+
+    /// With the recorder-layer default metadata `key=value`
+    /// ([`EndpointSpec::default_metadata`]).
+    pub fn with_default_metadata(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.default_metadata.insert(key.into(), value.into());
         self
     }
 }

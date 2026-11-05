@@ -49,9 +49,9 @@ pub const PRODUCER_NAME: &str = "producer_name";
 /// The label the merged layers give a source from its merged
 /// [`PRODUCER_NAME`], whichever layer sets it: a user entry over the
 /// producer's declared name over the recorder layer's (what the probe hook or
-/// a legacy derivation read). A later entry that changes the merged name, a
-/// late hook reply among them, changes the label with it. Internal by the
-/// `__` rule, so listings and legends hide it.
+/// a legacy derivation read, or a recorder's default). A later entry that
+/// changes the merged name, a late hook reply among them, changes the label
+/// with it. Internal by the `__` rule, so listings and legends hide it.
 pub const PRODUCER_LABEL: &str = "__producer__";
 /// The producer layer's metadata key for a producer identity's version.
 pub const VERSION: &str = "version";
@@ -107,7 +107,8 @@ pub fn forbidden_metadata(key: &str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Layer {
     /// What the recorder observed: the endpoint, the transport, each producer
-    /// epoch, and what a probe hook read.
+    /// epoch, and what a probe hook read; and a recorder's defaults
+    /// (metriken-recorder's `EndpointSpec::default_metadata`).
     Recorder,
     /// What the producer declared: its handshake, or an in-process source's
     /// identity.

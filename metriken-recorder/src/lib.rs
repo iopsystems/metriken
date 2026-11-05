@@ -14,16 +14,18 @@
 //!
 //! A source's labels and metadata are its identity layers
 //! (metriken-storage's `layers`): the recorder's entries (`endpoint`,
-//! `transport`, `sampling_interval_ms`, the probe hook's reply, and one
-//! entry per producer epoch), the producer's (its handshake, or a local
+//! `transport`, `sampling_interval_ms`, the probe hook's reply over an
+//! endpoint's [`EndpointSpec::default_metadata`], and one entry per
+//! producer epoch), the producer's (its handshake, or a local
 //! source's [`SourceIdentity`], with a producer identity written as
 //! `producer_name`, `version`, `build` and the `host` label), and the
 //! caller's (an endpoint's labels and metadata, a local source's labels,
 //! [`Recorder::patch_metadata`]), merged in that order, the last winning.
 //! The recorder writes no `source` of its own. It refuses a caller's
 //! `metriken.` keys, the flat epoch keys, and dendro's `encoder` and
-//! `writer_sessions`; a caller's `events` is stored as given, outside the
-//! layers.
+//! `writer_sessions`, and, as a default, `source`, `events`, `transport`
+//! and `sampling_interval_ms`; a caller's `events` is stored as given,
+//! outside the layers.
 //!
 //! [`detect`] decides how each endpoint is recorded before the archive
 //! opens: by its stream first, then by the caller's [`Probe`] hook, then as
@@ -127,7 +129,8 @@ pub mod keys {
     /// layers carry. Refused from a caller, as `PRODUCER_EPOCH` is.
     pub const PRODUCER_EPOCHS: &str = "producer_epochs";
     /// The producer's version, as its handshake (the producer layer) or the
-    /// probe hook (the recorder layer) reports it.
+    /// probe hook (the recorder layer) reports it, or as a caller's default
+    /// (the recorder layer) gives it.
     pub const VERSION: &str = "version";
     /// A JSON object of metric name to help text; a scraped source's `#
     /// HELP` lines.

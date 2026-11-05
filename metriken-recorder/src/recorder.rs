@@ -555,6 +555,7 @@ impl Recorder {
         #[cfg(feature = "http")]
         for d in detected {
             reserved(&d.spec().labels, &d.spec().metadata)?;
+            reserved_default(&d.spec().default_metadata)?;
             let id = SourceId(slots.len() as u32);
             let (spec, mode, state, opened) = match d {
                 Detected::Streamed { spec, subscription } => (
@@ -773,6 +774,31 @@ fn reserved_key(
             "{key} is a key dendro maintains for the source, so it cannot be set"
         )),
     }
+}
+
+/// Refuse a caller's default metadata key that [`reserved`] refuses, and
+/// `source` (a label), dendro's `events` (stored outside the layers),
+/// `transport` and `sampling_interval_ms` (the recorder's own).
+#[cfg(feature = "http")]
+fn reserved_default(defaults: &BTreeMap<String, String>) -> Result<(), StartError> {
+    for key in defaults.keys() {
+        let (reason, hint) = if key == keys::SOURCE {
+            ("is a label", "; set it with EndpointSpec::with_label")
+        } else if key == layered::EVENTS {
+            (
+                "is stored as given outside the layers",
+                "; give it in EndpointSpec::metadata",
+            )
+        } else if layered::RECORDER_METADATA.contains(&key.as_str()) {
+            ("is a key the recorder writes for the source", "")
+        } else {
+            continue;
+        };
+        return Err(StartError::Reserved(format!(
+            "{key} {reason}, so it cannot be a default{hint}"
+        )));
+    }
+    reserved(&BTreeMap::new(), defaults)
 }
 
 pub(crate) fn wall_now_ns() -> u64 {
@@ -1656,7 +1682,7 @@ impl Driver {
                 let none = BTreeMap::new();
                 entries.push((
                     Layer::Recorder,
-                    layered::opened(None, "local", interval_ms, &none, &none),
+                    layered::opened(None, "local", interval_ms, &none, &none, &none),
                 ));
                 if let Some(epoch) = &identity.epoch {
                     entries.push((Layer::Recorder, layered::epoch(epoch, None, &none)));
@@ -1701,6 +1727,7 @@ impl Driver {
                         interval_ms,
                         &ep.hook_labels,
                         &ep.hook_metadata,
+                        &ep.spec.default_metadata,
                     ),
                 ));
                 if let Some(epoch) = &ep.epoch {
