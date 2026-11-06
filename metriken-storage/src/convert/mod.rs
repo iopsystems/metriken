@@ -15,7 +15,9 @@
 //! or 0.3.3) runs on a dendro up to 0.5.1, which opens only
 //! schema 4, and dendro 0.6 writes schema 5, so they refuse every archive
 //! this writes when opening it. metriken-storage 0.4.0 opens it and refuses
-//! a format 2 segment (a gauge histogram) by its `metriken.format` key.
+//! a format 2 segment (a gauge histogram) by its `metriken.format` key, and
+//! metriken-storage 0.7.0, which reads up to format 2, refuses a format 3
+//! segment (a float counter or gauge) the same way.
 //! Parquet files written before keep reading (`parquet`, `MultiParquetSource`,
 //! and metriken-query's `ParquetReader`).
 

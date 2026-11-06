@@ -2899,7 +2899,7 @@ mod tests {
             metriken_storage::types::Counter {
                 labels: metriken_storage::Labels::default(),
                 timestamps: vec![S, 2 * S, 3 * S],
-                values: vec![1, 2, 3],
+                values: vec![1, 2, 3].into(),
                 windows: None,
             },
         );

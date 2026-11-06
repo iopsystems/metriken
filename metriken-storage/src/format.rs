@@ -27,6 +27,13 @@
 //!   histogram by its Arrow type alone, would difference its rows. A writer
 //!   stamps 2 only on a segment that holds one ([`format_of`]), so an archive
 //!   without gauge histograms stays readable by format 1 readers.
+//! - 3 ([`FORMAT_FLOAT`]): a segment holding a `Float64` column, a float
+//!   counter or gauge (`metric_type` `counter` or `gauge`). A format 2
+//!   reader does not classify a `Float64` column, so it would drop the
+//!   series without an error, and its eager table decoder
+//!   (`read_table_parquet`) panics on one. A writer stamps 3 only on a
+//!   segment that holds one, so a segment without float columns stays
+//!   format 1 or 2.
 
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
@@ -37,24 +44,34 @@ use crate::long::{LAYOUT_KEY, LAYOUT_LONG};
 pub const FORMAT_KEY: &str = "metriken.format";
 
 /// The newest format version this crate reads, and the one it writes for a
-/// segment holding a gauge histogram. Other segments are written as format 1
-/// ([`format_of`]).
-pub const FORMAT_VERSION: u32 = 2;
+/// segment holding a float column. Other segments are written as format 1
+/// or 2 ([`format_of`]).
+pub const FORMAT_VERSION: u32 = 3;
 
 /// The format of a segment holding a gauge histogram column.
 pub const FORMAT_GAUGE_HISTOGRAM: u32 = 2;
 
+/// The format of a segment holding a float counter or gauge column.
+pub const FORMAT_FLOAT: u32 = 3;
+
 /// The format a segment with `schema`'s columns is written as:
+/// [`FORMAT_FLOAT`] when a column is `Float64`, else
 /// [`FORMAT_GAUGE_HISTOGRAM`] when a column's field metadata has
 /// `metric_type = gauge_histogram`, else 1.
 pub fn format_of(schema: &arrow::datatypes::Schema) -> u32 {
+    let float = schema
+        .fields()
+        .iter()
+        .any(|f| f.data_type() == &arrow::datatypes::DataType::Float64);
     let gauge_histogram = schema.fields().iter().any(|f| {
         f.metadata()
             .get(metriken_model::METRIC_TYPE)
             .map(String::as_str)
             == Some(metriken_model::GAUGE_HISTOGRAM)
     });
-    if gauge_histogram {
+    if float {
+        FORMAT_FLOAT
+    } else if gauge_histogram {
         FORMAT_GAUGE_HISTOGRAM
     } else {
         1
@@ -81,17 +98,23 @@ impl From<FormatError> for String {
 
 /// Refuse a segment this reader cannot interpret; see the module docs.
 pub fn check(kv: Option<&Vec<KeyValue>>) -> Result<(), FormatError> {
+    check_up_to(kv, FORMAT_VERSION)
+}
+
+/// [`check`] for a reader of formats up to `newest`: what a release that
+/// reads up to `newest` does with the segment.
+fn check_up_to(kv: Option<&Vec<KeyValue>>, newest: u32) -> Result<(), FormatError> {
     let get = |key: &str| {
         kv.and_then(|kv| kv.iter().find(|e| e.key == key))
             .map(|e| e.value.as_deref().unwrap_or(""))
     };
     if let Some(v) = get(FORMAT_KEY) {
         match v.parse::<u32>() {
-            Ok(n) if n <= FORMAT_VERSION => {}
+            Ok(n) if n <= newest => {}
             Ok(n) => {
                 return Err(FormatError(format!(
                     "segment format {n} is newer than this reader, which reads up to \
-                     {FORMAT_VERSION}; read it with a newer release"
+                     {newest}; read it with a newer release"
                 )))
             }
             Err(_) => {
@@ -165,6 +188,7 @@ mod tests {
         assert_eq!(check(Some(&kv(&[("source", "rezolus")]))), Ok(()));
         assert_eq!(check(Some(&kv(&[(FORMAT_KEY, "1")]))), Ok(()));
         assert_eq!(check(Some(&kv(&[(FORMAT_KEY, "2")]))), Ok(()));
+        assert_eq!(check(Some(&kv(&[(FORMAT_KEY, "3")]))), Ok(()));
         assert_eq!(
             check(Some(&kv(&[(FORMAT_KEY, "1"), (LAYOUT_KEY, LAYOUT_LONG)]))),
             Ok(())
@@ -173,8 +197,8 @@ mod tests {
 
     #[test]
     fn a_newer_format_or_an_unknown_layout_is_refused() {
-        let e = check(Some(&kv(&[(FORMAT_KEY, "3")]))).unwrap_err();
-        assert!(e.to_string().contains("segment format 3 is newer"), "{e}");
+        let e = check(Some(&kv(&[(FORMAT_KEY, "4")]))).unwrap_err();
+        assert!(e.to_string().contains("segment format 4 is newer"), "{e}");
         let e = check(Some(&kv(&[(FORMAT_KEY, "two")]))).unwrap_err();
         assert!(e.to_string().contains("not a version number"), "{e}");
         let e = check(Some(&kv(&[(LAYOUT_KEY, "long2")]))).unwrap_err();
@@ -225,5 +249,62 @@ mod tests {
             .build();
         let got = stamped(props).key_value_metadata().cloned().unwrap();
         assert_eq!(got, kv(&[("a", "b"), (FORMAT_KEY, "1")]));
+    }
+
+    /// A schema with a `Float64` column is format 3, with or without a
+    /// gauge histogram beside it; one without stays 1 or 2. A reader of
+    /// formats up to 2 (metriken-storage 0.5 to 0.7) refuses it.
+    #[test]
+    fn a_float_column_makes_the_segment_format_3() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let scalar = |kind: &str, ty: DataType| {
+            Field::new(format!("x_{kind}"), ty, true).with_metadata(
+                std::collections::HashMap::from([("metric_type".to_string(), kind.to_string())]),
+            )
+        };
+        let gauge_histogram = Field::new(
+            "h:buckets",
+            DataType::new_list(DataType::UInt64, true),
+            true,
+        )
+        .with_metadata(std::collections::HashMap::from([(
+            "metric_type".to_string(),
+            "gauge_histogram".to_string(),
+        )]));
+        let ts = Field::new("timestamp", DataType::UInt64, false);
+        let ints = Schema::new(vec![
+            ts.clone(),
+            scalar("counter", DataType::UInt64),
+            scalar("gauge", DataType::Int64),
+        ]);
+        let with_gauge_histogram = Schema::new(vec![ts.clone(), gauge_histogram.clone()]);
+        let float_counter = Schema::new(vec![ts.clone(), scalar("counter", DataType::Float64)]);
+        let float_gauge = Schema::new(vec![ts.clone(), scalar("gauge", DataType::Float64)]);
+        let both = Schema::new(vec![
+            ts,
+            gauge_histogram,
+            scalar("gauge", DataType::Float64),
+        ]);
+        assert_eq!(format_of(&ints), 1);
+        assert_eq!(format_of(&with_gauge_histogram), FORMAT_GAUGE_HISTOGRAM);
+        assert_eq!(format_of(&float_counter), FORMAT_FLOAT);
+        assert_eq!(format_of(&float_gauge), FORMAT_FLOAT);
+        assert_eq!(format_of(&both), FORMAT_FLOAT);
+
+        let stamped = stamped_for(WriterProperties::builder().build(), &float_gauge);
+        assert_eq!(
+            stamped.key_value_metadata().cloned().unwrap(),
+            kv(&[(FORMAT_KEY, "3")])
+        );
+        assert_eq!(check(stamped.key_value_metadata()), Ok(()));
+        let e = check_up_to(stamped.key_value_metadata(), 2).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "segment format 3 is newer than this reader, which reads up to 2; read it with a \
+             newer release"
+        );
+        // A format 2 segment is still read by a format 2 reader.
+        let stamped = stamped_for(WriterProperties::builder().build(), &with_gauge_histogram);
+        assert_eq!(check_up_to(stamped.key_value_metadata(), 2), Ok(()));
     }
 }

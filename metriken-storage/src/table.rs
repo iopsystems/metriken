@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::window::Window;
-use arrow::array::{Array, ArrayRef, Int64Array, ListBuilder, UInt64Array, UInt64Builder};
+use arrow::array::{
+    Array, ArrayRef, Float64Array, Int64Array, ListBuilder, UInt64Array, UInt64Builder,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -37,6 +39,11 @@ pub enum Values {
     Counter(Vec<Option<u64>>),
     Gauge(Vec<Option<i64>>),
     Histogram(Vec<Option<histogram::Histogram>>),
+    /// A float counter: a `Float64` column whose `metric_type` is
+    /// `counter`.
+    FloatCounter(Vec<Option<f64>>),
+    /// A float gauge: a `Float64` column whose `metric_type` is `gauge`.
+    FloatGauge(Vec<Option<f64>>),
 }
 
 /// One metric column plus its per-row acquisition windows.
@@ -124,8 +131,26 @@ fn build_histogram_list(values: &[Option<histogram::Histogram>]) -> ArrayRef {
 /// `arrays`. Shared by both `table_to_batch` branches — the window sidecar
 /// placement differs between them (table-level vs per-metric), but the value
 /// column itself never does.
+///
+/// A float column's `metric_type` is written as its variant says, whatever
+/// the column's metadata holds: a reader tells a float counter from a float
+/// gauge by it alone, and does not read a `Float64` column of any other
+/// `metric_type`.
 fn push_value_column(fields: &mut Vec<Field>, arrays: &mut Vec<ArrayRef>, col: &Column) {
+    let float = |kind: &str| {
+        let mut metadata = col.metadata.clone();
+        metadata.insert(metriken_model::METRIC_TYPE.to_string(), kind.to_string());
+        Field::new(&col.name, DataType::Float64, true).with_metadata(metadata)
+    };
     match &col.values {
+        Values::FloatCounter(v) => {
+            fields.push(float("counter"));
+            arrays.push(Arc::new(Float64Array::from(v.clone())));
+        }
+        Values::FloatGauge(v) => {
+            fields.push(float("gauge"));
+            arrays.push(Arc::new(Float64Array::from(v.clone())));
+        }
         Values::Counter(v) => {
             fields.push(
                 Field::new(&col.name, DataType::UInt64, true).with_metadata(col.metadata.clone()),
@@ -399,18 +424,27 @@ pub fn read_table_parquet(sampler: String, bytes: Vec<u8>) -> Result<Table, Erro
                     }
                 }
             } else {
-                // A metric value column: counter (UInt64) or gauge (Int64).
+                // A metric value column: counter (UInt64), gauge (Int64), or
+                // a float counter or gauge (Float64, told apart by
+                // `metric_type`; a Float64 column of any other
+                // `metric_type` is not read, as `parse_schema` does not).
                 let meta: HashMap<String, String> = field.metadata().into();
-                let is_gauge = meta.get("metric_type").map(String::as_str) == Some("gauge");
+                let metric_type = meta.get("metric_type").map(String::as_str);
+                let is_gauge = metric_type == Some("gauge");
+                let empty = match field.data_type() {
+                    DataType::Float64 => match metric_type {
+                        Some("counter") => Values::FloatCounter(Vec::new()),
+                        Some("gauge") => Values::FloatGauge(Vec::new()),
+                        _ => continue,
+                    },
+                    _ if is_gauge => Values::Gauge(Vec::new()),
+                    _ => Values::Counter(Vec::new()),
+                };
                 let entry = match values.entry(name.to_string()) {
                     std::collections::hash_map::Entry::Vacant(v) => {
                         order.push(name.to_string());
                         metas.insert(name.to_string(), meta);
-                        v.insert(if is_gauge {
-                            Values::Gauge(Vec::new())
-                        } else {
-                            Values::Counter(Vec::new())
-                        })
+                        v.insert(empty)
                     }
                     std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
                 };
@@ -424,6 +458,13 @@ pub fn read_table_parquet(sampler: String, bytes: Vec<u8>) -> Result<Table, Erro
                             .as_any()
                             .downcast_ref::<Int64Array>()
                             .expect("i64 gauge");
+                        vs.extend((0..a.len()).map(|r| (!a.is_null(r)).then(|| a.value(r))));
+                    }
+                    Values::FloatCounter(vs) | Values::FloatGauge(vs) => {
+                        let a = col
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .ok_or("a float column that is not Float64")?;
                         vs.extend((0..a.len()).map(|r| (!a.is_null(r)).then(|| a.value(r))));
                     }
                     Values::Histogram(_) => {}

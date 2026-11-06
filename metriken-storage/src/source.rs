@@ -34,6 +34,9 @@ pub struct ColumnPosition {
     /// null (a wide table keeps a series' column after it stops); true
     /// when they do not say. Fits the struct's padding.
     pub holds_values: bool,
+    /// Whether the column is a float counter (`Float64`), whose values a
+    /// read returns as `CounterValues::Float`. Fits the struct's padding.
+    pub float: bool,
 }
 pub trait DataSource: Send + Sync {
     /// A source emits every sample at the timestamp it was recorded with.

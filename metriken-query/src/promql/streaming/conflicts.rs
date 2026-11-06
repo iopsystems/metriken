@@ -52,8 +52,20 @@ enum Kind {
     Gauge,
 }
 
-/// A row as kept: its time, window and value.
+/// A row as kept: its time, window and value. The value is compared for
+/// equality only: an integer counter's as itself, an integer gauge's bits,
+/// a float's bits ([`value_bits`]).
 pub(crate) type Row = (u64, Option<(u64, u64)>, u64);
+
+/// A counter reading as a [`Row`] keeps it. An integer and a float reading
+/// of one series at one time compare unequal even when they are the same
+/// number.
+fn value_bits(v: crate::types::CounterValue) -> u64 {
+    match v {
+        crate::types::CounterValue::Int(v) => v,
+        crate::types::CounterValue::Float(v) => v.to_bits(),
+    }
+}
 
 /// One source's rows of one series as read. Rows read twice appear twice.
 type Rows = Vec<Row>;
@@ -203,10 +215,12 @@ impl Recorded {
                 &self.source,
                 c.timestamps
                     .iter()
-                    .zip(&c.values)
                     .enumerate()
-                    .filter(|(_, (t, _))| within(self.keep, **t))
-                    .map(|(i, (t, v))| (*t, windows.and_then(|w| w.get(i).copied()), *v)),
+                    .filter(|(_, t)| within(self.keep, **t))
+                    .filter_map(|(i, t)| {
+                        let v = value_bits(c.values.get(i)?);
+                        Some((*t, windows.and_then(|w| w.get(i).copied()), v))
+                    }),
             );
         }
     }
@@ -219,10 +233,15 @@ impl Recorded {
                 &self.source,
                 g.timestamps
                     .iter()
-                    .zip(&g.values)
                     .enumerate()
-                    .filter(|(_, (t, _))| within(self.keep, **t))
-                    .map(|(i, (t, v))| (*t, windows.and_then(|w| w.get(i).copied()), *v as u64)),
+                    .filter(|(_, t)| within(self.keep, **t))
+                    .filter_map(|(i, t)| {
+                        let v = match &g.values {
+                            crate::types::GaugeValues::Int(v) => *v.get(i)? as u64,
+                            crate::types::GaugeValues::Float(v) => v.get(i)?.to_bits(),
+                        };
+                        Some((*t, windows.and_then(|w| w.get(i).copied()), v))
+                    }),
             );
         }
     }
@@ -269,7 +288,7 @@ impl Iterator for RecordedSamples<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         let x = self.inner.next()?;
         if within(self.keep, x.ts) {
-            self.kept.push((x.ts, x.window, x.value));
+            self.kept.push((x.ts, x.window, value_bits(x.value)));
         }
         Some(x)
     }
@@ -392,6 +411,7 @@ impl DataSource for Recorded {
                     CounterStream {
                         labels: s.labels,
                         windowed: s.windowed,
+                        float: s.float,
                         interval: s.interval,
                         samples: Box::new(RecordedSamples {
                             inner: s.samples,
@@ -729,7 +749,7 @@ mod tests {
             crate::types::Gauge {
                 labels: Labels::from(&[("cpu", "0")][..]),
                 timestamps: vec![S],
-                values: vec![11],
+                values: vec![11].into(),
                 windows: None,
             },
         );

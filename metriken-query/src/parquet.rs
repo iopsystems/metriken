@@ -691,12 +691,14 @@ mod tests {
         use crate::long::LAYOUT_KEY;
         use metriken_storage::format::FORMAT_KEY;
         assert!(ParquetReader::open_bytes(file(vec![(FORMAT_KEY, "1")])).is_ok());
-        // Format 2 is a segment holding a gauge histogram.
+        // Format 2 is a segment holding a gauge histogram, 3 one holding a
+        // float column.
         assert!(ParquetReader::open_bytes(file(vec![(FORMAT_KEY, "2")])).is_ok());
-        let err = ParquetReader::open_bytes(file(vec![(FORMAT_KEY, "3")]))
+        assert!(ParquetReader::open_bytes(file(vec![(FORMAT_KEY, "3")])).is_ok());
+        let err = ParquetReader::open_bytes(file(vec![(FORMAT_KEY, "4")]))
             .err()
             .unwrap();
-        assert!(err.to_string().contains("segment format 3"), "{err}");
+        assert!(err.to_string().contains("segment format 4"), "{err}");
         let err = ParquetReader::open_bytes(file(vec![(LAYOUT_KEY, "long2")]))
             .err()
             .unwrap();

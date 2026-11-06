@@ -1179,7 +1179,10 @@ impl Tap {
             if !g.timestamps.iter().all(|&t| self.keeps(t)) {
                 let keep: Vec<bool> = g.timestamps.iter().map(|&t| self.keeps(t)).collect();
                 retain_by(&keep, &mut g.timestamps);
-                retain_by(&keep, &mut g.values);
+                match &mut g.values {
+                    crate::types::GaugeValues::Int(v) => retain_by(&keep, v),
+                    crate::types::GaugeValues::Float(v) => retain_by(&keep, v),
+                }
                 if let Some(w) = &mut g.windows {
                     retain_by(&keep, w);
                 }
@@ -1298,7 +1301,10 @@ impl DataSource for Tap {
             if !c.timestamps.iter().all(|&t| self.keeps(t)) {
                 let keep: Vec<bool> = c.timestamps.iter().map(|&t| self.keeps(t)).collect();
                 retain_by(&keep, &mut c.timestamps);
-                retain_by(&keep, &mut c.values);
+                match &mut c.values {
+                    crate::types::CounterValues::Int(v) => retain_by(&keep, v),
+                    crate::types::CounterValues::Float(v) => retain_by(&keep, v),
+                }
                 if let Some(w) = &mut c.windows {
                     retain_by(&keep, w);
                 }
@@ -1327,6 +1333,7 @@ impl DataSource for Tap {
                     CounterStream {
                         labels: s.labels,
                         windowed: s.windowed,
+                        float: s.float,
                         interval: s.interval,
                         samples: Box::new(
                             s.samples

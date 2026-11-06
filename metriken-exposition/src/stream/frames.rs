@@ -198,6 +198,8 @@ impl EncodedLongGroup {
                             })
                         })
                         .collect(),
+                    // A long group has no gauge histograms, and `GroupBuilder`
+                    // makes no float members.
                     gauge_histograms: Vec::new(),
                     float_counters: Vec::new(),
                     float_gauges: Vec::new(),

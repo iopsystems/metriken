@@ -38,7 +38,7 @@ fn cgroup_source() -> Arc<Memory> {
             Counter {
                 labels,
                 timestamps,
-                values,
+                values: values.into(),
                 windows: None,
             },
         );
@@ -178,7 +178,7 @@ fn single_right_broadcasts_against_label_stripping_aggregate() {
             Counter {
                 labels,
                 timestamps: vec![1_000_000_000_000, 1_001_000_000_000, 1_002_000_000_000],
-                values: vec![cpu * 1000, cpu * 1000 + 100, cpu * 1000 + 200],
+                values: vec![cpu * 1000, cpu * 1000 + 100, cpu * 1000 + 200].into(),
                 windows: None,
             },
         );
@@ -197,7 +197,7 @@ fn single_right_broadcasts_against_label_stripping_aggregate() {
         Gauge {
             labels,
             timestamps: vec![1_000_000_000_000, 1_001_000_000_000, 1_002_000_000_000],
-            values: vec![4, 4, 4],
+            values: vec![4, 4, 4].into(),
             windows: None,
         },
     );
@@ -380,7 +380,7 @@ fn gauge_rows(
         name,
         Gauge {
             labels: Labels::from(labels.to_vec().as_slice()),
-            values: vec![v; timestamps.len()],
+            values: vec![v; timestamps.len()].into(),
             timestamps,
             windows: None,
         },

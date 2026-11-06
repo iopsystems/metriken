@@ -263,8 +263,10 @@ impl IdentityMemo {
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct SegmentColumns {
+    /// Integer counter columns.
     #[serde(with = "columns_serde")]
     pub counters: Vec<(String, Labels)>,
+    /// Integer gauge columns.
     #[serde(with = "columns_serde")]
     pub gauges: Vec<(String, Labels)>,
     #[serde(with = "columns_serde")]
@@ -274,6 +276,14 @@ pub(crate) struct SegmentColumns {
     /// Each histogram's `(grouping_power, max_value_power)`.
     pub histogram_configs: BTreeMap<String, (u8, u8)>,
     pub gauge_histogram_configs: BTreeMap<String, (u8, u8)>,
+    /// Float counter columns, listed as counters. Only a format 3 segment
+    /// has any, so a reader that does not know this field refuses the
+    /// segment before it would list without them.
+    #[serde(with = "columns_serde")]
+    pub float_counters: Vec<(String, Labels)>,
+    /// Float gauge columns, listed as gauges.
+    #[serde(with = "columns_serde")]
+    pub float_gauges: Vec<(String, Labels)>,
 }
 
 impl SegmentColumns {
@@ -290,6 +300,8 @@ impl SegmentColumns {
             gauge_histograms: seg.histogram_columns_of(HistKind::Gauge),
             histogram_configs: seg.histogram_configs_of(HistKind::Counting),
             gauge_histogram_configs: seg.histogram_configs_of(HistKind::Gauge),
+            float_counters: seg.float_counter_columns(),
+            float_gauges: seg.float_gauge_columns(),
         })
     }
 }
@@ -361,12 +373,22 @@ impl Listing {
         unresolved: &mut bool,
     ) {
         // Each counter and gauge column's identities, registered once per
-        // open.
+        // open. A float column is a counter or a gauge to a listing, and a
+        // series stored as an integer column in one segment and a float
+        // column in another is one series.
         for (kind, identity, columns) in [
-            (Kind::Counter, &mut self.counter_identity, &columns.counters),
-            (Kind::Gauge, &mut self.gauge_identity, &columns.gauges),
+            (
+                Kind::Counter,
+                &mut self.counter_identity,
+                [&columns.counters, &columns.float_counters],
+            ),
+            (
+                Kind::Gauge,
+                &mut self.gauge_identity,
+                [&columns.gauges, &columns.float_gauges],
+            ),
         ] {
-            for (name, labels) in columns {
+            for (name, labels) in columns.into_iter().flatten() {
                 let sets = memo.presents(relabel, name, labels, unresolved);
                 if memo.register(kind, name, labels) {
                     identity.extend(sets.of(labels).iter().map(|l| (name.clone(), l.clone())));
@@ -1150,8 +1172,9 @@ impl SegmentedSource {
 
     /// See [`DataSource::counter_scan`]. `None` when the relabel's
     /// identities are not fixed, when a series has two locations in one
-    /// segment, or when nothing matches; the dispatcher then uses the
-    /// per-series path.
+    /// segment, when a matched series has a float column in a segment the
+    /// range touches (the scan reads `u64` columns only), or when nothing
+    /// matches; the dispatcher then uses the per-series path.
     fn scan_counters(
         &self,
         name: &str,
@@ -1193,6 +1216,9 @@ impl SegmentedSource {
             for l in locations {
                 if !self.state.catalog[l.segment as usize].touches(start, end) {
                     continue;
+                }
+                if l.position.float {
+                    return None;
                 }
                 if l.position.holds_values {
                     held = held.max(Some(l.segment));
@@ -1367,7 +1393,7 @@ fn relabel_counter(
         .map(|(labels, range)| Counter {
             labels,
             timestamps: c.timestamps[range.clone()].to_vec(),
-            values: c.values[range.clone()].to_vec(),
+            values: c.values.slice(range.clone()),
             windows: c.windows.as_ref().map(|w| w[range].to_vec()),
         })
         .collect()
@@ -1395,7 +1421,7 @@ fn relabel_gauge(
         .map(|(labels, range)| Gauge {
             labels,
             timestamps: g.timestamps[range.clone()].to_vec(),
-            values: g.values[range.clone()].to_vec(),
+            values: g.values.slice(range.clone()),
             windows: g.windows.as_ref().map(|w| w[range].to_vec()),
         })
         .collect()
@@ -1410,6 +1436,9 @@ fn relabel_gauge(
 ///
 /// Used by the O(1)-indexed splice path in [`SegmentedSource::counters`];
 /// probed directly by [`tests::merge_counter_drops_windows_on_mixed_coverage`].
+///
+/// A series read as integers from some segments and as floats from others
+/// becomes a float series (`CounterValues::extend`).
 fn merge_counter(a: &mut Counter, c: Counter) {
     a.timestamps.extend(c.timestamps);
     a.values.extend(c.values);
@@ -1763,6 +1792,9 @@ impl DataSource for SegmentedSource {
             let windowed = locations
                 .first()
                 .is_some_and(|l| l.position.begin_col.is_some() && l.position.width_col.is_some());
+            let float = locations.iter().any(|l| {
+                l.position.float && self.state.catalog[l.segment as usize].touches(start_ns, end_ns)
+            });
             let labels = labels.clone();
             let series_labels = labels.clone();
             let name = Arc::clone(&name);
@@ -1808,6 +1840,7 @@ impl DataSource for SegmentedSource {
             out.push(crate::CounterStream {
                 labels,
                 windowed,
+                float,
                 interval: None,
                 samples: Box::new(samples),
             });
@@ -2259,7 +2292,7 @@ mod internal_tests {
         let counter = |windows: Option<Vec<(u64, u64)>>| Counter {
             labels: Labels::default(),
             timestamps: vec![1, 2],
-            values: vec![10, 20],
+            values: vec![10, 20].into(),
             windows,
         };
         let with = || Some(vec![(0u64, 1u64), (1, 2)]);
@@ -2289,7 +2322,7 @@ mod internal_tests {
         let gauge = |windows: Option<Vec<(u64, u64)>>| Gauge {
             labels: Labels::default(),
             timestamps: vec![1, 2],
-            values: vec![10, 20],
+            values: vec![10, 20].into(),
             windows,
         };
         let mut a = gauge(with());

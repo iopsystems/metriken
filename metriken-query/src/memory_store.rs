@@ -67,7 +67,7 @@ impl MemoryStore {
             Counter {
                 labels: labels.into(),
                 timestamps,
-                values,
+                values: values.into(),
                 windows,
             },
         );
@@ -94,7 +94,7 @@ impl MemoryStore {
             Gauge {
                 labels: labels.into(),
                 timestamps,
-                values,
+                values: values.into(),
                 windows,
             },
         );

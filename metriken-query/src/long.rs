@@ -395,7 +395,16 @@ mod reader_tests {
                 let mut labels: Vec<(String, String)> =
                     s.labels.inner.clone().into_iter().collect();
                 labels.sort();
-                let samples = s.samples.map(|x| (x.ts, x.value, x.window)).collect();
+                let samples = s
+                    .samples
+                    .map(|x| {
+                        (
+                            x.ts,
+                            x.value.as_int().expect("an integer counter"),
+                            x.window,
+                        )
+                    })
+                    .collect();
                 (labels, samples)
             })
             .collect();

@@ -41,6 +41,28 @@ use crate::promql::streaming::{
     LabeledSeries, MatchSpec, OneSide, SeriesSet,
 };
 use crate::promql::{nothing_read, MatrixSample, MetricKind, QueryError, QueryResult};
+
+/// The refusal of a read whose series hold `f64` values (a float counter or
+/// gauge column): the rate and gauge producers here take integer samples.
+/// `deriv`, which evaluates in `f64`, reads them.
+fn float_unsupported(metric: &str, kind: MetricKind) -> QueryError {
+    QueryError::Unsupported(format!(
+        "{} {metric} is stored with float values, which this release does not evaluate \
+         except in deriv()",
+        kind.noun()
+    ))
+}
+
+/// A gauge series' integer values, or the refusal of a float gauge.
+fn int_gauge_values(
+    values: crate::types::GaugeValues,
+    metric: &str,
+) -> Result<Vec<i64>, QueryError> {
+    match values {
+        crate::types::GaugeValues::Int(v) => Ok(v),
+        crate::types::GaugeValues::Float(_) => Err(float_unsupported(metric, MetricKind::Gauge)),
+    }
+}
 use crate::{DataSource, QueryOptions, RateMode};
 
 /// Evaluate `expr` via the streaming pipeline. Returns
@@ -1185,6 +1207,9 @@ where
                     metric_name_for_error: None,
                 });
             };
+            if streams.iter().any(|s| s.float) {
+                return Err(float_unsupported(metric_name, MetricKind::Counter));
+            }
             // Each series is its producer over its own sample stream, pulled
             // by whatever consumes it: an aggregate holds one buffered point
             // per series and each producer one interval's worth of samples,
@@ -1272,16 +1297,16 @@ where
                 .map(|g| {
                     let producer = ctx.place(GaugeAvgOverTime::new(
                         g.timestamps,
-                        g.values,
+                        int_gauge_values(g.values, metric_name)?,
                         ctx.start_ns,
                         ctx.end_ns,
                         ctx.step_ns,
                         range_ns,
                         matches!(ctx.rate_mode, RateMode::Raw),
                     ));
-                    LabeledSeries::new(g.labels, producer)
+                    Ok(LabeledSeries::new(g.labels, producer))
                 })
-                .collect();
+                .collect::<Result<_, QueryError>>()?;
             Ok(Built::Series {
                 series,
                 metric_name: Some(metric_name),
@@ -1306,16 +1331,16 @@ where
                 .map(|g| {
                     let producer = ctx.place(GaugeIdelta::new(
                         g.timestamps,
-                        g.values,
+                        int_gauge_values(g.values, metric_name)?,
                         ctx.start_ns,
                         ctx.end_ns,
                         ctx.step_ns,
                         range_ns,
                         matches!(ctx.rate_mode, RateMode::Raw),
                     ));
-                    LabeledSeries::new(g.labels, producer)
+                    Ok(LabeledSeries::new(g.labels, producer))
                 })
-                .collect();
+                .collect::<Result<_, QueryError>>()?;
             Ok(Built::Series {
                 series,
                 metric_name: Some(metric_name),
@@ -1332,13 +1357,7 @@ where
                 gauges
                     .series
                     .into_iter()
-                    .map(|g| {
-                        (
-                            g.labels,
-                            g.timestamps,
-                            g.values.iter().map(|v| *v as f64).collect(),
-                        )
-                    })
+                    .map(|g| (g.labels, g.timestamps, g.values.to_f64()))
                     .collect()
             } else if let Some(counters) =
                 ctx.source
@@ -1347,13 +1366,7 @@ where
                 counters
                     .series
                     .into_iter()
-                    .map(|c| {
-                        (
-                            c.labels,
-                            c.timestamps,
-                            c.values.iter().map(|v| *v as f64).collect(),
-                        )
-                    })
+                    .map(|c| (c.labels, c.timestamps, c.values.to_f64()))
                     .collect()
             } else {
                 // Nothing matched: empty, unless the source holds the name
@@ -1521,17 +1534,17 @@ where
             gauges.series.into_iter().map(move |g| {
                 let producer = ctx.place(GaugeStepGrid::new(
                     g.timestamps,
-                    g.values,
+                    int_gauge_values(g.values, metric_name)?,
                     ctx.start_ns,
                     ctx.end_ns,
                     ctx.step_ns,
                     staleness_ns,
                     matches!(ctx.rate_mode, RateMode::Raw),
                 ));
-                LabeledSeries::new(g.labels, producer)
+                Ok(LabeledSeries::new(g.labels, producer))
             })
         })
-        .collect();
+        .collect::<Result<_, QueryError>>()?;
     Ok(Built::Series {
         series,
         metric_name: Some(metric_name),

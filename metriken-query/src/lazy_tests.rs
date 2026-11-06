@@ -251,8 +251,8 @@ fn streams_pass_through_a_lazy_child() {
     );
     let samples: Vec<_> = streams.into_iter().next().unwrap().samples.collect();
     assert_eq!(
-        samples.iter().map(|s| s.value).collect::<Vec<_>>(),
-        vec![10, 20, 30, 40]
+        samples.iter().map(|s| s.value.as_int()).collect::<Vec<_>>(),
+        vec![Some(10), Some(20), Some(30), Some(40)]
     );
     assert_eq!(loads.load(Ordering::SeqCst), 1);
     assert!(data

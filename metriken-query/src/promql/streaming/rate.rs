@@ -27,7 +27,7 @@ fn stream_of(
     let windows = windows.unwrap_or_default();
     Box::new((0..n).map(move |i| CounterSample {
         ts: timestamps[i],
-        value: values[i],
+        value: crate::types::CounterValue::Int(values[i]),
         window: windows.get(i).copied(),
     }))
 }
@@ -84,7 +84,12 @@ impl<'a> Iterator for CounterPairwiseRate<'a> {
     fn next(&mut self) -> Option<Point> {
         loop {
             let cur = self.source.next()?;
-            let cur = (cur.ts, cur.value, cur.window);
+            // A float counter's stream is refused before a rate is built
+            // (`dispatch::float_unsupported`); a float sample is skipped.
+            let Some(value) = cur.value.as_int() else {
+                continue;
+            };
+            let cur = (cur.ts, value, cur.window);
             if cur.0 > self.end_ns {
                 return None;
             }
@@ -326,17 +331,22 @@ impl<'a> CounterGridRate<'a> {
             self.exhausted = true;
             return false;
         };
+        // A float counter's stream is refused before a rate is built
+        // (`dispatch::float_unsupported`); a float sample is skipped.
+        let Some(value) = sample.value.as_int() else {
+            return true;
+        };
         // Reset-adjusted cumulative: same convention as CounterRate's
         // total_increase (a decrease is treated as a fresh counter start,
         // contributing its own value as the increment).
         if let Some(prev) = self.prev_value {
-            self.acc += if sample.value >= prev {
-                (sample.value - prev) as f64
+            self.acc += if value >= prev {
+                (value - prev) as f64
             } else {
-                sample.value as f64
+                value as f64
             };
         }
-        self.prev_value = Some(sample.value);
+        self.prev_value = Some(value);
         if let Some(last) = self.last_ts {
             if self.spacings.len() < SPACING_PROBE - 1 {
                 self.spacings.push(sample.ts - last);

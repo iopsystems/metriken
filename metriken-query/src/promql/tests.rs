@@ -54,7 +54,7 @@ fn create_cgroup_source() -> Memory {
             Counter {
                 labels,
                 timestamps,
-                values,
+                values: values.into(),
                 windows: None,
             },
         );
@@ -417,7 +417,7 @@ fn selected_cgroups(names: &[&str], query: &str) -> Vec<String> {
             Counter {
                 labels: make_labels(&[("name", name)]),
                 timestamps: (0u64..3).map(|s| (1000 + s) * 1_000_000_000).collect(),
-                values: vec![0, 100, 200],
+                values: vec![0, 100, 200].into(),
                 windows: None,
             },
         );
@@ -618,7 +618,7 @@ fn create_counter_reset_source() -> Memory {
         Counter {
             labels: Labels::default(),
             timestamps: (0u64..5).map(|s| (1000 + s) * 1_000_000_000).collect(),
-            values: vec![100, 200, 300, 50, 150],
+            values: vec![100, 200, 300, 50, 150].into(),
             windows: None,
         },
     );
@@ -833,7 +833,7 @@ fn eval_timestamps_place_points_on_a_slow_irregular_sources_readings() {
         Gauge {
             labels: Labels::default(),
             timestamps: vec![S / 10 * 3, 2 * S + S / 10 * 3, 6 * S + S / 10 * 3],
-            values: vec![2, 4, 5],
+            values: vec![2, 4, 5].into(),
             windows: None,
         },
     );
@@ -1041,7 +1041,7 @@ fn create_three_gauge_source() -> Memory {
         Gauge {
             labels: Labels::default(),
             timestamps: ts.clone(),
-            values: vec![1000; 5],
+            values: vec![1000; 5].into(),
             windows: None,
         },
     );
@@ -1059,7 +1059,7 @@ fn create_three_gauge_source() -> Memory {
         Gauge {
             labels: Labels::default(),
             timestamps: ts,
-            values: vec![50; 5],
+            values: vec![50; 5].into(),
             windows: None,
         },
     );
@@ -1139,7 +1139,7 @@ fn create_duplex_source() -> Memory {
             Gauge {
                 labels,
                 timestamps: ts.clone(),
-                values: vec![tx_val; 3],
+                values: vec![tx_val; 3].into(),
                 windows: None,
             },
         );
@@ -1152,7 +1152,7 @@ fn create_duplex_source() -> Memory {
             Gauge {
                 labels,
                 timestamps: ts.clone(),
-                values: vec![bw; 3],
+                values: vec![bw; 3].into(),
                 windows: None,
             },
         );
@@ -1251,7 +1251,7 @@ fn create_columns_source() -> Memory {
             Counter {
                 labels,
                 timestamps: ts.clone(),
-                values: vec![0, 100],
+                values: vec![0, 100].into(),
                 windows: None,
             },
         );
@@ -1264,7 +1264,7 @@ fn create_columns_source() -> Memory {
             Gauge {
                 labels,
                 timestamps: ts.clone(),
-                values: vec![50, 50],
+                values: vec![50, 50].into(),
                 windows: None,
             },
         );
@@ -1275,7 +1275,7 @@ fn create_columns_source() -> Memory {
         Gauge {
             labels: Labels::default(),
             timestamps: ts,
-            values: vec![8, 8],
+            values: vec![8, 8].into(),
             windows: None,
         },
     );
@@ -2556,7 +2556,7 @@ fn test_label_values_via_query_engine() {
             Counter {
                 labels,
                 timestamps: ts.clone(),
-                values: vec![0, 100],
+                values: vec![0, 100].into(),
                 windows: None,
             },
         );
@@ -2566,7 +2566,7 @@ fn test_label_values_via_query_engine() {
         Gauge {
             labels: make_labels(&[("cpu", "0")]),
             timestamps: ts.clone(),
-            values: vec![50, 51],
+            values: vec![50, 51].into(),
             windows: None,
         },
     );
@@ -2664,7 +2664,7 @@ fn make_mixed_memory() -> Arc<metriken_storage::memory_store::MemoryStoreInner> 
             Counter {
                 labels,
                 timestamps: ts.clone(),
-                values: vec![0, 100],
+                values: vec![0, 100].into(),
                 windows: None,
             },
         );
@@ -2674,7 +2674,7 @@ fn make_mixed_memory() -> Arc<metriken_storage::memory_store::MemoryStoreInner> 
         Gauge {
             labels: make_labels(&[("cpu", "0")]),
             timestamps: ts.clone(),
-            values: vec![50, 51],
+            values: vec![50, 51].into(),
             windows: None,
         },
     );
@@ -2683,7 +2683,7 @@ fn make_mixed_memory() -> Arc<metriken_storage::memory_store::MemoryStoreInner> 
         Gauge {
             labels: make_labels(&[("node", "n1")]),
             timestamps: ts.clone(),
-            values: vec![1024, 2048],
+            values: vec![1024, 2048].into(),
             windows: None,
         },
     );
@@ -2960,7 +2960,7 @@ fn counter_engine(interval_ms: u64, timestamps: Vec<u64>, values: Vec<u64>) -> Q
         Counter {
             labels: Labels::default(),
             timestamps,
-            values,
+            values: values.into(),
             windows: None,
         },
     );
@@ -3099,7 +3099,7 @@ fn a_rate_across_recordings_takes_its_own_tables_reach() {
             Counter {
                 labels: Labels::default(),
                 timestamps: ts.iter().map(|s| s * S).collect(),
-                values: vals,
+                values: vals.into(),
                 windows: None,
             },
         );
@@ -3144,7 +3144,7 @@ fn counters_source(interval_ms: u64, counters: Vec<(&str, Vec<u64>, Vec<u64>)>) 
             Counter {
                 labels: Labels::default(),
                 timestamps: ts.iter().map(|s| s * S).collect(),
-                values,
+                values: values.into(),
                 windows: None,
             },
         );
@@ -3260,7 +3260,7 @@ fn a_raw_avg_over_time_point_before_the_range_is_the_same_from_any_start() {
         Gauge {
             labels: Labels::default(),
             timestamps: (1000..=1200u64).map(|s| s * S).collect(),
-            values: vec![1; 201],
+            values: vec![1; 201].into(),
             windows: None,
         },
     );
@@ -3330,7 +3330,7 @@ fn a_raw_point_after_a_sample_without_a_value_is_held_for_its_own_gap() {
         Gauge {
             labels: Labels::default(),
             timestamps: (1000..=1200u64).map(|s| s * S).collect(),
-            values: vec![1; 201],
+            values: vec![1; 201].into(),
             windows: None,
         },
     );
@@ -3398,7 +3398,7 @@ fn a_timing_point_without_its_point_is_dropped() {
         Gauge {
             labels: Labels::default(),
             timestamps: (1000..=1200u64).map(|s| s * S).collect(),
-            values: vec![1; 201],
+            values: vec![1; 201].into(),
             windows: None,
         },
     );
@@ -3472,7 +3472,7 @@ fn raw_compositions_never_show_a_timing_point() {
                 Counter {
                     labels: Labels::default(),
                     timestamps: ts.iter().map(|s| s * MS).collect(),
-                    values,
+                    values: values.into(),
                     windows: None,
                 },
             );
@@ -3483,7 +3483,7 @@ fn raw_compositions_never_show_a_timing_point() {
                 Gauge {
                     labels: Labels::default(),
                     timestamps: ts.iter().map(|s| s * MS).collect(),
-                    values,
+                    values: values.into(),
                     windows: None,
                 },
             );
@@ -3543,7 +3543,7 @@ fn a_raw_irate_point_before_the_range_is_held_for_the_gap_before_it() {
         Gauge {
             labels: Labels::default(),
             timestamps: (1000..1200u64).map(|s| s * S).collect(),
-            values: vec![1; 200],
+            values: vec![1; 200].into(),
             windows: None,
         },
     );
@@ -3604,7 +3604,7 @@ fn a_first_point_after_a_point_without_a_value_is_held_for_its_own_gap() {
         Gauge {
             labels: Labels::default(),
             timestamps: (1000..=1200u64).map(|s| s * S).collect(),
-            values: vec![1; 201],
+            values: vec![1; 201].into(),
             windows: None,
         },
     );
@@ -3665,7 +3665,7 @@ fn a_timing_point_in_the_range_is_not_in_the_result() {
         Gauge {
             labels: Labels::default(),
             timestamps: (900..=1040u64).map(|s| s * S).collect(),
-            values: vec![1; 141],
+            values: vec![1; 141].into(),
             windows: None,
         },
     );
@@ -3728,7 +3728,7 @@ fn a_point_before_the_range_does_not_count_for_one_to_one() {
             Gauge {
                 labels: make_labels(&[("i", i)]),
                 timestamps: t.iter().map(|s| s * S).collect(),
-                values: vec![1; t.len()],
+                values: vec![1; t.len()].into(),
                 windows: None,
             },
         );
@@ -3838,7 +3838,7 @@ fn raw_results_do_not_depend_on_the_start() {
                 Counter {
                     labels: labels.clone(),
                     timestamps: ts.iter().map(|ms| ms * 1_000_000).collect(),
-                    values,
+                    values: values.into(),
                     windows: None,
                 },
             );
@@ -3849,7 +3849,7 @@ fn raw_results_do_not_depend_on_the_start() {
                 Gauge {
                     labels,
                     timestamps: ts.iter().map(|ms| ms * 1_000_000).collect(),
-                    values,
+                    values: values.into(),
                     windows: None,
                 },
             );
@@ -3860,7 +3860,7 @@ fn raw_results_do_not_depend_on_the_start() {
             Gauge {
                 labels: Labels::default(),
                 timestamps: ts.iter().map(|ms| ms * 1_000_000).collect(),
-                values: vec![1; ts.len()],
+                values: vec![1; ts.len()].into(),
                 windows: None,
             },
         );
@@ -3939,7 +3939,7 @@ fn a_raw_irate_after_the_first_sample_read_is_held_for_its_gap() {
         Gauge {
             labels: Labels::default(),
             timestamps: (1000..=1040u64).map(|s| s * S).collect(),
-            values: vec![1; 41],
+            values: vec![1; 41].into(),
             windows: None,
         },
     );
@@ -3969,7 +3969,7 @@ fn a_raw_join_holds_a_slow_series_across_its_spacing() {
             Gauge {
                 labels: Labels::default(),
                 timestamps: ts.iter().map(|s| s * S).collect(),
-                values: vec![1; ts.len()],
+                values: vec![1; ts.len()].into(),
                 windows: None,
             },
         );
@@ -4000,7 +4000,7 @@ fn a_nested_raw_join_is_the_same_from_any_start() {
             Gauge {
                 labels: Labels::default(),
                 timestamps: ms.iter().map(|t| t * 1_000_000).collect(),
-                values: values.to_vec(),
+                values: values.to_vec().into(),
                 windows: None,
             },
         );
@@ -4079,7 +4079,7 @@ fn a_raw_irate_spans_a_missed_tick() {
         Counter {
             labels: Labels::default(),
             timestamps: ts,
-            values,
+            values: values.into(),
             windows: None,
         },
     );
@@ -4104,7 +4104,7 @@ fn a_raw_irate_spans_a_missed_tick() {
         Gauge {
             labels: Labels::default(),
             timestamps: (990..=1010u64).map(|s| s * 1_000_000_000).collect(),
-            values: vec![1; 21],
+            values: vec![1; 21].into(),
             windows: None,
         },
     );
@@ -4993,7 +4993,7 @@ fn create_relabel_source() -> Memory {
                 Gauge {
                     labels: make_labels(&[("pid", pid), ("name", name)]),
                     timestamps: ts.clone(),
-                    values: vec![1; ts.len()],
+                    values: vec![1; ts.len()].into(),
                     windows: None,
                 },
             );
