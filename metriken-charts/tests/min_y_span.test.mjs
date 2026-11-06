@@ -169,17 +169,22 @@ test('a decimated percentile chart with an OOB band keeps its span function', ()
     assert.equal(typeof chart.echart.getOption().yAxis[0].min, 'function');
 });
 
-test('a line chart clamps to the range before it measures the span', () => {
-    const chart = configured(configureLineChart, [times(), flat(1.5)], ONE_POINT, 'line');
-    assertExtent(yExtent(chart.echart), [0.99, 1]);
-});
+for (const [name, configure, style] of [
+    ['line', configureLineChart, 'line'],
+    ['multi-series', configureMultiSeriesChart, 'multi'],
+]) {
+    test(`a ${name} chart clamps to the range before it measures the span`, () => {
+        const chart = configured(configure, [times(), flat(1.5)], ONE_POINT, style);
+        assertExtent(yExtent(chart.echart), [0.99, 1]);
+    });
+}
 
 test('a percentile chart with values in its OOB band keeps the usual axis', () => {
-    const values = [...flat(0.5, 59), 2];
-    const format = { ...ONE_POINT, range: { min: 0, max: 0.51 } };
-    const chart = configured(configureScatterChart, [times(), values], format, 'scatter');
-    const [min] = yExtent(chart.echart);
-    assert.ok(min <= 0.5 && min !== 0.495, `min ${min}`);
+    const values = [...flat(0.1, 59), 2];
+    const range = { min: 0, max: 0.1 };
+    const extent = (format) =>
+        yExtent(configured(configureScatterChart, [times(), values], format, 'scatter').echart);
+    assert.deepEqual(extent({ ...ONE_POINT, range }), extent({ unit_system: 'percentage', range }));
 });
 
 test('a range narrower than the span sets the axis at every zoom', () => {

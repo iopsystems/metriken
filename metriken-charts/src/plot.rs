@@ -235,11 +235,12 @@ impl PlotBuilder {
     /// `span` wide, in the units of the values, so a percentage's `0.01` is
     /// one percentage point. Values closer together than `span` are centred
     /// on the axis, which stays inside `range`, so a narrower range sets the
-    /// width. A line or multi-series chart clamps to `range` first, so a
-    /// clamped value gets the span at the bound. A change smaller than `span`
-    /// draws small and cannot be enlarged by zooming the time axis. A log
-    /// axis keeps the usual axis, as does a percentile chart with values in
-    /// its OOB band.
+    /// width. A change smaller than `span` draws small and cannot be enlarged
+    /// by zooming the time axis. A line or multi-series chart clamps to
+    /// `range` first, so a clamped value gets the span at the bound, unless
+    /// it is drawn from decimated columns. A log axis keeps the usual axis,
+    /// as do values left outside `range`: a percentile chart's OOB band and a
+    /// decimated line chart's unclamped columns.
     pub fn with_min_y_span(mut self, span: f64) -> Self {
         self.opts.format.min_y_span = Some(span);
         self
