@@ -495,12 +495,33 @@ impl ShardedCounterHistogram {
     /// shard.
     #[inline]
     pub fn add(&self, value: u64, count: u64) -> Result<(), Error> {
+        let histogram = match SHARD_ID.get().and_then(|id| self.shards[id].get()) {
+            Some(histogram) => histogram,
+            None => match self.init_shard(value) {
+                Some(histogram) => histogram,
+                None => return Err(Error::OutOfRange),
+            },
+        };
+        histogram.add(value, count)
+    }
+
+    /// Find or allocate the calling thread's shard, for a thread with no
+    /// shard id or an unallocated shard. Returns `None` for an out-of-range
+    /// value, which takes no shard and allocates nothing.
+    ///
+    /// `add` is `#[inline]`; this path is out of line to reduce the code
+    /// inlined at each caller. `AtomicHistogram::add` rejects an out-of-range
+    /// value on an allocated shard.
+    #[cold]
+    #[inline(never)]
+    fn init_shard(&self, value: u64) -> Option<&histogram::AtomicHistogram> {
         if !in_range(&self.config, value) {
-            return Err(Error::OutOfRange);
+            return None;
         }
-        self.shards[shard_index()]
-            .get_or_init(|| histogram::AtomicHistogram::with_config(&self.config))
-            .add(value, count)
+        Some(
+            self.shards[shard_index()]
+                .get_or_init(|| histogram::AtomicHistogram::with_config(&self.config)),
+        )
     }
 
     /// Load the histogram (summed across shards).
@@ -1029,6 +1050,40 @@ mod tests {
         assert!(G.increment(0, 1 << 10).is_err());
         assert!(G.load(0).is_none());
         assert!(G.load_all().is_none());
+    }
+
+    #[test]
+    fn range_is_checked_on_new_and_allocated_shards() {
+        // Grouping power 2, max value power 4: 16 is the first value out of
+        // range. Rejected first on an unallocated shard, then on an
+        // allocated one, starting in a thread with no shard.
+        static H: ShardedCounterHistogram = ShardedCounterHistogram::new(2, 4);
+        std::thread::spawn(|| {
+            assert_eq!(H.increment(16), Err(Error::OutOfRange));
+            assert!(SHARD_ID.get().is_none());
+            assert!(H.load().is_none());
+            H.increment(15).unwrap();
+            assert!(SHARD_ID.get().is_some());
+            assert_eq!(H.increment(16), Err(Error::OutOfRange));
+            H.increment(15).unwrap();
+        })
+        .join()
+        .unwrap();
+        assert_eq!(H.load().unwrap().as_slice().iter().sum::<u64>(), 2);
+    }
+
+    #[test]
+    fn range_is_checked_on_a_set_shard_before_allocating() {
+        static H: ShardedCounterHistogram = ShardedCounterHistogram::new(2, 4);
+        std::thread::spawn(|| {
+            set_thread_shard(3);
+            assert_eq!(H.increment(16), Err(Error::OutOfRange));
+            assert!(H.load().is_none());
+            H.increment(15).unwrap();
+        })
+        .join()
+        .unwrap();
+        assert_eq!(H.load().unwrap().as_slice().iter().sum::<u64>(), 1);
     }
 
     #[test]
