@@ -2307,14 +2307,14 @@ gets an alias, a deprecation warning, or a refusal:
   example `endpoint`), with `source` accepted and warned about.
 - `--recording source=X`, `--baseline source=X`, `--experiment source=X`
   and MCP's `recording` argument (Q6): resolved through D2, as a recording
-  whose `alias` or kind is X, with a warning naming `alias=`. rezolus builds
-  it by matching the `source`, `alias` or `__producer__` label
-  (`src/parquet_tools/select.rs`).
+  whose `alias` or kind is X, with a warning naming `alias=`. rezolus today
+  matches labels rather than D2's kind: the `source`, `alias` or
+  `__producer__` label (`src/parquet_tools/select.rs`).
 - PromQL `{source="X"}` on a legacy recording: matches it, since a legacy
   recording keeps its `source` label (Q6, changed 2026-11-05). Whether a
   v5.10.0 to v5.20.0 parquet's per-column `source` survives `recording
-  upgrade` is open (Q1, step 3.4). The registry templates no longer select `source`
-  (rezolus #1635).
+  upgrade` is open (Q1, step 3.4). The registry templates no longer select
+  `source` (rezolus #1635).
 - A template carried by a legacy recording that selects `source`:
   cachecannon's handshake template through v0.0.34 (14
   `source="cachecannon"` matchers, removed in cachecannon #272), llm-perf's
