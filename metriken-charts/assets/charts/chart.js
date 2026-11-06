@@ -335,6 +335,16 @@ function familyBandDiffers(a, b) {
     return !shallowSameShape([a.lower], [b.lower]) || !shallowSameShape([a.upper], [b.upper]);
 }
 
+/**
+ * A chart's time axis. A heatmap or histogram heatmap keeps it in `time_data`,
+ * and its `data` holds `[time index, row or bucket index, value]` cells. Other
+ * charts keep it in `data[0]`.
+ */
+export function specTimeAxis(spec) {
+    if (spec.time_data) return spec.time_data;
+    return Array.isArray(spec.data?.[0]) ? spec.data[0] : null;
+}
+
 // One chart, drawn with echarts. The page creates the element, then calls
 // mount(element) once, update({ spec, interval }) when the spec changes, and
 // destroy() when the element goes away. ui/chart_view.js wraps this for
@@ -604,14 +614,7 @@ export class Chart {
             });
         }
 
-        let timeData = null;
-        if (this.spec.data && this.spec.data.length > 0) {
-            if (this.spec.data[0] && Array.isArray(this.spec.data[0])) {
-                timeData = this.spec.data[0];
-            }
-        } else if (this.spec.time_data) {
-            timeData = this.spec.time_data;
-        }
+        const timeData = specTimeAxis(this.spec);
 
         // The narrowest zoom: five samples at the recording's interval, or
         // at the chart's own point spacing when the interval is unknown. A
@@ -975,7 +978,9 @@ export class Chart {
             newMax = yMax + padding;
         }
 
-        // Cap axis max: OOB band takes priority, then range ceiling, then padded max
+        // Cap axis max: OOB band takes priority, then range ceiling, then padded
+        // max. The range floor bounds the min, unless a drawn value sits below it
+        // or the axis would invert.
         let yAxisMax;
         if (this._oobAxisMax) {
             yAxisMax = this._oobAxisMax;
@@ -984,9 +989,12 @@ export class Chart {
         } else {
             yAxisMax = newMax;
         }
+        const floor = format.range?.min;
+        const floored = floor != null && newMin < floor && yAxisMax > floor
+            && !(this._drawnYExtent(visibleMinMs, visibleMaxMs)[0] < floor);
         this.echart.setOption({
             yAxis: {
-                min: newMin,
+                min: floored ? floor : newMin,
                 max: yAxisMax,
             }
         });

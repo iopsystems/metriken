@@ -17,7 +17,7 @@ const echarts = createRequire(import.meta.url)('../assets/charts/echarts.min.js'
 // ECharts measures axis labels on a canvas, and node has none.
 echarts.setPlatformAPI({ measureText: (text) => ({ width: text.length * 7 }) });
 const { getBaseYAxisOption, minSpanBounds } = await import('../assets/charts/base.js');
-const { Chart, ChartsState } = await import('../assets/charts/chart.js');
+const { Chart, ChartsState, specTimeAxis } = await import('../assets/charts/chart.js');
 const { configureLineChart } = await import('../assets/charts/line.js');
 const { configureMultiSeriesChart } = await import('../assets/charts/multi.js');
 const { configureScatterChart } = await import('../assets/charts/scatter.js');
@@ -273,11 +273,11 @@ test('zooming a flat line with a band wider than the span keeps the padded axis'
     assertExtent(yExtent(echart), [0.445, 0.555]);
 });
 
-test('zooming a flat median at 0 with a wider max band keeps the padded axis', () => {
+test('zooming a flat median at 0 with a wider max band keeps the padded max above the floor', () => {
     const values = flat(0);
     const echart = renderedChart(values, { extraSeries: band(0, 0.05) });
     chartOn(echart, values, { start: 25, end: 75 })._rescaleYAxis();
-    assertExtent(yExtent(echart), [-1.1, 1]);
+    assertExtent(yExtent(echart), [0, 1]);
 });
 
 test('a window ECharts thinned to one point is measured on all of its points', () => {
@@ -357,10 +357,70 @@ test('zooming a flat line with no span keeps the padded axis', () => {
     assertExtent(yExtent(echart), [0.445, 0.555]);
 });
 
+test('a zoomed axis stops at the range floor', () => {
+    const values = [...flat(0, 30), ...flat(0.8, 30)];
+    const echart = renderedChart(values, { format: {} });
+    chartOn(echart, values, { start: 25, end: 75 }, { range: { min: 0, max: 1 } })._rescaleYAxis();
+    assert.equal(echart.getOption().yAxis[0].min, 0);
+});
+
+test('a zoomed axis keeps a drawn value below the range floor on the axis', () => {
+    const values = [...flat(-0.5, 30), ...flat(0.48, 30)];
+    const echart = renderedChart(values, { format: {} });
+    chartOn(echart, values, { start: 25, end: 75 }, { range: { min: 0, max: 1 } })._rescaleYAxis();
+    assert.ok(echart.getOption().yAxis[0].min < -0.5);
+});
+
+test('a zoomed axis below the range floor is not inverted', () => {
+    const values = flat(-0.5);
+    const echart = renderedChart(values, { format: {} });
+    chartOn(echart, values, { start: 25, end: 75 }, { range: { min: 0, max: 1 } })._rescaleYAxis();
+    const { min, max } = echart.getOption().yAxis[0];
+    assert.ok(min < max, `min ${min}, max ${max}`);
+});
+
 test('a line that varies by more than a point rescales on zoom as before', () => {
     const values = [...flat(0.2, 30), ...flat(0.8, 30)];
     const echart = renderedChart(values);
     chartOn(echart, values, { start: 25, end: 75 })._rescaleYAxis();
     const [min, max] = yExtent(echart);
     assert.ok(min < 0.2 && max > 0.8, `extent ${min},${max}`);
+});
+
+test('the time axis of a heatmap is its time_data, not its first cell', () => {
+    const time_data = times(3);
+    assert.equal(specTimeAxis({ time_data, data: [[0, 0, 5], [1, 0, 2]] }), time_data);
+});
+
+test('the time axis of a line chart is the first column of its data', () => {
+    const t = times(3);
+    assert.equal(specTimeAxis({ data: [t, flat(1, 3)] }), t);
+});
+
+test('a chart with no data has no time axis', () => {
+    assert.equal(specTimeAxis({ data: [] }), null);
+    assert.equal(specTimeAxis({}), null);
+});
+
+test('first draw of a heatmap takes its narrowest zoom from time_data', () => {
+    const time_data = times(600);
+    const spec = { opts: { id: 'h', style: 'heatmap' }, time_data, data: [[0, 3, 5], [1, 3, 2]] };
+    const chart = new Chart({ spec, chartsState: new ChartsState(), interval: 1 });
+    chart.domNode = { addEventListener() {}, removeEventListener() {} };
+    chart.configureChartByType = () => {};
+    chart._applyEventMarkers = () => {};
+    const init = echarts.init;
+    const hadWindow = 'window' in globalThis;
+    const hadEcharts = 'echarts' in globalThis;
+    globalThis.window ??= { location: { search: '' } };
+    globalThis.echarts ??= echarts;
+    echarts.init = () => ({ on() {}, off() {}, dispatchAction() {}, getZr: () => ({ on() {} }) });
+    try {
+        chart.initEchart();
+    } finally {
+        echarts.init = init;
+        if (!hadWindow) delete globalThis.window;
+        if (!hadEcharts) delete globalThis.echarts;
+    }
+    assert.ok(chart.minZoomPercent < 1, `minZoomPercent ${chart.minZoomPercent}`);
 });
