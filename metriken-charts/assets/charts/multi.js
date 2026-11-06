@@ -226,7 +226,7 @@ export function configureMultiSeriesChart(chart) {
     // at the cursor.
     const option = {
         ...baseOption,
-        yAxis: getBaseYAxisOption(logScale, unitSystem),
+        yAxis: getBaseYAxisOption(logScale, unitSystem, format),
         tooltip: {
             ...baseOption.tooltip,
             formatter: getTooltipFormatter(unitSystem ?

@@ -267,13 +267,44 @@ export function getBaseOption() {
     };
 }
 
-export function getBaseYAxisOption(logScale, unitSystem) {
+/**
+ * The y-axis bounds for values from `lo` to `hi` on a chart with
+ * `format.min_y_span`, or null when the chart's usual axis applies. Values
+ * closer together than the span get an axis that wide, centred on them and
+ * kept inside `format.range`, so a narrower range sets the width. Values
+ * outside the range, such as a percentile chart's OOB dots, get the usual
+ * axis.
+ */
+export function minSpanBounds(lo, hi, format) {
+    const span = format.min_y_span;
+    if (!span || !(lo <= hi) || hi - lo >= span) return null;
+    const floor = format.range?.min ?? -Infinity;
+    const ceiling = format.range?.max ?? Infinity;
+    if (lo < floor || hi > ceiling) return null;
+    const min = Math.max(floor, Math.min((lo + hi - span) / 2, ceiling - span));
+    return { min, max: Math.min(ceiling, min + span) };
+}
+
+/**
+ * The `min` and `max` of a y-axis at the default zoom. With `format.min_y_span`
+ * they are functions, so ECharts passes them the extent of the series the
+ * legend shows, across the whole time range, with stacked bands at their
+ * stacked height. A log axis keeps the bounds ECharts chooses.
+ */
+export function defaultYAxisBounds(logScale, format) {
+    if (logScale || !format.min_y_span) return { min: null, max: null };
+    return {
+        min: ({ min, max }) => minSpanBounds(min, max, format)?.min ?? null,
+        max: ({ min, max }) => minSpanBounds(min, max, format)?.max ?? null,
+    };
+}
+
+export function getBaseYAxisOption(logScale, unitSystem, format = {}) {
     return {
         type: logScale ? 'log' : 'value',
         logBase: 10,
         scale: true,
-        min: null,
-        max: null,
+        ...defaultYAxisBounds(logScale, format),
         axisLine: { show: false },
         axisTick: { show: false },
         axisLabel: {

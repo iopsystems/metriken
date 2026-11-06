@@ -23,8 +23,8 @@ machine that built the crate:
 
 - `echarts` as a global: load `charts/echarts.min.js` before the modules,
   or your own ECharts. The modules were checked by hand against the bundled
-  6.1.0 in the rezolus viewer (iopsystems/rezolus#1613); the node tests do
-  not load ECharts.
+  6.1.0 in the rezolus viewer (iopsystems/rezolus#1613); of the node tests,
+  only `tests/min_y_span.test.mjs` loads ECharts.
 - CSS custom properties on `document.documentElement`:
   - every property named in `CSS_MAP` in `charts/util/colormap.js`, with no
     fallback: an unset property reads as an empty string. The modules read
@@ -104,10 +104,10 @@ a `Plot` and serializes it with serde, as the `spec` a `Chart` takes.
 
 `Plot::gauge`, `Plot::counter`, `Plot::histogram` and `Plot::histogram_latency`
 return a `PlotBuilder`. Its methods set the presentation (`with_description`,
-`with_log_scale`, `range` and the rest), the total query (`with_total_query`)
-and the scope (`with_scope`), and `build(query)` returns the `Plot`. Three
-enums name what the chart modules accept, and tests fail if they differ from
-the JS:
+`with_log_scale`, `with_min_y_span`, `range` and the rest), the total query
+(`with_total_query`) and the scope (`with_scope`), and `build(query)` returns
+the `Plot`. Three enums name what the chart modules accept, and tests fail if
+they differ from the JS:
 
 - `Unit`: the keys of `UNIT_SYSTEMS` in `charts/util/units.js`.
 - `HistogramView`: how a histogram plot is drawn (`percentiles`, `buckets`,

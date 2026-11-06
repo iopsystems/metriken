@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-charts 0.1.1
+
+- **Added:** `PlotBuilder::with_min_y_span`, the narrowest y-axis a line,
+  multi-series or percentile chart draws, in the units of its values, at
+  the default zoom and when zoomed. Values closer together than the span
+  are centred on an axis that wide, inside `range` if the chart has one.
+  ECharts otherwise draws a flat 100% on 40-160%. A chart that does not
+  set it draws as before. A log axis keeps the usual axis, as does a
+  percentile chart with values in its OOB band and a window holding a
+  band wider than the span. A change smaller than the span draws small:
+  with a span of 0.01, an error rate of 0 with a 0.05% spike fills 5% of
+  the plot height.
+
 ### metriken-recorder 0.8.1
 
 - **Added:** `EndpointSpec::default_metadata` and

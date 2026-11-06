@@ -231,6 +231,21 @@ impl PlotBuilder {
         self
     }
 
+    /// Draw the y-axis of a line, multi-series or percentile chart at least
+    /// `span` wide, in the units of the values, so a percentage's `0.01` is
+    /// one percentage point. Values closer together than `span` are centred
+    /// on the axis, which stays inside `range`, so a narrower range sets the
+    /// width. A change smaller than `span` draws small and cannot be enlarged
+    /// by zooming the time axis. A line or multi-series chart clamps to
+    /// `range` first, so a clamped value gets the span at the bound, except
+    /// on a line chart drawn from decimated columns. A log axis keeps the
+    /// usual axis, as do values left outside `range`: a percentile chart's
+    /// OOB band and a decimated line chart's unclamped columns.
+    pub fn with_min_y_span(mut self, span: f64) -> Self {
+        self.opts.format.min_y_span = Some(span);
+        self
+    }
+
     /// Clamp plotted values to `min..=max`. A line or multi-series chart
     /// draws a value outside the range at the bound. A percentile chart caps
     /// its y-axis at `max` and draws values above it in a band marked OOB. A
@@ -419,6 +434,10 @@ struct FormatConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     range: Option<Range>,
 
+    // The narrowest y-axis, in the units of the values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_y_span: Option<f64>,
+
     value_label: Option<String>, // label used in tooltips for the value
 
     // Entity each heatmap row represents in tooltips (e.g. "CPU", "GPU").
@@ -436,6 +455,7 @@ impl FormatConfig {
             precision: Some(2),
             log_scale: None,
             range: None,
+            min_y_span: None,
             value_label: None,
             row_label: None,
         }
@@ -638,6 +658,16 @@ mod tests {
         assert_eq!(opts, ["format", "id", "title", "type"], "{json}");
         assert!(json["opts"]["format"].get("row_label").is_none(), "{json}");
         assert!(json["opts"]["format"].get("range").is_none(), "{json}");
+        assert!(json["opts"]["format"].get("min_y_span").is_none(), "{json}");
+    }
+
+    #[test]
+    fn min_y_span_reaches_the_format_the_charts_read() {
+        let plot = Plot::gauge("t", "id", Unit::Percentage)
+            .with_min_y_span(0.01)
+            .build("up");
+        let json = serde_json::to_value(plot).unwrap();
+        assert_eq!(json["opts"]["format"]["min_y_span"], 0.01, "{json}");
     }
 
     #[test]

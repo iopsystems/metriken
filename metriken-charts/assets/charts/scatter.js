@@ -158,8 +158,8 @@ function renderPercentileBands(chart) {
         ...baseOption,
         dataZoom: getDataZoomConfig(calculateMinZoomSpan(widest, chart.interval)),
         yAxis: oob
-            ? oobYAxis(getBaseYAxisOption(logScale, unitSystem), oob.oobMax, range.max)
-            : getBaseYAxisOption(logScale, unitSystem),
+            ? oobYAxis(getBaseYAxisOption(logScale, unitSystem, format), oob.oobMax, range.max)
+            : getBaseYAxisOption(logScale, unitSystem, format),
         tooltip: {
             ...baseOption.tooltip,
             formatter: getTooltipFormatter(
@@ -392,7 +392,7 @@ export function configureScatterChart(chart) {
     const uniqueNamesForLayout = [...new Set(series.map(s => s.name))];
 
     // Build yAxis config — when OOB is active, cap at the band top + relabel range.max "OOB"
-    const baseYAxis = getBaseYAxisOption(logScale, unitSystem);
+    const baseYAxis = getBaseYAxisOption(logScale, unitSystem, format);
     const yAxisConfig = chart._oobAxisMax
         ? oobYAxis(baseYAxis, chart._oobAxisMax, range.max)
         : baseYAxis;
