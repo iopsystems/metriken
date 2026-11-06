@@ -13,9 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own range check once the calling thread's shard is allocated;
   `histogram::AtomicHistogram::add` rejects an out-of-range value there
   with the same error. Recorded values, errors and allocation are
-  unchanged. In a micro-benchmark on Zen 1, recording
-  throughput ranged from 0.96x to 1.07x of 0.11.6 depending on loop shape
-  and thread placement.
+  unchanged. In a micro-benchmark on Zen 1, median recording throughput
+  ranged from 0.96x to 1.07x of 0.11.6 depending on loop shape and thread
+  placement.
 
 ### metriken-charts 0.1.2
 
