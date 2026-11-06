@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-charts 0.1.2
+
+- **Fixed:** a histogram or entity heatmap first drawn as a heatmap could
+  break shared zoom. Its narrowest zoom was computed from its first cell
+  instead of `time_data`, so a drag was widened, up to the full range. At
+  the full range, from an unzoomed view the chart moved, the other charts
+  did not, and a reset had nothing to undo. From an existing zoom the
+  other charts went to the full range.
+- **Fixed:** a zoomed y-axis stops at `range`'s minimum, as it stopped at
+  its maximum, unless a drawn value sits below it or every value in the
+  window does. A zoomed window near 0 could draw below 0. A percentile
+  chart's OOB band still extends past the maximum.
+
 ### metriken-charts 0.1.1
 
 - **Added:** `PlotBuilder::with_min_y_span`, the narrowest y-axis a line,
