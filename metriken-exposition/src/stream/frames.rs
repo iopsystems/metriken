@@ -199,6 +199,8 @@ impl EncodedLongGroup {
                         })
                         .collect(),
                     gauge_histograms: Vec::new(),
+                    float_counters: Vec::new(),
+                    float_gauges: Vec::new(),
                 })
                 .collect(),
         };
@@ -571,6 +573,8 @@ mod tests {
             gauges: Vec::new(),
             histograms: Vec::new(),
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         }
     }
 
@@ -588,6 +592,8 @@ mod tests {
                 gauges: Vec::new(),
                 histograms: Vec::new(),
                 gauge_histograms: Vec::new(),
+                float_counters: Vec::new(),
+                float_gauges: Vec::new(),
             })
             .unwrap(),
         }
@@ -619,6 +625,8 @@ mod tests {
             gauges: Vec::new(),
             histograms: Vec::new(),
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         };
         GroupSnapshot {
             name: name.to_string(),
@@ -629,6 +637,8 @@ mod tests {
             gauges: Vec::new(),
             histograms: Vec::new(),
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         }
     }
 
@@ -721,6 +731,8 @@ mod tests {
                         gauges: Vec::new(),
                         histograms: Vec::new(),
                         gauge_histograms: Vec::new(),
+                        float_counters: Vec::new(),
+                        float_gauges: Vec::new(),
                     })
                     .collect(),
             })

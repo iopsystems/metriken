@@ -1498,6 +1498,8 @@ mod malformed_histogram_tests {
             gauges: Vec::new(),
             histograms: vec![desc("bad_histogram")],
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         };
 
         let mut builder = GroupTableBuilder::new("cpu_usage/sweep".to_string());

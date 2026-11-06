@@ -202,6 +202,8 @@ fn a_long_row_with_gauge_histograms_drops_them() {
                 } else {
                     Vec::new()
                 },
+                float_counters: Vec::new(),
+                float_gauges: Vec::new(),
             }],
         }
     };
@@ -289,6 +291,8 @@ fn a_long_written_group_that_gains_a_gauge_histogram_drops_it() {
                 } else {
                     Vec::new()
                 },
+                float_counters: Vec::new(),
+                float_gauges: Vec::new(),
             }],
         })
     };

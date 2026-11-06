@@ -29,6 +29,8 @@ fn schema(n: usize) -> GroupSchema {
         gauges: Vec::new(),
         histograms: Vec::new(),
         gauge_histograms: Vec::new(),
+        float_counters: Vec::new(),
+        float_gauges: Vec::new(),
     }
 }
 
@@ -45,6 +47,8 @@ fn row(&(stream, window, n, base): &G) -> AgentRow {
         gauges: Vec::new(),
         histograms: Vec::new(),
         gauge_histograms: Vec::new(),
+        float_counters: Vec::new(),
+        float_gauges: Vec::new(),
     })
     .unwrap();
     AgentRow {

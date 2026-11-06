@@ -207,6 +207,8 @@ impl StreamDecoder {
                 gauges: decoded.gauges,
                 histograms,
                 gauge_histograms,
+                float_counters: Vec::new(),
+                float_gauges: Vec::new(),
             }));
         }
         Ok(out)
@@ -988,6 +990,8 @@ impl SourceRecorder {
                 gauges: vec![None; widths.1],
                 histograms: vec![None; widths.2],
                 gauge_histograms: Vec::new(),
+                float_counters: Vec::new(),
+                float_gauges: Vec::new(),
             };
             for (i, v) in o.counters.into_iter().enumerate() {
                 occ.counters[wire.counters[i]] = v;
@@ -1259,6 +1263,8 @@ impl SourceRecorder {
                         gauges: vec![None; widths.1],
                         histograms: vec![None; widths.2],
                         gauge_histograms: Vec::new(),
+                        float_counters: Vec::new(),
+                        float_gauges: Vec::new(),
                     };
                     for &(m, c) in &slot.counters {
                         occ.counters[c] = g.counters[m];
@@ -1525,6 +1531,8 @@ mod row_form_tests {
             gauges: Vec::new(),
             histograms: Vec::new(),
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         })
         .unwrap();
         let long = wal::encode_wal_long_row(&WalLongRow {

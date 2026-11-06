@@ -322,6 +322,8 @@ mod tests {
             gauges: vec![d("8", "depth")],
             histograms: vec![d("9", "lat")],
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         }
     }
 
@@ -332,6 +334,8 @@ mod tests {
             gauges: vec![n.is_multiple_of(2).then_some(v as i64)],
             histograms: vec![Some((2, 8, vec![v, 0, 1]))],
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         }
     }
 

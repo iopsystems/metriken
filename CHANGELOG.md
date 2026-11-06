@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-model 0.3.0
+
+- **Added (breaking):** `GroupSchema`, `GroupSnapshot`, `WalGroupRow` and
+  `LongOccupant` gain two last fields, `float_counters` and `float_gauges`
+  (descriptors in the schema, `Option<f64>` slots in the snapshot and
+  rows), for counters and gauges whose values are `f64`. Struct literals
+  must add them. `Snapshot::float_counters` and `Snapshot::float_gauges`
+  read them as `FloatCounter` and `FloatGauge`; `GroupSnapshot::validate`
+  checks their arity; `convert::wal_group_row` copies them; the cost meters
+  charge a present float slot as a counter or gauge slot.
+- **Changed:** the four structs encode `gauge_histograms`,
+  `float_counters` and `float_gauges` up to the last non-empty one,
+  writing an empty one before it, and leave out the empty ones after it.
+  A value without floats encodes byte for byte as in 0.2.2, so schema
+  hashes and existing archives are unchanged and 0.2.2 decoders read it.
+  A value with floats is a longer array, which 0.2.2 refuses ("array had
+  incorrect length") rather than read the floats as gauge histograms.
+  `encode_wal_group_row_with_schema` splices rows of 6 to 9 fields.
+
 ### metriken 0.11.7
 
 - **Changed:** `ShardedCounterHistogram::add` and `increment` skip their

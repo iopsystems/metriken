@@ -6,8 +6,8 @@ use crate::wal::{WalGroupRow, WalLongRow};
 use crate::GroupSnapshot;
 
 /// In-memory cost of a cell's value slot: `Option<u64>` / `Option<i64>` /
-/// `Option<Box<[u64]>>` are all 16 B (the histogram's buckets are counted
-/// separately).
+/// `Option<f64>` / `Option<Box<[u64]>>` are all 16 B (the histogram's buckets
+/// are counted separately).
 pub const VALUE_SLOT_BYTES: usize = 16;
 /// In-memory cost of the `Option<Window>` a table builder pushes alongside
 /// every counted cell: 24 B, because `Window` is two `u64`s with no niche, so
@@ -25,6 +25,7 @@ pub fn group_approx_bytes(g: &GroupSnapshot) -> usize {
     let mut bytes = WINDOW_SLOT_BYTES;
     bytes += g.counters.iter().filter(|v| v.is_some()).count() * VALUE_SLOT_BYTES;
     bytes += g.gauges.iter().filter(|v| v.is_some()).count() * VALUE_SLOT_BYTES;
+    bytes += float_slots(&g.float_counters, &g.float_gauges) * VALUE_SLOT_BYTES;
     for h in g.histograms.iter().chain(&g.gauge_histograms).flatten() {
         bytes += VALUE_SLOT_BYTES + h.as_slice().len() * HISTOGRAM_BUCKET_BYTES;
     }
@@ -37,6 +38,7 @@ pub fn wal_group_row_approx_bytes(row: &WalGroupRow) -> usize {
     let mut bytes = WINDOW_SLOT_BYTES;
     bytes += row.counters.iter().filter(|v| v.is_some()).count() * VALUE_SLOT_BYTES;
     bytes += row.gauges.iter().filter(|v| v.is_some()).count() * VALUE_SLOT_BYTES;
+    bytes += float_slots(&row.float_counters, &row.float_gauges) * VALUE_SLOT_BYTES;
     for (_, _, buckets) in row.histograms.iter().chain(&row.gauge_histograms).flatten() {
         bytes += VALUE_SLOT_BYTES + buckets.len() * HISTOGRAM_BUCKET_BYTES;
     }
@@ -51,11 +53,21 @@ pub fn wal_long_row_approx_bytes(row: &WalLongRow) -> usize {
         bytes += VALUE_SLOT_BYTES;
         bytes += o.counters.iter().filter(|v| v.is_some()).count() * VALUE_SLOT_BYTES;
         bytes += o.gauges.iter().filter(|v| v.is_some()).count() * VALUE_SLOT_BYTES;
+        bytes += float_slots(&o.float_counters, &o.float_gauges) * VALUE_SLOT_BYTES;
         for (_, _, buckets) in o.histograms.iter().chain(&o.gauge_histograms).flatten() {
             bytes += VALUE_SLOT_BYTES + buckets.len() * HISTOGRAM_BUCKET_BYTES;
         }
     }
     bytes
+}
+
+/// The present float counter and float gauge slots.
+fn float_slots(counters: &[Option<f64>], gauges: &[Option<f64>]) -> usize {
+    counters
+        .iter()
+        .chain(gauges)
+        .filter(|v| v.is_some())
+        .count()
 }
 
 #[cfg(test)]
@@ -81,14 +93,67 @@ mod tests {
             gauges: vec![None, Some(-4)],
             histograms: vec![Some(h), None],
             gauge_histograms: Vec::new(),
+            float_counters: vec![Some(0.25), None],
+            float_gauges: vec![None, Some(-1.5), Some(f64::MAX)],
         };
         let row = wal_group_row(&g, None);
         let decoded = decode_wal_group_row(&encode_wal_group_row(&row).unwrap()).unwrap();
         let metered = wal_group_row_approx_bytes(&decoded);
         assert_eq!(metered, group_approx_bytes(&g));
         assert!(
-            metered > WINDOW_SLOT_BYTES + 4 * VALUE_SLOT_BYTES + HISTOGRAM_BUCKET_BYTES,
+            metered > WINDOW_SLOT_BYTES + 7 * VALUE_SLOT_BYTES + HISTOGRAM_BUCKET_BYTES,
             "the histogram's buckets must be charged"
+        );
+    }
+
+    /// Each present float slot costs a value slot in all three meters, as a
+    /// counter or gauge slot does; an absent one costs nothing.
+    #[test]
+    fn present_float_slots_are_charged_as_value_slots() {
+        let g = |float_counters: Vec<Option<f64>>, float_gauges: Vec<Option<f64>>| GroupSnapshot {
+            name: "s/g".to_string(),
+            schema_hash: (1, 2),
+            schema: None,
+            window: None,
+            counters: Vec::new(),
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
+            float_counters,
+            float_gauges,
+        };
+        let empty = g(Vec::new(), Vec::new());
+        let floats = g(vec![Some(0.5), None], vec![Some(1.0), Some(2.0), None]);
+        assert_eq!(
+            group_approx_bytes(&floats) - group_approx_bytes(&empty),
+            3 * VALUE_SLOT_BYTES
+        );
+        assert_eq!(
+            wal_group_row_approx_bytes(&wal_group_row(&floats, None))
+                - wal_group_row_approx_bytes(&wal_group_row(&empty, None)),
+            3 * VALUE_SLOT_BYTES
+        );
+        let long = |o: crate::wal::LongOccupant| WalLongRow {
+            schema_hash: (1, 2),
+            schema: None,
+            window: None,
+            occupants: vec![o],
+        };
+        let occupant = |float_counters, float_gauges| crate::wal::LongOccupant {
+            occupant: 0,
+            counters: Vec::new(),
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
+            float_counters,
+            float_gauges,
+        };
+        assert_eq!(
+            wal_long_row_approx_bytes(&long(occupant(
+                vec![Some(0.5), None],
+                vec![Some(1.0), Some(2.0), None]
+            ))) - wal_long_row_approx_bytes(&long(occupant(Vec::new(), Vec::new()))),
+            3 * VALUE_SLOT_BYTES
         );
     }
 }

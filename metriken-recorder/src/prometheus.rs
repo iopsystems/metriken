@@ -242,6 +242,8 @@ impl PrometheusConverter {
             gauges: gauges.iter().map(desc_of).collect(),
             histograms: histograms.iter().map(desc_of).collect(),
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         };
         let group = GroupSnapshot {
             name: PROMETHEUS_GROUP.to_string(),
@@ -256,6 +258,8 @@ impl PrometheusConverter {
             gauges: gauges.into_iter().map(|g| Some(g.value)).collect(),
             histograms: histograms.into_iter().map(|h| Some(h.value)).collect(),
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         };
 
         Snapshot::V3(SnapshotV3 {

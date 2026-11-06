@@ -36,6 +36,8 @@ fn snapshot(t: u64) -> Snapshot {
         }],
         histograms: Vec::new(),
         gauge_histograms: Vec::new(),
+        float_counters: Vec::new(),
+        float_gauges: Vec::new(),
     };
     let group = GroupSnapshot {
         name: STREAM.to_string(),
@@ -46,6 +48,8 @@ fn snapshot(t: u64) -> Snapshot {
         gauges: vec![Some(1_000_000 - t as i64)],
         histograms: Vec::new(),
         gauge_histograms: Vec::new(),
+        float_counters: Vec::new(),
+        float_gauges: Vec::new(),
     };
     Snapshot::V3(SnapshotV3 {
         systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
@@ -427,6 +431,8 @@ fn long_snapshot(t: u64) -> Snapshot {
         gauges,
         histograms: Vec::new(),
         gauge_histograms: Vec::new(),
+        float_counters: Vec::new(),
+        float_gauges: Vec::new(),
     };
     Snapshot::V3(SnapshotV3 {
         systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),

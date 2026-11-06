@@ -119,6 +119,8 @@ fn snapshot(t: u64) -> Snapshot {
         gauges,
         histograms,
         gauge_histograms: Vec::new(),
+        float_counters: Vec::new(),
+        float_gauges: Vec::new(),
     };
     let fixed_schema = GroupSchema {
         counters: Vec::new(),
@@ -131,6 +133,8 @@ fn snapshot(t: u64) -> Snapshot {
         }],
         histograms: Vec::new(),
         gauge_histograms: Vec::new(),
+        float_counters: Vec::new(),
+        float_gauges: Vec::new(),
     };
     let fixed = GroupSnapshot {
         name: "memory/meminfo".to_string(),
@@ -142,6 +146,8 @@ fn snapshot(t: u64) -> Snapshot {
         gauges: vec![Some(1_000_000 - t as i64)],
         histograms: Vec::new(),
         gauge_histograms: Vec::new(),
+        float_counters: Vec::new(),
+        float_gauges: Vec::new(),
     };
     Snapshot::V3(SnapshotV3 {
         systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
@@ -1026,6 +1032,8 @@ fn growing(t: u64) -> Snapshot {
         gauges,
         histograms: Vec::new(),
         gauge_histograms: Vec::new(),
+        float_counters: Vec::new(),
+        float_gauges: Vec::new(),
     };
     Snapshot::V3(SnapshotV3 {
         systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
@@ -1955,6 +1963,8 @@ fn members_snapshot(t: u64, members: &[&str]) -> Snapshot {
             gauges,
             histograms: Vec::new(),
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         }],
     })
 }
@@ -2219,6 +2229,8 @@ fn unslotted(t: u64) -> Snapshot {
                 }],
                 histograms: Vec::new(),
                 gauge_histograms: Vec::new(),
+                float_counters: Vec::new(),
+                float_gauges: Vec::new(),
             };
             g.schema_hash = schema.hash();
             g.schema = Some(Arc::new(schema));
