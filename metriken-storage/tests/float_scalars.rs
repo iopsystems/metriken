@@ -11,6 +11,15 @@
 //! format 3, one without stays 1; a producer's `metric_type` label does not
 //! change a float column's kind; two recordings of one name, one integer
 //! and one float, read as two series.
+//!
+//! Queried through metriken-query, on the batched rate path and per
+//! series: float counters and gauges evaluate in every function that reads
+//! them; any decrease of a float counter is a reset (decision 3); a series
+//! that turns float rates across the change; a query over an integer
+//! recording and a float recording reads both (decision 1); one process
+//! recorded as integers and then as floats reads as it does recorded as
+//! integers throughout, and its overlapping rows conflict only where the
+//! numbers differ.
 #![cfg(feature = "write")]
 
 use std::collections::BTreeMap;
@@ -681,42 +690,317 @@ fn float_scalars_round_trip_off_the_stream() {
     check(&live);
 }
 
-/// A query reads integer counters as before and refuses a float counter or
-/// gauge with an error naming it, rather than answering without it.
+// ─── Queries ────────────────────────────────────────────────────────────────
+
+/// The two ways a range query evaluates a `rate` or `irate`: the batched
+/// scan of the decoded columns, and one sample stream per series.
+const PATHS: [(&str, bool); 2] = [("batched", false), ("per series", true)];
+
+/// A result series: its labels (no `__name__`) and points as
+/// `(tick, value)`.
+type Series = (BTreeMap<String, String>, Vec<(u64, f64)>);
+
+/// `query`'s series over the recorded ticks at a 1 s step, by labels; on
+/// the per-series rate path when `per_series`.
+fn query(reader: &ArchiveReader, query: &str, per_series: bool) -> Vec<Series> {
+    use metriken_query::{MetricsSource, QueryOptions, QueryResult};
+    let opts = QueryOptions::default().with_per_series_rates(per_series);
+    let (lo, hi) = (BASE / S, BASE / S + TICKS - 1);
+    let result = reader
+        .query_range_opts(query, lo as f64, hi as f64, 1.0, &opts)
+        .unwrap_or_else(|e| panic!("{query}: {e}"));
+    assert!(
+        result.notices().is_empty(),
+        "{query}: {:?}",
+        result.notices()
+    );
+    let QueryResult::Matrix { result, .. } = result else {
+        panic!("{query}: not a matrix")
+    };
+    let mut out: Vec<_> = result
+        .into_iter()
+        .map(|m| {
+            let labels: BTreeMap<String, String> = m
+                .metric
+                .into_iter()
+                .filter(|(k, _)| k != "__name__")
+                .collect();
+            let points = m
+                .values
+                .into_iter()
+                .map(|(t, v)| ((t.round() as u64) - BASE / S, v))
+                .collect();
+            (labels, points)
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// `query`'s one series.
+fn one(reader: &ArchiveReader, q: &str, per_series: bool) -> Vec<(u64, f64)> {
+    let mut got = query(reader, q, per_series);
+    assert_eq!(got.len(), 1, "{q}: {got:?}");
+    got.remove(0).1
+}
+
+/// Whether `a` is `b` up to the rounding of a difference of two values
+/// near `scale`.
+fn close(a: f64, b: f64, scale: f64) -> bool {
+    (a - b).abs() <= 1e-12 * scale.abs().max(1.0)
+}
+
+/// Float counters and gauges evaluate as integer ones do, through every
+/// function that reads them, wide and long, on both rate paths; an integer
+/// counter beside them reads as before.
 #[test]
-fn a_query_refuses_a_float_series_by_name() {
-    use metriken_query::{MetricsSource, QueryResult};
+fn float_counters_and_gauges_evaluate() {
+    use metriken_query::MetricsSource;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("query.dendro");
     record_snapshots(&path, true);
     let reader = open(&path);
-    let (lo, hi) = reader.time_range().unwrap();
-    let QueryResult::Matrix { result, .. } = reader
-        .query_range("irate(ops_total[2s])", lo, hi, 1.0)
-        .unwrap()
-    else {
-        panic!("not a matrix")
+    assert!(reader.has_counter("cpu_seconds_total"));
+    assert!(reader.has_gauge("cpu_limit"));
+    assert!(!reader.has_gauge("cpu_seconds_total"));
+    assert!(!reader.has_counter("cpu_limit"));
+
+    for (path, per_series) in PATHS {
+        metriken_query::fixtures::take_batch_rates();
+        let ops = one(&reader, "irate(ops_total[2s])", per_series);
+        assert_eq!(ops.len(), TICKS as usize - 1, "{path}");
+        assert!(ops.iter().all(|(_, v)| *v == 1.0), "{path}: {ops:?}");
+
+        // 0.1 a second, wide.
+        let cpu = one(&reader, "irate(cpu_seconds_total[2s])", per_series);
+        assert_eq!(cpu.len(), TICKS as usize - 1, "{path}");
+        for (t, v) in &cpu {
+            let want = cpu_seconds(*t) - cpu_seconds(t - 1);
+            assert!(close(*v, want, cpu_seconds(*t)), "{path} {t}: {v} {want}");
+        }
+        let rate = one(&reader, "rate(cpu_seconds_total[3s])", per_series);
+        assert!(!rate.is_empty(), "{path}");
+        for (t, v) in &rate {
+            assert!(close(*v, 0.1, 10.0), "{path} {t}: {v}");
+        }
+
+        // 0.3 a second per container, long.
+        let containers = query(
+            &reader,
+            "rate(container_cpu_usage_seconds_total[3s])",
+            per_series,
+        );
+        assert_eq!(containers.len(), IDS.len(), "{path}");
+        for (labels, points) in &containers {
+            assert!(!points.is_empty(), "{path} {labels:?}");
+            for (t, v) in points {
+                assert!(close(*v, 0.3, 10.0), "{path} {labels:?} {t}: {v}");
+            }
+        }
+        let summed = one(
+            &reader,
+            "sum(rate(container_cpu_usage_seconds_total[3s]))",
+            per_series,
+        );
+        assert!(
+            summed.iter().all(|(_, v)| close(*v, 0.6, 10.0)),
+            "{summed:?}"
+        );
+        if per_series {
+            assert_eq!(metriken_query::fixtures::take_batch_rates(), 0, "{path}");
+        } else {
+            // Every rate and irate above, the float ones included.
+            assert_eq!(metriken_query::fixtures::take_batch_rates(), 5, "{path}");
+        }
+    }
+
+    // The display path, at full resolution, reads the batched rates.
+    let display = reader
+        .query_range_display_opts(
+            "rate(container_cpu_usage_seconds_total[3s])",
+            (BASE / S) as f64,
+            (BASE / S + TICKS - 1) as f64,
+            1.0,
+            &metriken_query::DisplayOptions {
+                budget: 0,
+                ..metriken_query::DisplayOptions::default()
+            },
+            &metriken_query::QueryOptions::default(),
+        )
+        .unwrap();
+    let metriken_query::DisplayResult::Series { result, .. } = display else {
+        panic!("not series")
     };
-    assert_eq!(result.len(), 1);
-    assert!(result[0].values.iter().all(|(_, v)| *v == 1.0));
+    assert_eq!(result.len(), IDS.len());
+    for s in &result {
+        assert!(!s.points.is_empty());
+        assert!(
+            s.points.iter().all(|p| close(p.median, 0.3, 10.0)),
+            "{:?}",
+            s.points
+        );
+    }
+
+    // The two paths agree point for point.
     for q in [
         "irate(cpu_seconds_total[2s])",
+        "rate(cpu_seconds_total[5s])",
         "rate(container_cpu_usage_seconds_total[3s])",
-        "cpu_limit",
-        "avg_over_time(container_spec_cpu_quota[3s])",
+        "sum by (id) (irate(container_cpu_usage_seconds_total[2s]))",
     ] {
-        let err = reader
-            .query_range(q, lo, hi, 1.0)
-            .err()
-            .unwrap_or_else(|| panic!("{q}: answered"))
-            .to_string();
-        assert!(err.contains("float values"), "{q}: {err}");
+        let (batched, streamed) = (query(&reader, q, false), query(&reader, q, true));
+        assert_eq!(batched.len(), streamed.len(), "{q}");
+        for ((lb, pb), (ls, ps)) in batched.iter().zip(&streamed) {
+            assert_eq!(lb, ls, "{q}");
+            assert_eq!(pb.len(), ps.len(), "{q} {lb:?}");
+            for ((tb, vb), (ts, vs)) in pb.iter().zip(ps) {
+                assert_eq!(tb, ts, "{q} {lb:?}");
+                assert!(close(*vb, *vs, 10.0), "{q} {lb:?} {tb}: {vb} {vs}");
+            }
+        }
+    }
+
+    // A bare selector reads each fraction as stored; tick 3, absent, holds
+    // tick 2's value.
+    let limit = one(&reader, "cpu_limit", false);
+    assert_eq!(limit.len(), TICKS as usize);
+    for (t, v) in &limit {
+        let want = cpu_limit(*t).or_else(|| cpu_limit(t - 1)).unwrap();
+        assert_eq!(v.to_bits(), want.to_bits(), "{t}");
+    }
+    // Long gauges, below zero and nine digits down.
+    for (i, (labels, points)) in query(&reader, "container_spec_cpu_quota", false)
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(labels.get("id").map(String::as_str), Some(IDS[i]));
+        let want: Vec<(u64, u64)> = (0..TICKS)
+            .map(|t| (t, container_quota(i, t).to_bits()))
+            .collect();
+        let got: Vec<(u64, u64)> = points.iter().map(|(t, v)| (*t, v.to_bits())).collect();
+        assert_eq!(got, want, "{labels:?}");
+    }
+
+    // The samples stamped in `[t - 3 s, t]`.
+    let window = |t: u64| (t.saturating_sub(3)..=t).filter(|k| cpu_limit(*k).is_some());
+    let avg = one(&reader, "avg_over_time(cpu_limit[3s])", false);
+    assert_eq!(avg.len(), TICKS as usize);
+    for (t, v) in &avg {
+        let w: Vec<f64> = window(*t).map(|k| cpu_limit(k).unwrap()).collect();
+        let want = w.iter().sum::<f64>() / w.len() as f64;
+        assert!(close(*v, want, 1.0), "{t}: {v} {want}");
+    }
+    let idelta = one(&reader, "idelta(cpu_limit[3s])", false);
+    assert_eq!(idelta.len(), TICKS as usize - 1);
+    for (t, v) in &idelta {
+        let w: Vec<u64> = window(*t).collect();
+        let [.., a, b] = w[..] else {
+            panic!("{t}: {w:?}")
+        };
+        let want = cpu_limit(b).unwrap() - cpu_limit(a).unwrap();
+        assert_eq!(v.to_bits(), want.to_bits(), "{t}");
+    }
+    let deriv = one(&reader, "deriv(cpu_seconds_total[3s])", false);
+    assert!(!deriv.is_empty());
+    assert!(deriv.iter().all(|(_, v)| close(*v, 0.1, 10.0)), "{deriv:?}");
+}
+
+/// Any decrease of a float counter is a reset, however small: the value
+/// after it is the increase. On both rate paths, `irate` and `rate` on the
+/// grid and `irate` between raw samples.
+#[test]
+fn a_float_counter_resets_on_any_decrease() {
+    use metriken_query::{MetricsSource, QueryOptions, QueryResult, RateMode};
+    // A reset to 0.25 at tick 4, and a decrease of 1e-9 at tick 8.
+    let values = [
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        0.25,
+        0.75,
+        1.25,
+        2.0,
+        2.0 - 1e-9,
+        2.5,
+        3.0,
+        3.5,
+    ];
+    assert_eq!(values.len(), TICKS as usize);
+    let increase = |t: usize| {
+        if values[t] >= values[t - 1] {
+            values[t] - values[t - 1]
+        } else {
+            values[t]
+        }
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resets.dendro");
+    let schema = Arc::new(GroupSchema {
+        float_counters: vec![desc("0", &[("metric", "busy_seconds_total")])],
+        ..GroupSchema::default()
+    });
+    record(&path, true, |source, t| {
+        let mut g = group(NODE, &schema, t);
+        g.float_counters = vec![Some(values[t as usize])];
+        let snap = Snapshot::V3(SnapshotV3 {
+            systemtime: std::time::UNIX_EPOCH + std::time::Duration::from_nanos(BASE + t * S),
+            duration: std::time::Duration::from_millis(1),
+            metadata: Default::default(),
+            groups: vec![g],
+        });
+        source.stage(&snap, BASE + t * S, 0).unwrap()
+    });
+    let reader = open(&path);
+    for (path, per_series) in PATHS {
+        let irate = one(&reader, "irate(busy_seconds_total[2s])", per_series);
+        let want: Vec<(u64, f64)> = (1..TICKS).map(|t| (t, increase(t as usize))).collect();
+        assert_eq!(irate.len(), want.len(), "{path}");
+        for ((t, v), (_, w)) in irate.iter().zip(&want) {
+            assert!(close(*v, *w, 4.0), "{path} {t}: {v} {w}");
+        }
+        // Over two seconds: the two increases' mean, from the first point
+        // whose window holds two.
+        let rate = one(&reader, "rate(busy_seconds_total[2s])", per_series);
+        assert!(rate.iter().any(|(t, _)| *t == 2), "{path}: {rate:?}");
+        for (t, v) in rate.iter().filter(|(t, _)| *t >= 2) {
+            let t = *t as usize;
+            let w = (increase(t) + increase(t - 1)) / 2.0;
+            assert!(close(*v, w, 4.0), "{path} {t}: {v} {w}");
+        }
+    }
+    let (lo, hi) = (BASE / S, BASE / S + TICKS - 1);
+    let raw = reader
+        .query_range_opts(
+            "irate(busy_seconds_total[2s])",
+            lo as f64,
+            hi as f64,
+            1.0,
+            &QueryOptions::with_rate_mode(RateMode::Raw),
+        )
+        .unwrap();
+    let QueryResult::Matrix { result, .. } = raw else {
+        panic!("not a matrix")
+    };
+    let got: Vec<(u64, f64)> = result[0]
+        .values
+        .iter()
+        .map(|(t, v)| ((t.round() as u64) - BASE / S, *v))
+        .collect();
+    assert_eq!(
+        got.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        (1..TICKS).collect::<Vec<_>>()
+    );
+    for (t, v) in &got {
+        let w = increase(*t as usize);
+        assert!(close(*v, w, 4.0), "raw {t}: {v} {w}");
     }
 }
 
-/// One counter name recorded by two sources, one as an integer column and
-/// one as a float column (an endpoint before and after its recorder
-/// stored floats), reads as two series, each with its own values.
+/// One counter name and one gauge name recorded by two sources, one as
+/// integer columns and one as float columns (an endpoint before and after
+/// its recorder stored floats), read as two series each, with their own
+/// values, and one query over both recordings reads both (decision 1).
 #[test]
 fn an_integer_and_a_float_recording_of_one_name_read_together() {
     let dir = tempfile::tempdir().unwrap();
@@ -730,10 +1014,12 @@ fn an_integer_and_a_float_recording_of_one_name_read_together() {
         .unwrap();
     let int_schema = Arc::new(GroupSchema {
         counters: vec![desc("0", &[("metric", "requests_total")])],
+        gauges: vec![desc("1", &[("metric", "queue_depth")])],
         ..GroupSchema::default()
     });
     let float_schema = Arc::new(GroupSchema {
         float_counters: vec![desc("0", &[("metric", "requests_total")])],
+        float_gauges: vec![desc("1", &[("metric", "queue_depth")])],
         ..GroupSchema::default()
     });
     for t in 0..TICKS {
@@ -748,8 +1034,10 @@ fn an_integer_and_a_float_recording_of_one_name_read_together() {
         };
         let mut i = group(NODE, &int_schema, t);
         i.counters = vec![Some(BIG + t)];
+        i.gauges = vec![Some(t as i64)];
         let mut f = group(NODE, &float_schema, t);
         f.float_counters = vec![Some(cpu_seconds(t))];
+        f.float_gauges = vec![Some(t as f64 + 0.5)];
         let a = int_source.stage(&snap(i), ts, 0).unwrap();
         let b = float_source.stage(&snap(f), ts, 0).unwrap();
         writer.commit(vec![a, b]).unwrap();
@@ -762,7 +1050,7 @@ fn an_integer_and_a_float_recording_of_one_name_read_together() {
     assert_eq!(readers.len(), 2);
     let reader = ArchiveReader::flatten(readers, None);
     assert_eq!(reader.counter_names(), ["requests_total"]);
-    assert!(reader.gauge_names().is_empty());
+    assert_eq!(reader.gauge_names(), ["queue_depth"]);
     let mut sources: Vec<String> = reader
         .counter_labels("requests_total")
         .iter()
@@ -793,6 +1081,53 @@ fn an_integer_and_a_float_recording_of_one_name_read_together() {
             CounterValues::Int((0..TICKS).map(|t| BIG + t).collect()),
             CounterValues::Float((0..TICKS).map(cpu_seconds).collect()),
         ]
+    );
+
+    let source = |labels: &BTreeMap<String, String>| labels["source"].clone();
+    for (path, per_series) in PATHS {
+        let rates = query(&reader, "irate(requests_total[2s])", per_series);
+        assert_eq!(
+            rates.iter().map(|(l, _)| source(l)).collect::<Vec<_>>(),
+            ["after", "before"],
+            "{path}"
+        );
+        for ((labels, points), want) in rates.iter().zip([0.1, 1.0]) {
+            assert_eq!(points.len(), TICKS as usize - 1, "{path} {labels:?}");
+            assert!(
+                points.iter().all(|(_, v)| close(*v, want, 10.0)),
+                "{path} {labels:?}: {points:?}"
+            );
+        }
+        let sum = one(&reader, "sum(irate(requests_total[2s]))", per_series);
+        assert_eq!(sum.len(), TICKS as usize - 1, "{path}");
+        assert!(
+            sum.iter().all(|(_, v)| close(*v, 1.1, 10.0)),
+            "{path}: {sum:?}"
+        );
+    }
+    let depths = query(&reader, "queue_depth", false);
+    assert_eq!(
+        depths
+            .iter()
+            .map(|(l, p)| (source(l), p.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "after".to_string(),
+                (0..TICKS).map(|t| (t, t as f64 + 0.5)).collect::<Vec<_>>()
+            ),
+            (
+                "before".to_string(),
+                (0..TICKS).map(|t| (t, t as f64)).collect()
+            ),
+        ]
+    );
+    let sum = one(&reader, "sum(queue_depth)", false);
+    assert_eq!(
+        sum,
+        (0..TICKS)
+            .map(|t| (t, 2.0 * t as f64 + 0.5))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -876,10 +1211,12 @@ fn a_float_column_of_another_metric_type_is_not_read() {
 /// A member that is an integer counter for the first ticks and a float
 /// counter after (a schema change mid-recording) reads as one float series
 /// with every value, whether the change falls inside a segment or at a
-/// seal. Integers become `f64`.
+/// seal (with 100 or 4 rows a segment the change is inside one; with 3 a
+/// segment starts at it). Integers become `f64`. Its rate is continuous
+/// across the change.
 #[test]
 fn a_series_that_turns_float_reads_as_one_float_series() {
-    for max_rows in [100, 4] {
+    for max_rows in [100, 4, 3] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("turns.dendro");
         let config = WriterConfig {
@@ -958,6 +1295,26 @@ fn a_series_that_turns_float_reads_as_one_float_series() {
             bits(&want),
             "max_rows {max_rows}"
         );
+        // A rate across the change differences an integer reading and a
+        // float one.
+        for (path, per_series) in PATHS {
+            metriken_query::fixtures::take_batch_rates();
+            let rate = one(&reader, "irate(turns_total[2s])", per_series);
+            let expected: Vec<(u64, f64)> = (1..TICKS)
+                .map(|t| (t, if t == 6 { 10.5 } else { 10.0 }))
+                .collect();
+            assert_eq!(rate, expected, "max_rows {max_rows} {path}");
+            // A segment holding the series in both columns is read per
+            // series (two locations in one segment); with the change at a
+            // seal (3 rows) the batched scan reads an integer segment and
+            // then a float one.
+            let batched = usize::from(!per_series && max_rows == 3);
+            assert_eq!(
+                metriken_query::fixtures::take_batch_rates(),
+                batched,
+                "max_rows {max_rows} {path}"
+            );
+        }
     }
 }
 
@@ -1009,4 +1366,151 @@ fn a_float_column_is_written_with_its_own_kind() {
             ("fg", Some("gauge"), &Values::FloatGauge(vec![Some(-1.5)])),
         ]
     );
+}
+
+/// Two sources of one process (one labels, one producer epoch), the first
+/// recording ticks 0 to 7 as integer columns and the second ticks 4 to 11,
+/// as float columns when `float`, with a counter growing 10 a tick and a
+/// gauge holding the tick. `edit` changes the second source's reading at
+/// tick 6 by 0.5.
+fn write_process(path: &Path, float: bool, edit: bool) {
+    let mut writer = ArchiveWriter::create(path, config()).unwrap();
+    let metadata = BTreeMap::from([("producer_epoch".to_string(), "e".to_string())]);
+    let mut first = writer
+        .add_source(labels(&[("host", "a")]), metadata.clone(), BASE)
+        .unwrap();
+    let mut second = writer
+        .add_source(labels(&[("host", "a")]), metadata, BASE + 4 * S)
+        .unwrap();
+    let int_schema = Arc::new(GroupSchema {
+        counters: vec![desc("0", &[("metric", "work_total")])],
+        gauges: vec![desc("1", &[("metric", "level")])],
+        ..GroupSchema::default()
+    });
+    let float_schema = Arc::new(GroupSchema {
+        float_counters: vec![desc("0", &[("metric", "work_total")])],
+        float_gauges: vec![desc("1", &[("metric", "level")])],
+        ..GroupSchema::default()
+    });
+    let snap = |g: GroupSnapshot, ts: u64| {
+        Snapshot::V3(SnapshotV3 {
+            systemtime: std::time::UNIX_EPOCH + std::time::Duration::from_nanos(ts),
+            duration: std::time::Duration::from_millis(1),
+            metadata: Default::default(),
+            groups: vec![g],
+        })
+    };
+    for t in 0..TICKS {
+        let ts = BASE + t * S;
+        let mut staged = Vec::new();
+        if t < 8 {
+            let mut g = group(NODE, &int_schema, t);
+            g.counters = vec![Some(10 * t)];
+            g.gauges = vec![Some(t as i64)];
+            staged.push(first.stage(&snap(g, ts), ts, 0).unwrap());
+        }
+        if t >= 4 {
+            let delta = if edit && t == 6 { 0.5 } else { 0.0 };
+            let g = if float {
+                let mut g = group(NODE, &float_schema, t);
+                g.float_counters = vec![Some(10.0 * t as f64 + delta)];
+                g.float_gauges = vec![Some(t as f64 + delta)];
+                g
+            } else {
+                let mut g = group(NODE, &int_schema, t);
+                g.counters = vec![Some(10 * t)];
+                g.gauges = vec![Some(t as i64)];
+                g
+            };
+            staged.push(second.stage(&snap(g, ts), ts, 0).unwrap());
+        }
+        writer.commit(staged).unwrap();
+        first.maybe_seal().unwrap();
+        second.maybe_seal().unwrap();
+    }
+    first.finalize((BASE + 7 * S, 0)).unwrap();
+    second.finalize((BASE + (TICKS - 1) * S, 0)).unwrap();
+    writer.join().unwrap();
+}
+
+fn open_process(path: &Path) -> ArchiveReader {
+    let reader = ArchiveReader::flatten(open_all(path).into_iter().map(|(_, r)| r).collect(), None);
+    assert_eq!(reader.read_groups().len(), 1, "one process");
+    reader
+}
+
+/// One process recorded first with integer columns and then with float
+/// columns reads as one series of each name across the change, as it does
+/// recorded with integers throughout. Where the two recordings overlap they
+/// hold the same numbers, one as integers and one as floats, which is not
+/// a conflict; a different float reading is.
+#[test]
+fn a_process_recorded_as_integers_then_floats_reads_as_one_series() {
+    use metriken_query::{MetricsSource, Notice, QueryOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str, float: bool, edit: bool| {
+        let path = dir.path().join(name);
+        write_process(&path, float, edit);
+        open_process(&path)
+    };
+    let floats = path("floats.dendro", true, false);
+    let ints = path("ints.dendro", false, false);
+    for (path, per_series) in PATHS {
+        metriken_query::fixtures::take_batch_rates();
+        for q in [
+            "irate(work_total[2s])",
+            "rate(work_total[3s])",
+            "sum(rate(work_total[3s]))",
+            "level",
+            "avg_over_time(level[3s])",
+            "idelta(level[3s])",
+        ] {
+            let got = one(&floats, q, per_series);
+            assert!(!got.is_empty(), "{path} {q}");
+            assert_eq!(got, one(&ints, q, per_series), "{path} {q}");
+        }
+        // Three rates, of each archive.
+        let batched = if per_series { 0 } else { 6 };
+        assert_eq!(
+            metriken_query::fixtures::take_batch_rates(),
+            batched,
+            "{path}"
+        );
+        let rate = one(&floats, "irate(work_total[2s])", per_series);
+        assert_eq!(
+            rate,
+            (1..TICKS).map(|t| (t, 10.0)).collect::<Vec<_>>(),
+            "{path}"
+        );
+    }
+
+    let edited = path("edited.dendro", true, true);
+    let (lo, hi) = (BASE / S, BASE / S + TICKS - 1);
+    for (q, metric, per_series) in [
+        ("irate(work_total[2s])", "work_total", false),
+        ("irate(work_total[2s])", "work_total", true),
+        ("level", "level", false),
+    ] {
+        let got = edited
+            .query_range_opts(
+                q,
+                lo as f64,
+                hi as f64,
+                1.0,
+                &QueryOptions::default().with_per_series_rates(per_series),
+            )
+            .unwrap();
+        let [Notice::Conflict {
+            series,
+            first,
+            count,
+            ..
+        }] = got.notices()
+        else {
+            panic!("{q} {per_series}: {:?}", got.notices());
+        };
+        assert_eq!(series["__name__"], metric, "{q}");
+        assert_eq!(*first, (BASE + 6 * S) as f64 / 1e9, "{q}");
+        assert_eq!(*count, 1, "{q}");
+    }
 }

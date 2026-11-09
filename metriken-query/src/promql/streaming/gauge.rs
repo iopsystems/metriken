@@ -12,6 +12,7 @@
 //!   gauge's or a counter's values.
 
 use super::Point;
+use crate::types::GaugeValues;
 
 /// Where a gauge producer places its output points, and how it advances.
 ///
@@ -105,9 +106,17 @@ macro_rules! impl_at_points {
 
 impl_at_points!(GaugeStepGrid, GaugeAvgOverTime, GaugeIdelta, GaugeDeriv);
 
+/// Value `i` of a gauge series, as an `f64`: an integer gauge's converted,
+/// a float gauge's as stored.
+fn value_at(values: &GaugeValues, i: usize) -> f64 {
+    values
+        .get_f64(i)
+        .expect("a series has as many values as timestamps")
+}
+
 pub struct GaugeStepGrid {
     timestamps: Vec<u64>,
-    values: Vec<i64>,
+    values: GaugeValues,
     end_ns: u64,
     staleness_ns: u64,
     place: Placement,
@@ -116,7 +125,7 @@ pub struct GaugeStepGrid {
 impl GaugeStepGrid {
     pub fn new(
         timestamps: Vec<u64>,
-        values: Vec<i64>,
+        values: GaugeValues,
         start_ns: u64,
         end_ns: u64,
         step_ns: u64,
@@ -145,18 +154,18 @@ impl Iterator for GaugeStepGrid {
                 continue;
             }
             let ts = self.timestamps[hi - 1];
-            let val = self.values[hi - 1];
+            let val = value_at(&self.values, hi - 1);
             if t.saturating_sub(ts) > self.staleness_ns {
                 continue;
             }
-            return Some(Point::at(t, val as f64));
+            return Some(Point::at(t, val));
         }
     }
 }
 
 pub struct GaugeAvgOverTime {
     timestamps: Vec<u64>,
-    values: Vec<i64>,
+    values: GaugeValues,
     end_ns: u64,
     range_ns: u64,
     place: Placement,
@@ -165,7 +174,7 @@ pub struct GaugeAvgOverTime {
 impl GaugeAvgOverTime {
     pub fn new(
         timestamps: Vec<u64>,
-        values: Vec<i64>,
+        values: GaugeValues,
         start_ns: u64,
         end_ns: u64,
         step_ns: u64,
@@ -198,8 +207,8 @@ impl Iterator for GaugeAvgOverTime {
 
             let mut sum = 0.0_f64;
             let count = hi - lo;
-            for &v in &self.values[lo..hi] {
-                sum += v as f64;
+            for i in lo..hi {
+                sum += value_at(&self.values, i);
             }
             return Some(Point::at(t, sum / count as f64));
         }
@@ -208,7 +217,7 @@ impl Iterator for GaugeAvgOverTime {
 
 pub struct GaugeIdelta {
     timestamps: Vec<u64>,
-    values: Vec<i64>,
+    values: GaugeValues,
     end_ns: u64,
     range_ns: u64,
     place: Placement,
@@ -217,7 +226,7 @@ pub struct GaugeIdelta {
 impl GaugeIdelta {
     pub fn new(
         timestamps: Vec<u64>,
-        values: Vec<i64>,
+        values: GaugeValues,
         start_ns: u64,
         end_ns: u64,
         step_ns: u64,
@@ -252,8 +261,8 @@ impl Iterator for GaugeIdelta {
                 }
                 continue;
             }
-            let cur = self.values[hi - 1] as f64;
-            let prev = self.values[hi - 2] as f64;
+            let cur = value_at(&self.values, hi - 1);
+            let prev = value_at(&self.values, hi - 2);
             return Some(Point::at(t, cur - prev));
         }
     }
@@ -348,7 +357,7 @@ mod tests {
         let vals = [10i64, 20, 30];
         let pts: Vec<Point> = GaugeStepGrid::new(
             ts.to_vec(),
-            vals.to_vec(),
+            vals.to_vec().into(),
             0,
             3_000_000_000,
             1_000_000_000,
@@ -373,7 +382,7 @@ mod tests {
         let vals = [10i64, 20, 30];
         let pts: Vec<Point> = GaugeStepGrid::new(
             ts.to_vec(),
-            vals.to_vec(),
+            vals.to_vec().into(),
             0,
             3_000_000_000,
             1_000_000_000,

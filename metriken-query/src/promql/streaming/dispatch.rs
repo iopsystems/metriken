@@ -41,28 +41,6 @@ use crate::promql::streaming::{
     LabeledSeries, MatchSpec, OneSide, SeriesSet,
 };
 use crate::promql::{nothing_read, MatrixSample, MetricKind, QueryError, QueryResult};
-
-/// The refusal of a read whose series hold `f64` values (a float counter or
-/// gauge column): the rate and gauge producers here take integer samples.
-/// `deriv`, which evaluates in `f64`, reads them.
-fn float_unsupported(metric: &str, kind: MetricKind) -> QueryError {
-    QueryError::Unsupported(format!(
-        "{} {metric} is stored with float values, which this release does not evaluate \
-         except in deriv()",
-        kind.noun()
-    ))
-}
-
-/// A gauge series' integer values, or the refusal of a float gauge.
-fn int_gauge_values(
-    values: crate::types::GaugeValues,
-    metric: &str,
-) -> Result<Vec<i64>, QueryError> {
-    match values {
-        crate::types::GaugeValues::Int(v) => Ok(v),
-        crate::types::GaugeValues::Float(_) => Err(float_unsupported(metric, MetricKind::Gauge)),
-    }
-}
 use crate::{DataSource, QueryOptions, RateMode};
 
 /// Evaluate `expr` via the streaming pipeline. Returns
@@ -413,7 +391,7 @@ fn batch_rates<'a>(
     else {
         return None;
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fixtures"))]
     BATCH_RATES.with(|n| n.set(n.get() + 1));
     let series = results
         .into_iter()
@@ -622,6 +600,10 @@ fn grid_request<'c, 'g>(
 thread_local! {
     /// Display queries [`batch_display`] answered on this thread.
     pub(crate) static BATCH_DISPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+thread_local! {
     /// Queries [`batch_rates`] answered on this thread.
     pub(crate) static BATCH_RATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -1207,9 +1189,6 @@ where
                     metric_name_for_error: None,
                 });
             };
-            if streams.iter().any(|s| s.float) {
-                return Err(float_unsupported(metric_name, MetricKind::Counter));
-            }
             // Each series is its producer over its own sample stream, pulled
             // by whatever consumes it: an aggregate holds one buffered point
             // per series and each producer one interval's worth of samples,
@@ -1297,16 +1276,16 @@ where
                 .map(|g| {
                     let producer = ctx.place(GaugeAvgOverTime::new(
                         g.timestamps,
-                        int_gauge_values(g.values, metric_name)?,
+                        g.values,
                         ctx.start_ns,
                         ctx.end_ns,
                         ctx.step_ns,
                         range_ns,
                         matches!(ctx.rate_mode, RateMode::Raw),
                     ));
-                    Ok(LabeledSeries::new(g.labels, producer))
+                    LabeledSeries::new(g.labels, producer)
                 })
-                .collect::<Result<_, QueryError>>()?;
+                .collect();
             Ok(Built::Series {
                 series,
                 metric_name: Some(metric_name),
@@ -1331,16 +1310,16 @@ where
                 .map(|g| {
                     let producer = ctx.place(GaugeIdelta::new(
                         g.timestamps,
-                        int_gauge_values(g.values, metric_name)?,
+                        g.values,
                         ctx.start_ns,
                         ctx.end_ns,
                         ctx.step_ns,
                         range_ns,
                         matches!(ctx.rate_mode, RateMode::Raw),
                     ));
-                    Ok(LabeledSeries::new(g.labels, producer))
+                    LabeledSeries::new(g.labels, producer)
                 })
-                .collect::<Result<_, QueryError>>()?;
+                .collect();
             Ok(Built::Series {
                 series,
                 metric_name: Some(metric_name),
@@ -1534,17 +1513,17 @@ where
             gauges.series.into_iter().map(move |g| {
                 let producer = ctx.place(GaugeStepGrid::new(
                     g.timestamps,
-                    int_gauge_values(g.values, metric_name)?,
+                    g.values,
                     ctx.start_ns,
                     ctx.end_ns,
                     ctx.step_ns,
                     staleness_ns,
                     matches!(ctx.rate_mode, RateMode::Raw),
                 ));
-                Ok(LabeledSeries::new(g.labels, producer))
+                LabeledSeries::new(g.labels, producer)
             })
         })
-        .collect::<Result<_, QueryError>>()?;
+        .collect();
     Ok(Built::Series {
         series,
         metric_name: Some(metric_name),

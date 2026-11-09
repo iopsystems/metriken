@@ -58,7 +58,9 @@ pub(crate) use binary::{
     matrix_scalar_op, scalar_point, BinOp, MatchSpec, OneSide,
 };
 pub(crate) use gauge::{AtPoints, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid};
-pub(crate) use rate::{range_start, CounterGridRate, CounterPairwiseRate, SPACING_PROBE};
+pub(crate) use rate::{
+    counter_increase, range_start, CounterGridRate, CounterPairwiseRate, SPACING_PROBE,
+};
 
 #[cfg(test)]
 pub(crate) use aggregate::sum_by;

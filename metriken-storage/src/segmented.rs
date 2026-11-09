@@ -1172,9 +1172,9 @@ impl SegmentedSource {
 
     /// See [`DataSource::counter_scan`]. `None` when the relabel's
     /// identities are not fixed, when a series has two locations in one
-    /// segment, when a matched series has a float column in a segment the
-    /// range touches (the scan reads `u64` columns only), or when nothing
-    /// matches; the dispatcher then uses the per-series path.
+    /// segment, or when nothing matches; the dispatcher then uses the
+    /// per-series path. A float counter's column is scanned as an integer
+    /// counter's is: the batches hold it as `Float64`.
     fn scan_counters(
         &self,
         name: &str,
@@ -1216,9 +1216,6 @@ impl SegmentedSource {
             for l in locations {
                 if !self.state.catalog[l.segment as usize].touches(start, end) {
                     continue;
-                }
-                if l.position.float {
-                    return None;
                 }
                 if l.position.holds_values {
                     held = held.max(Some(l.segment));

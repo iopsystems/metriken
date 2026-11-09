@@ -58,19 +58,34 @@ Requires metriken-model 0.3.0.
   without one stay format 1 or 2. A segment's names index records float
   columns in sets of their own, which a reader lists as counters and
   gauges.
-- **Changed:** `DataSource::counter_scan` of a segmented source declines a
-  counter with a float column in the range, so the batched rate path reads
-  only integer columns.
+- **Added:** `Memory::upsert_float_counter_sample` and
+  `upsert_float_gauge_sample` (feature `ingest`). An integer series a float
+  sample is appended to becomes a float series.
+- **Changed:** `DataSource::counter_scan` of a segmented source scans
+  float counter columns as it scans integer ones; a `ScanColumn`'s values
+  column is `UInt64` or `Float64`.
 
 ### metriken-query 0.45.0
 
 Requires metriken-storage 0.8.0.
 
+- **Added:** float counters and gauges evaluate as counters and gauges in
+  every function that reads them (`rate`, `irate`, a bare selector,
+  `avg_over_time`, `idelta`, `deriv`), on the batched rate path and per
+  series. Integer counters keep exact `u64` differencing; a float counter
+  differences in `f64`, and any decrease, however small, is a reset whose
+  increase is the value after it, as for integers. A series stored as
+  integers and then as floats rates across the change. Gauge values are
+  read as `f64` as before, so a float gauge's fractions are returned as
+  stored.
+- **Added:** `MemoryStore::ingest_snapshot` ingests a snapshot's
+  `float_counters` and `float_gauges` as counters and gauges.
+- **Changed:** a process group's sources are compared for conflicts by
+  number: an integer reading and a float reading of the same number (a
+  recording made before its recorder stored floats and one after) are
+  not a conflict; different numbers are.
 - **Changed:** adapted to metriken-storage 0.8's read types; integer
-  counters and gauges evaluate as before. A query that reads a float
-  counter or gauge (`rate`, `irate`, a bare selector, `avg_over_time`,
-  `idelta`) returns `QueryError::Unsupported` naming the metric, rather
-  than an answer without it; `deriv` reads floats.
+  counters and gauges evaluate as before.
 
 ### metriken 0.11.7
 

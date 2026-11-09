@@ -135,6 +135,45 @@ impl Memory {
         }
     }
 
+    /// Append a float counter sample, as
+    /// [`upsert_counter_sample`](Self::upsert_counter_sample) appends an
+    /// integer one. An integer series it is appended to becomes a float
+    /// series (`CounterValues::push_float`).
+    #[cfg(feature = "ingest")]
+    pub fn upsert_float_counter_sample(&mut self, name: &str, labels: Labels, ts: u64, value: f64) {
+        let series = self.counters.entry(name.to_string()).or_default();
+        if let Some(c) = series.iter_mut().find(|c| c.labels == labels) {
+            c.timestamps.push(ts);
+            c.values.push_float(value);
+        } else {
+            series.push(Counter {
+                labels,
+                timestamps: vec![ts],
+                values: vec![value].into(),
+                windows: None,
+            });
+        }
+    }
+
+    /// Append a float gauge sample, as
+    /// [`upsert_gauge_sample`](Self::upsert_gauge_sample) appends an integer
+    /// one. An integer series it is appended to becomes a float series.
+    #[cfg(feature = "ingest")]
+    pub fn upsert_float_gauge_sample(&mut self, name: &str, labels: Labels, ts: u64, value: f64) {
+        let series = self.gauges.entry(name.to_string()).or_default();
+        if let Some(g) = series.iter_mut().find(|g| g.labels == labels) {
+            g.timestamps.push(ts);
+            g.values.push_float(value);
+        } else {
+            series.push(Gauge {
+                labels,
+                timestamps: vec![ts],
+                values: vec![value].into(),
+                windows: None,
+            });
+        }
+    }
+
     /// Append a histogram sample. If a series with matching (name, labels)
     /// exists, the sample is appended to it; otherwise a new series is created.
     #[cfg(feature = "ingest")]

@@ -538,6 +538,10 @@ impl MemoryStore {
     /// store's nominal interval, which moved readings the producer had already
     /// timed exactly.
     ///
+    /// Float counters and gauges (`Snapshot::float_counters`,
+    /// `Snapshot::float_gauges`) are stored as counters and gauges with `f64`
+    /// values.
+    ///
     /// For histograms: a `HistogramSnapshot` is stored representing the
     /// cumulative (running) bucket counts. Quantile/rate computations are
     /// performed at query time against pairs of consecutive snapshots. A
@@ -563,6 +567,16 @@ impl MemoryStore {
         for gauge in snapshot.gauges() {
             let (name, labels) = extract_name_labels(&gauge.metadata, &gauge.name);
             memory.upsert_gauge_sample(&name, labels, ts, gauge.value);
+        }
+
+        for counter in snapshot.float_counters() {
+            let (name, labels) = extract_name_labels(&counter.metadata, &counter.name);
+            memory.upsert_float_counter_sample(&name, labels, ts, counter.value);
+        }
+
+        for gauge in snapshot.float_gauges() {
+            let (name, labels) = extract_name_labels(&gauge.metadata, &gauge.name);
+            memory.upsert_float_gauge_sample(&name, labels, ts, gauge.value);
         }
 
         for histogram in snapshot.histograms() {
