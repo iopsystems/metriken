@@ -39,7 +39,7 @@ metriken-query       -> metriken-model, metriken-storage
 metriken-recorder    -> metriken, metriken-exposition, metriken-model, metriken-storage, metriken-types
 ```
 
-`metriken-storage` also has a path-only dev-dependency on `metriken-query`, which `cargo publish` strips. Regenerate the list with `cargo metadata --format-version 1 --no-deps` when a dependency changes (filter `.packages[].dependencies` to workspace members whose `kind` is null).
+`metriken-storage` and `metriken-recorder` also have a path-only dev-dependency on `metriken-query`, which `cargo publish` strips. Regenerate the list with `cargo metadata --format-version 1 --no-deps` when a dependency changes (filter `.packages[].dependencies` to workspace members whose `kind` is null).
 
 - **metriken-types** — Types shared by the metriken registry and the readers of what it records.
 - **metriken-charts** — Browser chart modules (ES modules on ECharts) and their stylesheet, embedded with `include_dir` for a server to serve. Its node tests run with `node --test metriken-charts/tests/*.mjs`.

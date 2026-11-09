@@ -294,6 +294,10 @@ pub fn segment_writer_props() -> WriterProperties {
 }
 
 /// Serialize one table to parquet bytes.
+///
+/// A NaN or infinite float value is written as given, and a counter rate
+/// read across it is NaN from that sample on. `ArchiveWriter`'s builders
+/// drop such values before a table reaches this function.
 pub fn write_table_parquet(table: &Table) -> Result<Vec<u8>, Error> {
     write_table_parquet_with(table, segment_writer_props())
 }

@@ -49,9 +49,10 @@ Requires metriken-model 0.3.0.
   snapshots and from a replication stream (`StreamDecoder` carries them),
   replayed from the WAL, and kept in the long layout: a group whose
   members carry an `id` is written long with float members too. A NaN or
-  infinite float value is dropped when a segment is built (sealed or
-  materialized from the live tail) and by `Memory`'s float upserts, so it
-  reads as absent.
+  infinite float value is dropped when `ArchiveWriter` builds a segment
+  (sealed or materialized from the live tail) and by `Memory`'s float
+  upserts, so it reads as absent. `write_table_parquet` writes a `Table`'s
+  float values as given.
 - **Breaking:** the read types carry integer or `f64` values per series:
   `Counter::values` and `ColumnChunk::values` are `CounterValues` (`Int`
   of `u64` or `Float` of `f64`), `Gauge::values` is `GaugeValues` (`Int`
