@@ -25,7 +25,8 @@ producer identity keys on 2026-10-27. Q9 and Q37 were decided on
 2026-10-28. Q19 was decided on 2026-10-31. On 2026-11-01 the owner
 amended Q1 (the recorder's key is `endpoint`) and decided Q4's `instance`
 part, Q5, Q6 and Q20; Q21 and Q22 on 2026-11-03; Q23, Q35 and Q38 on
-2026-11-04. "Step N" means this entry's
+2026-11-04. On 2026-11-05 the owner changed Q6 to option (a): a legacy
+recording keeps its `source` label. "Step N" means this entry's
 order of work.
 Follows the metriken-viewer entry's Q11 (how an archive of several
 recordings from one run opens) and Q12 (templates travel in the producer's
@@ -2306,12 +2307,14 @@ gets an alias, a deprecation warning, or a refusal:
   example `endpoint`), with `source` accepted and warned about.
 - `--recording source=X`, `--baseline source=X`, `--experiment source=X`
   and MCP's `recording` argument (Q6): resolved through D2, as a recording
-  whose `alias` or kind is X, with a warning naming `alias=`.
-- PromQL `{source="X"}` on a legacy recording: matches nothing, since a
-  legacy recording carries no `source` label (Q6). Whether a v5.10.0 to
-  v5.20.0 parquet's per-column `source` survives `recording upgrade` is
-  open (Q1, step 3.4). The registry templates no longer select `source`
-  (rezolus #1635).
+  whose `alias` or kind is X, with a warning naming `alias=`. rezolus today
+  matches labels rather than D2's kind: the `source`, `alias` or
+  `__producer__` label (`src/parquet_tools/select.rs`).
+- PromQL `{source="X"}` on a legacy recording: matches it, since a legacy
+  recording keeps its `source` label (Q6, changed 2026-11-05). Whether a
+  v5.10.0 to v5.20.0 parquet's per-column `source` survives `recording
+  upgrade` is open (Q1, step 3.4). The registry templates no longer select
+  `source` (rezolus #1635).
 - A template carried by a legacy recording that selects `source`:
   cachecannon's handshake template through v0.0.34 (14
   `source="cachecannon"` matchers, removed in cachecannon #272), llm-perf's
@@ -2707,7 +2710,27 @@ Identity and naming:
   `source` survives `recording upgrade` is open (Q1, step 3.4). The
   registry templates no longer select `source` (step 3.3). The candidates
   were (a) keep the legacy `source` as a label, (b) drop it, and (c) drop
-  it and accept `source=X` in selectors (the decision).
+  it and accept `source=X` in selectors (the decision of 2026-11-01).
+
+  Changed 2026-11-05 to option (a), for rezolus 6.0.0 (rezolus
+  `docs/journal/2026-10-08-6-0-release-readiness.md`, decision 9): a legacy
+  recording keeps its `source` label, and `source=X` in selectors stays
+  accepted (rezolus `src/parquet_tools/select.rs` matches it against
+  `source`, `alias` or `__producer__`). metriken-storage answers PromQL from
+  a source's flat labels, which `layers::append` sets to the merged labels
+  only when it writes the source; a legacy source that nothing has written
+  keeps its flat `source`, so leaving it out needs a read-path change. And
+  rezolus reads `source` directly in about 25 places (more through
+  `.source` fields), which would first have to read the kind through D2. A
+  6.x recording carries `alias` and `__producer__`, and `source` only where
+  its producer's handshake declares one (the rezolus 6.x agent declares
+  `source=rezolus`); a user's `source=` is recorded as `alias`. The
+  metriken-storage change above (the legacy `source` left out of the merged
+  labels, step 3.4) is not made. The 2026-11-04 decision below, dropping
+  `source` matchers from a template a legacy recording carries, stands
+  (rezolus `crates/dashboard/src/source_templates.rs`); with the label
+  kept, it changes the result only where a legacy recording's `source`
+  differs from the template's value.
 
   Some templates carried by legacy recordings select `source`: cachecannon's
   handshake template through v0.0.34 (14 `source="cachecannon"` matchers,
@@ -3423,8 +3446,8 @@ written by the new dendro.
       `dashboard_override=` (Q38); the user layer document (Q21, Q22);
       registry entries declaring their producer and `service_kind` (Q35),
       and category `members` read as kinds (Q5); `source=X` in selectors
-      (Q6), with the legacy `source` left out of the merged labels
-      (metriken-storage) and `source` matchers dropped from a template a
+      (Q6; the legacy `source` stays in the merged labels, changed
+      2026-11-05) and `source` matchers dropped from a template a
       legacy recording carries (Q6); the compatibility list; the recorder's
       `endpoint` key
       (metriken-recorder 0.7.0, Q1), with a legacy `instance` kept as a
