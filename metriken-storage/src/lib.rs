@@ -132,5 +132,8 @@ pub use lazy::CompositionCatalog;
 pub use parquet::CompositionSource;
 pub use segmented::{ColumnRelabel, Handover, InMemorySegments, Run, SegmentBytes, SegmentStore};
 pub use source::{label_walk_series_count, ColumnPosition, CounterColumnRef, DataSource};
-pub use types::{ColumnChunk, CounterSample, CounterStream, HistogramSnapshot};
+pub use types::{
+    ColumnChunk, CounterSample, CounterStream, CounterValue, CounterValues, GaugeValues,
+    HistogramSnapshot,
+};
 pub use union::{UnionChild, UnionError};

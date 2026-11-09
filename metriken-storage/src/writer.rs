@@ -207,6 +207,8 @@ impl StreamDecoder {
                 gauges: decoded.gauges,
                 histograms,
                 gauge_histograms,
+                float_counters: decoded.float_counters,
+                float_gauges: decoded.float_gauges,
             }));
         }
         Ok(out)
@@ -313,8 +315,8 @@ enum Layout {
 /// How one producer schema of a slotted group maps onto the group's long
 /// columns ([`LongColumns`]).
 struct LongLayout {
-    /// The group's member counts (counters, gauges, histograms).
-    arity: (usize, usize, usize),
+    /// The group's member counts, per kind (see [`KINDS`]).
+    arity: [usize; KINDS],
     /// Per slot, in first-appearance order.
     slots: Vec<Slot>,
 }
@@ -330,6 +332,59 @@ struct Slot {
     counters: Vec<(usize, usize)>,
     gauges: Vec<(usize, usize)>,
     histograms: Vec<(usize, usize)>,
+    float_counters: Vec<(usize, usize)>,
+    float_gauges: Vec<(usize, usize)>,
+}
+
+impl Slot {
+    /// The (member index, column index) pairs of member kind `kind`.
+    fn pairs_mut(&mut self, kind: usize) -> &mut Vec<(usize, usize)> {
+        match kind {
+            COUNTERS => &mut self.counters,
+            GAUGES => &mut self.gauges,
+            HISTOGRAMS => &mut self.histograms,
+            FLOAT_COUNTERS => &mut self.float_counters,
+            _ => &mut self.float_gauges,
+        }
+    }
+}
+
+/// The member kinds a long group has columns for, as indices into
+/// per-kind arrays: a schema's `counters`, `gauges`, `histograms`,
+/// `float_counters` and `float_gauges`. Gauge histograms have no long
+/// columns.
+const KINDS: usize = 5;
+const COUNTERS: usize = 0;
+const GAUGES: usize = 1;
+const HISTOGRAMS: usize = 2;
+const FLOAT_COUNTERS: usize = 3;
+const FLOAT_GAUGES: usize = 4;
+
+/// `schema`'s member lists, indexed by kind (see [`KINDS`]).
+fn kind_lists(schema: &GroupSchema) -> [&Vec<MetricDesc>; KINDS] {
+    [
+        &schema.counters,
+        &schema.gauges,
+        &schema.histograms,
+        &schema.float_counters,
+        &schema.float_gauges,
+    ]
+}
+
+/// `schema`'s member list of kind `kind`.
+fn kind_list_mut(schema: &mut GroupSchema, kind: usize) -> &mut Vec<MetricDesc> {
+    match kind {
+        COUNTERS => &mut schema.counters,
+        GAUGES => &mut schema.gauges,
+        HISTOGRAMS => &mut schema.histograms,
+        FLOAT_COUNTERS => &mut schema.float_counters,
+        _ => &mut schema.float_gauges,
+    }
+}
+
+/// The number of members of each kind in `schema`.
+fn kind_widths(schema: &GroupSchema) -> [usize; KINDS] {
+    kind_lists(schema).map(Vec::len)
 }
 
 /// A long group's metric columns. Append-only for the recording, so a
@@ -340,14 +395,15 @@ struct Slot {
 struct LongColumns {
     schema: GroupSchema,
     hash: (u64, u64),
-    /// Per member kind, column index by the column's fixed metadata.
-    index: [HashMap<String, usize>; 3],
+    /// Per member kind (see [`KINDS`]), column index by the column's fixed
+    /// metadata.
+    index: [HashMap<String, usize>; KINDS],
     names: HashSet<String>,
 }
 
 impl LongColumns {
     /// The column for a streamed long row's column `d` of member `kind`
-    /// (0 counters, 1 gauges, 2 histograms), added if new. Every key of a
+    /// (see [`KINDS`]), added if new. Every key of a
     /// streamed column describes the metric; the occupant's labels arrive
     /// separately. Returns the index and whether it was added.
     fn wire_column(&mut self, kind: usize, d: &MetricDesc) -> (usize, bool) {
@@ -372,11 +428,7 @@ impl LongColumns {
             name = format!("{base}#{n}");
             n += 1;
         }
-        let target = match kind {
-            0 => &mut self.schema.counters,
-            1 => &mut self.schema.gauges,
-            _ => &mut self.schema.histograms,
-        };
+        let target = kind_list_mut(&mut self.schema, kind);
         target.push(MetricDesc {
             name,
             metadata: d.metadata.clone(),
@@ -398,23 +450,22 @@ const STORAGE_KEYS: &[&str] = &[
 ];
 
 impl Layout {
-    /// The member counts a group's values must have.
-    fn arity(&self) -> (usize, usize, usize) {
+    /// The member counts a group's values must have, per kind (see
+    /// [`KINDS`]).
+    fn arity(&self) -> [usize; KINDS] {
         match self {
-            Layout::Wide(s) => (s.counters.len(), s.gauges.len(), s.histograms.len()),
+            Layout::Wide(s) => kind_widths(s),
             Layout::Long(l) => l.arity,
         }
     }
 }
 
 /// Whether a group with this schema is written long: any member carries a
-/// slot `id`.
+/// slot `id`. A float member counts as any other does.
 fn slotted(schema: &metriken_model::GroupSchema) -> bool {
-    schema
-        .counters
-        .iter()
-        .chain(&schema.gauges)
-        .chain(&schema.histograms)
+    kind_lists(schema)
+        .into_iter()
+        .flatten()
         .any(|d| d.metadata.contains_key("id"))
 }
 
@@ -424,7 +475,7 @@ impl LongLayout {
     /// occupant of slot `""`.
     fn of(schema: &metriken_model::GroupSchema, cols: &mut LongColumns) -> Self {
         type Desc = metriken_model::MetricDesc;
-        let kinds: [&Vec<Desc>; 3] = [&schema.counters, &schema.gauges, &schema.histograms];
+        let kinds = kind_lists(schema);
         fn slot_of(d: &metriken_model::MetricDesc) -> &str {
             d.metadata.get("id").map(String::as_str).unwrap_or("")
         }
@@ -490,11 +541,7 @@ impl LongLayout {
                             name = format!("{base}#{n}");
                             n += 1;
                         }
-                        let target = match kind {
-                            0 => &mut cols.schema.counters,
-                            1 => &mut cols.schema.gauges,
-                            _ => &mut cols.schema.histograms,
-                        };
+                        let target = kind_list_mut(&mut cols.schema, kind);
                         target.push(MetricDesc { name, metadata });
                         cols.index[kind].insert(key.clone(), target.len() - 1);
                         changed = true;
@@ -516,26 +563,19 @@ impl LongLayout {
                         counters: Vec::new(),
                         gauges: Vec::new(),
                         histograms: Vec::new(),
+                        float_counters: Vec::new(),
+                        float_gauges: Vec::new(),
                     });
                     slots.len() - 1
                 });
-                let pairs = match kind {
-                    0 => &mut slots[si].counters,
-                    1 => &mut slots[si].gauges,
-                    _ => &mut slots[si].histograms,
-                };
-                pairs.push((member, col));
+                slots[si].pairs_mut(kind).push((member, col));
             }
         }
         if changed {
             cols.hash = cols.schema.hash();
         }
         LongLayout {
-            arity: (
-                schema.counters.len(),
-                schema.gauges.len(),
-                schema.histograms.len(),
-            ),
+            arity: kind_widths(schema),
             slots,
         }
     }
@@ -614,11 +654,7 @@ impl GroupState {
 /// excepted: what [`LongLayout::of`] counts as the occupant's when a slot's
 /// metrics agree on them.
 fn shared_keys(schema: &GroupSchema) -> BTreeMap<String, String> {
-    let mut all = schema
-        .counters
-        .iter()
-        .chain(&schema.gauges)
-        .chain(&schema.histograms);
+    let mut all = kind_lists(schema).into_iter().flatten();
     let Some(first) = all.next() else {
         return BTreeMap::new();
     };
@@ -634,6 +670,20 @@ fn shared_keys(schema: &GroupSchema) -> BTreeMap<String, String> {
     shared
 }
 
+/// An occupant numbered `occupant` with every value of a long group whose
+/// columns number `widths` absent.
+fn empty_occupant(occupant: u64, widths: [usize; KINDS]) -> LongOccupant {
+    LongOccupant {
+        occupant,
+        counters: vec![None; widths[COUNTERS]],
+        gauges: vec![None; widths[GAUGES]],
+        histograms: vec![None; widths[HISTOGRAMS]],
+        gauge_histograms: Vec::new(),
+        float_counters: vec![None; widths[FLOAT_COUNTERS]],
+        float_gauges: vec![None; widths[FLOAT_GAUGES]],
+    }
+}
+
 /// What makes two occupants of a group the same occupant: its `__uid__`
 /// when it has one, otherwise its labels. The wide and streamed paths both
 /// number occupants by it.
@@ -647,9 +697,9 @@ fn occupant_identity(labels: &BTreeMap<String, String>) -> String {
 /// A streamed long row's columns, mapped onto the group's [`LongColumns`]:
 /// per member kind, the writer's column for each of the row's.
 struct WireColumns {
-    counters: Vec<usize>,
-    gauges: Vec<usize>,
-    histograms: Vec<usize>,
+    /// Per member kind (see [`KINDS`]), the writer's column for each of the
+    /// row's.
+    columns: [Vec<usize>; KINDS],
     /// Keys every column of the row carries with one value that are not
     /// storage keys. The wide path counts these as the occupant's
     /// ([`LongLayout::of`]), so the streamed path adds them to each
@@ -665,7 +715,8 @@ impl GroupState {
         }
         let schema = g.schema.as_ref()?;
         // A group holding a gauge histogram is written wide: the long layout
-        // has no gauge histogram columns.
+        // has no gauge histogram columns. Float members have long columns,
+        // so they leave a group long.
         let long = *self.long.get_or_insert_with(|| {
             long_groups && slotted(schema) && schema.gauge_histograms.is_empty()
         });
@@ -900,9 +951,13 @@ impl SourceRecorder {
                         .collect()
                 };
                 let wire = WireColumns {
-                    counters: map(0, &schema.counters),
-                    gauges: map(1, &schema.gauges),
-                    histograms: map(2, &schema.histograms),
+                    columns: [
+                        map(COUNTERS, &schema.counters),
+                        map(GAUGES, &schema.gauges),
+                        map(HISTOGRAMS, &schema.histograms),
+                        map(FLOAT_COUNTERS, &schema.float_counters),
+                        map(FLOAT_GAUGES, &schema.float_gauges),
+                    ],
                     shared,
                 };
                 if changed {
@@ -928,19 +983,19 @@ impl SourceRecorder {
         };
         state.long = Some(true);
         state.last_key = Some(key);
-        let widths = (
-            state.columns.schema.counters.len(),
-            state.columns.schema.gauges.len(),
-            state.columns.schema.histograms.len(),
-        );
+        let widths = kind_widths(&state.columns.schema);
         let mut present = Vec::with_capacity(row.occupants.len());
         let mut first_seen = Vec::new();
         let mut present_keys = HashSet::with_capacity(row.occupants.len());
         for o in row.occupants {
             present_keys.insert(o.occupant);
-            if o.counters.len() != wire.counters.len()
-                || o.gauges.len() != wire.gauges.len()
-                || o.histograms.len() != wire.histograms.len()
+            if [
+                o.counters.len(),
+                o.gauges.len(),
+                o.histograms.len(),
+                o.float_counters.len(),
+                o.float_gauges.len(),
+            ] != wire.columns.each_ref().map(Vec::len)
             {
                 if state.first_warning(WARN_WIDTH) {
                     tracing::warn!(
@@ -982,21 +1037,21 @@ impl SourceRecorder {
                 });
             }
             state.seen.entry(number).or_insert(labels);
-            let mut occ = LongOccupant {
-                occupant: number,
-                counters: vec![None; widths.0],
-                gauges: vec![None; widths.1],
-                histograms: vec![None; widths.2],
-                gauge_histograms: Vec::new(),
-            };
+            let mut occ = empty_occupant(number, widths);
             for (i, v) in o.counters.into_iter().enumerate() {
-                occ.counters[wire.counters[i]] = v;
+                occ.counters[wire.columns[COUNTERS][i]] = v;
             }
             for (i, v) in o.gauges.into_iter().enumerate() {
-                occ.gauges[wire.gauges[i]] = v;
+                occ.gauges[wire.columns[GAUGES][i]] = v;
             }
             for (i, v) in o.histograms.into_iter().enumerate() {
-                occ.histograms[wire.histograms[i]] = v;
+                occ.histograms[wire.columns[HISTOGRAMS][i]] = v;
+            }
+            for (i, v) in o.float_counters.into_iter().enumerate() {
+                occ.float_counters[wire.columns[FLOAT_COUNTERS][i]] = v;
+            }
+            for (i, v) in o.float_gauges.into_iter().enumerate() {
+                occ.float_gauges[wire.columns[FLOAT_GAUGES][i]] = v;
             }
             present.push(occ);
         }
@@ -1175,6 +1230,8 @@ impl SourceRecorder {
             && g.gauges.is_empty()
             && g.histograms.is_empty()
             && g.gauge_histograms.is_empty()
+            && g.float_counters.is_empty()
+            && g.float_gauges.is_empty()
         {
             state.last_key = Some(key);
             return Ok(());
@@ -1208,7 +1265,14 @@ impl SourceRecorder {
                 g.gauge_histograms.len()
             }
         };
-        if layout.arity() != (g.counters.len(), g.gauges.len(), g.histograms.len())
+        if layout.arity()
+            != [
+                g.counters.len(),
+                g.gauges.len(),
+                g.histograms.len(),
+                g.float_counters.len(),
+                g.float_gauges.len(),
+            ]
             || gauge_histograms != g.gauge_histograms.len()
         {
             tracing::warn!(
@@ -1238,33 +1302,37 @@ impl SourceRecorder {
             Layout::Long(l) => {
                 let mut present = Vec::new();
                 let mut first_seen = Vec::new();
-                let widths = (
-                    state.columns.schema.counters.len(),
-                    state.columns.schema.gauges.len(),
-                    state.columns.schema.histograms.len(),
-                );
+                let widths = kind_widths(&state.columns.schema);
                 for slot in &l.slots {
                     let any = slot.counters.iter().any(|&(m, _)| g.counters[m].is_some())
                         || slot.gauges.iter().any(|&(m, _)| g.gauges[m].is_some())
                         || slot
                             .histograms
                             .iter()
-                            .any(|&(m, _)| g.histograms[m].is_some());
+                            .any(|&(m, _)| g.histograms[m].is_some())
+                        || slot
+                            .float_counters
+                            .iter()
+                            .any(|&(m, _)| g.float_counters[m].is_some())
+                        || slot
+                            .float_gauges
+                            .iter()
+                            .any(|&(m, _)| g.float_gauges[m].is_some());
                     if !any {
                         continue;
                     }
-                    let mut occ = LongOccupant {
-                        occupant: 0,
-                        counters: vec![None; widths.0],
-                        gauges: vec![None; widths.1],
-                        histograms: vec![None; widths.2],
-                        gauge_histograms: Vec::new(),
-                    };
+                    let mut occ = empty_occupant(0, widths);
                     for &(m, c) in &slot.counters {
                         occ.counters[c] = g.counters[m];
                     }
                     for &(m, c) in &slot.gauges {
                         occ.gauges[c] = g.gauges[m];
+                    }
+                    for &(m, c) in &slot.float_counters {
+                        occ.float_counters[c] = g.float_counters[m];
+                    }
+                    for &(m, c) in &slot.float_gauges {
+                        occ.float_gauges[c] = g.float_gauges[m];
                     }
                     for &(m, c) in &slot.histograms {
                         occ.histograms[c] = g.histograms[m].as_ref().map(|h| {
@@ -1525,6 +1593,8 @@ mod row_form_tests {
             gauges: Vec::new(),
             histograms: Vec::new(),
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         })
         .unwrap();
         let long = wal::encode_wal_long_row(&WalLongRow {

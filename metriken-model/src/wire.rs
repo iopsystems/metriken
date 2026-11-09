@@ -13,6 +13,10 @@ pub enum Layout {
     /// A group whose metrics are all counter groups, gauge groups or
     /// histogram groups as a [`WalLongRow`](crate::wal::WalLongRow) keyed by
     /// occupant, after the occupants it introduces; any other group wide.
+    /// A long row's occupants can also carry float counters and float
+    /// gauges ([`LongOccupant`](crate::wal::LongOccupant)'s
+    /// `float_counters` and `float_gauges`), which a writer stores in the
+    /// long layout too; `metriken-exposition`'s producers send none.
     Long,
 }
 

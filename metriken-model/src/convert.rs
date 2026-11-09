@@ -14,6 +14,8 @@ pub fn wal_group_row(g: &GroupSnapshot, schema: Option<GroupSchema>) -> WalGroup
         gauges: g.gauges.clone(),
         histograms: cells(&g.histograms),
         gauge_histograms: cells(&g.gauge_histograms),
+        float_counters: g.float_counters.clone(),
+        float_gauges: g.float_gauges.clone(),
     }
 }
 

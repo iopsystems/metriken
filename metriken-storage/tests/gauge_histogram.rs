@@ -1038,6 +1038,8 @@ fn a_gauge_histogram_that_stops_reads_to_its_last_row() {
                 gauges: Vec::new(),
                 histograms: Vec::new(),
                 gauge_histograms: vec![free],
+                float_counters: Vec::new(),
+                float_gauges: Vec::new(),
             }],
         });
         let staged = source.stage(&snap, ts, 0).unwrap();

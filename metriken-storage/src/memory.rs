@@ -106,12 +106,12 @@ impl Memory {
         let series = self.counters.entry(name.to_string()).or_default();
         if let Some(c) = series.iter_mut().find(|c| c.labels == labels) {
             c.timestamps.push(ts);
-            c.values.push(value);
+            c.values.push_int(value);
         } else {
             series.push(Counter {
                 labels,
                 timestamps: vec![ts],
-                values: vec![value],
+                values: vec![value].into(),
                 windows: None,
             });
         }
@@ -124,12 +124,59 @@ impl Memory {
         let series = self.gauges.entry(name.to_string()).or_default();
         if let Some(g) = series.iter_mut().find(|g| g.labels == labels) {
             g.timestamps.push(ts);
-            g.values.push(value);
+            g.values.push_int(value);
         } else {
             series.push(Gauge {
                 labels,
                 timestamps: vec![ts],
-                values: vec![value],
+                values: vec![value].into(),
+                windows: None,
+            });
+        }
+    }
+
+    /// Append a float counter sample, as
+    /// [`upsert_counter_sample`](Self::upsert_counter_sample) appends an
+    /// integer one. An integer series it is appended to becomes a float
+    /// series (`CounterValues::push_float`). A NaN or infinite value is
+    /// dropped.
+    #[cfg(feature = "ingest")]
+    pub fn upsert_float_counter_sample(&mut self, name: &str, labels: Labels, ts: u64, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
+        let series = self.counters.entry(name.to_string()).or_default();
+        if let Some(c) = series.iter_mut().find(|c| c.labels == labels) {
+            c.timestamps.push(ts);
+            c.values.push_float(value);
+        } else {
+            series.push(Counter {
+                labels,
+                timestamps: vec![ts],
+                values: vec![value].into(),
+                windows: None,
+            });
+        }
+    }
+
+    /// Append a float gauge sample, as
+    /// [`upsert_gauge_sample`](Self::upsert_gauge_sample) appends an integer
+    /// one. An integer series it is appended to becomes a float series. A
+    /// NaN or infinite value is dropped.
+    #[cfg(feature = "ingest")]
+    pub fn upsert_float_gauge_sample(&mut self, name: &str, labels: Labels, ts: u64, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
+        let series = self.gauges.entry(name.to_string()).or_default();
+        if let Some(g) = series.iter_mut().find(|g| g.labels == labels) {
+            g.timestamps.push(ts);
+            g.values.push_float(value);
+        } else {
+            series.push(Gauge {
+                labels,
+                timestamps: vec![ts],
+                values: vec![value].into(),
                 windows: None,
             });
         }
@@ -295,7 +342,7 @@ impl DataSource for Memory {
                 Counter {
                     labels: c.labels.clone(),
                     timestamps: c.timestamps[r.clone()].to_vec(),
-                    values: c.values[r.clone()].to_vec(),
+                    values: c.values.slice(r.clone()),
                     windows: c.windows.as_ref().map(|w| w[r].to_vec()),
                 }
             })
@@ -318,7 +365,7 @@ impl DataSource for Memory {
                 Gauge {
                     labels: g.labels.clone(),
                     timestamps: g.timestamps[r.clone()].to_vec(),
-                    values: g.values[r.clone()].to_vec(),
+                    values: g.values.slice(r.clone()),
                     windows: g.windows.as_ref().map(|w| w[r].to_vec()),
                 }
             })

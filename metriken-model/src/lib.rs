@@ -25,6 +25,7 @@ pub mod identity;
 pub mod occupants;
 pub mod schema;
 pub mod snapshot;
+mod trailing;
 pub mod wal;
 pub mod wire;
 
@@ -35,6 +36,6 @@ pub use schema::{
     GAUGE_HISTOGRAM, LEGACY_HISTOGRAM, METRIC_TYPE,
 };
 pub use snapshot::{
-    Counter, Gauge, GroupSnapshot, GroupValidationError, Histogram, Snapshot, SnapshotV1,
-    SnapshotV2, SnapshotV3,
+    Counter, FloatCounter, FloatGauge, Gauge, GroupSnapshot, GroupValidationError, Histogram,
+    Snapshot, SnapshotV1, SnapshotV2, SnapshotV3,
 };

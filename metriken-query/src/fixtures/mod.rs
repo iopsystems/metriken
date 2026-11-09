@@ -28,6 +28,13 @@ pub fn take_union_rows_held_peak() -> usize {
     crate::batch_rate::UNION_ROWS_HELD_PEAK.with(|p| p.replace(0))
 }
 
+/// The `rate` and `irate` calls on this thread that the batched rate path
+/// answered (since the last call), reset to zero.
+#[doc(hidden)]
+pub fn take_batch_rates() -> usize {
+    crate::promql::streaming::dispatch::BATCH_RATES.with(|p| p.replace(0))
+}
+
 /// Batched rate reads on this thread that gave up and left the query to
 /// the per-series path because a series ended as silent came back (since
 /// the last call), reset to zero.

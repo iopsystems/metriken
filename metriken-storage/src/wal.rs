@@ -351,13 +351,19 @@ fn materialize_group_wal_tail(
             }
         };
         let window = decoded.window.map(|(begin, end)| Window::new(begin, end));
-        builder.push_row_with_gauge_histograms(
+        builder.push_group_row(
             row.ts(),
             row.wall_offset(),
             window,
             schema,
-            (&decoded.counters, &decoded.gauges, &decoded.histograms),
-            &decoded.gauge_histograms,
+            crate::builder::GroupRowValues {
+                counters: &decoded.counters,
+                gauges: &decoded.gauges,
+                histograms: &decoded.histograms,
+                gauge_histograms: &decoded.gauge_histograms,
+                float_counters: &decoded.float_counters,
+                float_gauges: &decoded.float_gauges,
+            },
         );
         first_ts.get_or_insert(row.ts());
     }
@@ -473,6 +479,8 @@ mod schema_rows_tests {
             gauges: Vec::new(),
             histograms: Vec::new(),
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         }
     }
 
@@ -486,6 +494,8 @@ mod schema_rows_tests {
             gauges: Vec::new(),
             histograms: Vec::new(),
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         };
         Row(ts, encode_wal_group_row(&row).unwrap())
     }
@@ -518,6 +528,8 @@ mod schema_rows_tests {
                     gauges: Vec::new(),
                     histograms: Vec::new(),
                     gauge_histograms: Vec::new(),
+                    float_counters: Vec::new(),
+                    float_gauges: Vec::new(),
                 }],
             };
             Row(ts, encode_wal_long_row(&row).unwrap())
@@ -547,6 +559,8 @@ mod schema_rows_tests {
                 gauges: Vec::new(),
                 histograms: Vec::new(),
                 gauge_histograms: Vec::new(),
+                float_counters: Vec::new(),
+                float_gauges: Vec::new(),
             };
             Row(ts, encode_wal_group_row(&row).unwrap())
         };
@@ -570,6 +584,8 @@ mod schema_rows_tests {
                     gauges: Vec::new(),
                     histograms: Vec::new(),
                     gauge_histograms: Vec::new(),
+                    float_counters: Vec::new(),
+                    float_gauges: Vec::new(),
                 }],
             };
             Row(ts, encode_wal_long_row(&row).unwrap())

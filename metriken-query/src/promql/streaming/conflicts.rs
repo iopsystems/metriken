@@ -53,7 +53,40 @@ enum Kind {
 }
 
 /// A row as kept: its time, window and value.
-pub(crate) type Row = (u64, Option<(u64, u64)>, u64);
+pub(crate) type Row = (u64, Option<(u64, u64)>, Reading);
+
+/// A row's value, compared as a number: an integer reading and a float
+/// reading of the same number are equal (a recording that stored a series
+/// as integers and one that stored it as floats agree), and two different
+/// numbers are not, however close. Integers compare exactly, above 2^53
+/// too.
+///
+/// A float holding an integer is kept as that integer, so equality is
+/// derived; the order is a total order for sorting rows, nothing more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Reading {
+    Int(i128),
+    /// A float that is not an integer, by its bits.
+    Fraction(u64),
+}
+
+impl Reading {
+    pub(crate) fn float(v: f64) -> Self {
+        // Below 2^127 in magnitude an integral float converts exactly.
+        if v.fract() == 0.0 && v.abs() < 2f64.powi(127) {
+            Reading::Int(v as i128)
+        } else {
+            Reading::Fraction(v.to_bits())
+        }
+    }
+
+    pub(crate) fn counter(v: crate::types::CounterValue) -> Self {
+        match v {
+            crate::types::CounterValue::Int(v) => Reading::Int(v.into()),
+            crate::types::CounterValue::Float(v) => Reading::float(v),
+        }
+    }
+}
 
 /// One source's rows of one series as read. Rows read twice appear twice.
 type Rows = Vec<Row>;
@@ -203,10 +236,12 @@ impl Recorded {
                 &self.source,
                 c.timestamps
                     .iter()
-                    .zip(&c.values)
                     .enumerate()
-                    .filter(|(_, (t, _))| within(self.keep, **t))
-                    .map(|(i, (t, v))| (*t, windows.and_then(|w| w.get(i).copied()), *v)),
+                    .filter(|(_, t)| within(self.keep, **t))
+                    .filter_map(|(i, t)| {
+                        let v = Reading::counter(c.values.get(i)?);
+                        Some((*t, windows.and_then(|w| w.get(i).copied()), v))
+                    }),
             );
         }
     }
@@ -219,10 +254,15 @@ impl Recorded {
                 &self.source,
                 g.timestamps
                     .iter()
-                    .zip(&g.values)
                     .enumerate()
-                    .filter(|(_, (t, _))| within(self.keep, **t))
-                    .map(|(i, (t, v))| (*t, windows.and_then(|w| w.get(i).copied()), *v as u64)),
+                    .filter(|(_, t)| within(self.keep, **t))
+                    .filter_map(|(i, t)| {
+                        let v = match &g.values {
+                            crate::types::GaugeValues::Int(v) => Reading::Int((*v.get(i)?).into()),
+                            crate::types::GaugeValues::Float(v) => Reading::float(*v.get(i)?),
+                        };
+                        Some((*t, windows.and_then(|w| w.get(i).copied()), v))
+                    }),
             );
         }
     }
@@ -269,7 +309,7 @@ impl Iterator for RecordedSamples<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         let x = self.inner.next()?;
         if within(self.keep, x.ts) {
-            self.kept.push((x.ts, x.window, x.value));
+            self.kept.push((x.ts, x.window, Reading::counter(x.value)));
         }
         Some(x)
     }
@@ -308,15 +348,16 @@ impl crate::scan::ChunkReader for RecordedChunks<'_> {
                     }
                     let duration = columns.duration.and_then(|c| columns.u64s(batch, c));
                     for (col, series) in segment.cols.iter().zip(series) {
-                        let Some(values) = columns.u64s(batch, col.values) else {
+                        let Some(values) =
+                            crate::batch_rate::CounterColumn::of(columns, batch, col.values)
+                        else {
                             continue;
                         };
                         let begin = col.begin.and_then(|c| columns.i64s(batch, c));
                         let width = col.width.and_then(|c| columns.u64s(batch, c));
                         let windowed = (begin.is_some() && width.is_some()) || duration.is_some();
                         let mut push = |r: usize, s: usize| {
-                            let (Some(base), Some(value)) =
-                                (get(Some(ts), r), get(Some(values), r))
+                            let (Some(base), Some(value)) = (get(Some(ts), r), values.get(r))
                             else {
                                 return;
                             };
@@ -335,7 +376,7 @@ impl crate::scan::ChunkReader for RecordedChunks<'_> {
                                 )
                             });
                             if let Some(rows) = rows.get_mut(s) {
-                                rows.push((base, window, value));
+                                rows.push((base, window, Reading::counter(value)));
                             }
                         };
                         match series {
@@ -392,6 +433,7 @@ impl DataSource for Recorded {
                     CounterStream {
                         labels: s.labels,
                         windowed: s.windowed,
+                        float: s.float,
                         interval: s.interval,
                         samples: Box::new(RecordedSamples {
                             inner: s.samples,
@@ -661,6 +703,75 @@ mod tests {
         assert!(conflicts_of(&[(0, a), (0, b)], &[(0, 3)]).is_empty());
     }
 
+    /// A reading is compared as a number: an integer and a float holding
+    /// it are equal, different numbers are not, integers exactly above
+    /// 2^53, and a fraction by its value.
+    #[test]
+    fn readings_compare_as_numbers() {
+        use crate::types::CounterValue::{Float, Int};
+        let r = Reading::counter;
+        assert_eq!(r(Int(3)), r(Float(3.0)));
+        assert_eq!(r(Int(0)), r(Float(-0.0)));
+        assert_eq!(r(Float(0.1 + 0.2)), r(Float(0.1 + 0.2)));
+        assert_ne!(r(Float(0.1 + 0.2)), r(Float(0.3)));
+        assert_ne!(r(Int(3)), r(Float(3.5)));
+        assert_ne!(r(Int((1 << 53) + 1)), r(Float((1u64 << 53) as f64)));
+        assert_eq!(r(Int(u64::MAX)), Reading::Int(u64::MAX.into()));
+        assert_eq!(Reading::Int(-2), Reading::float(-2.0));
+    }
+
+    /// Rows of one series read as integers from one source and as floats
+    /// from another (a recording made before its recorder stored floats and
+    /// one after) conflict where the numbers differ, not where only the
+    /// type does, through every read that keeps rows.
+    #[test]
+    fn integer_and_float_rows_of_one_number_do_not_conflict() {
+        let w = |t: u64| Some((t * S - 1000, t * S));
+        let floats = |values: &[f64]| -> Arc<dyn DataSource> {
+            let mut memory = crate::memory::Memory::new(1000);
+            memory.push_counter_series(
+                "c",
+                crate::types::Counter {
+                    labels: Labels::from(&[("cpu", "0")][..]),
+                    timestamps: (1..=values.len() as u64).map(|t| t * S).collect(),
+                    values: values.to_vec().into(),
+                    windows: Some((1..=values.len() as u64).map(|t| w(t).unwrap()).collect()),
+                },
+            );
+            Arc::new(memory)
+        };
+        let ints = counters(&[(1, 10, w(1)), (2, 20, w(2)), (3, 30, w(3))]);
+        for streams in [false, true] {
+            let notices = |other: Arc<dyn DataSource>| {
+                let conflicts = Arc::new(Conflicts::default());
+                for (position, source) in [(0, Arc::clone(&ints)), (1, other)] {
+                    let recorded = Recorded::new(source, named(position), Arc::clone(&conflicts));
+                    match streams {
+                        false => {
+                            recorded.counters("c", &Labels::default(), 0, 4 * S);
+                        }
+                        true => {
+                            for stream in recorded
+                                .counter_streams("c", &Labels::default(), 0, 4 * S)
+                                .expect("streams")
+                            {
+                                stream.samples.for_each(drop);
+                            }
+                        }
+                    }
+                }
+                conflicts.notices()
+            };
+            let same = notices(floats(&[10.0, 20.0, 30.0]));
+            assert!(same.is_empty(), "streams {streams}: {same:?}");
+            let differs = notices(floats(&[10.0, 20.5, 30.0]));
+            assert!(
+                matches!(differs.as_slice(), [crate::Notice::Conflict { first, count: 1, .. }] if *first == 2.0),
+                "streams {streams}: {differs:?}"
+            );
+        }
+    }
+
     /// A source keeping rows from 2 s on reports a conflict at 3 s and not
     /// the one at 1 s, whichever path reads the rows.
     #[test]
@@ -729,7 +840,7 @@ mod tests {
             crate::types::Gauge {
                 labels: Labels::from(&[("cpu", "0")][..]),
                 timestamps: vec![S],
-                values: vec![11],
+                values: vec![11].into(),
                 windows: None,
             },
         );

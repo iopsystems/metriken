@@ -32,7 +32,7 @@ const FINGERPRINT: &[u8; 4] = b"MNS1";
 /// [`SegmentColumns`] the same way, as a second zstd frame. A field added
 /// later is left out by a reader that does not know it, and a field missing
 /// is its default. A change to what a field means, including how a probe
-/// classifies a column into the four name sets or which footer keys of a
+/// classifies a column into the name sets or which footer keys of a
 /// column become its labels (`Labels::from_metadata`, `STORAGE_KEYS`),
 /// needs a new prefix (`MNI2`), since a reader takes an index over the
 /// footer it was built from. A reader fetches the segment of an `MNI` index
@@ -56,10 +56,19 @@ const MAX_COLUMNS_DECODED: u64 = 64 * 1024 * 1024;
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct SegmentNames {
+    /// Metrics held in integer counter columns.
     pub counters: BTreeSet<String>,
+    /// Metrics held in integer gauge columns.
     pub gauges: BTreeSet<String>,
     pub histograms: BTreeSet<String>,
     pub gauge_histograms: BTreeSet<String>,
+    /// Metrics held in float counter columns, which a reader lists as
+    /// counters. Only a format 3 segment has any, and a reader that does not
+    /// know this field refuses that segment's `format` before it would list
+    /// without them.
+    pub float_counters: BTreeSet<String>,
+    /// Metrics held in float gauge columns, listed as gauges.
+    pub float_gauges: BTreeSet<String>,
     /// The footer's `sampling_interval_ms`, as written.
     pub sampling_interval_ms: Option<String>,
     /// The footer's `metriken.format`, as written.
@@ -73,7 +82,7 @@ pub(crate) struct SegmentNames {
 pub(crate) enum Stored {
     /// The names, and the segment's [`SegmentColumns`] frame, compressed
     /// ([`columns`] decodes it), when the index has one.
-    Names(SegmentNames, Option<Vec<u8>>),
+    Names(Box<SegmentNames>, Option<Vec<u8>>),
     /// A names fingerprint: the segment holds the same names as any other
     /// with this value.
     Fingerprint(u64),
@@ -136,10 +145,12 @@ fn probe_of(segment: &[u8]) -> Option<(SegmentNames, crate::parquet::MultiParque
     )
     .ok()?;
     let names = SegmentNames {
-        counters: probe.counter_names().into_iter().collect(),
-        gauges: probe.gauge_names().into_iter().collect(),
+        counters: probe.scalar_names(true, false).into_iter().collect(),
+        gauges: probe.scalar_names(false, false).into_iter().collect(),
         histograms: probe.histogram_names().into_iter().collect(),
         gauge_histograms: probe.gauge_histogram_names().into_iter().collect(),
+        float_counters: probe.scalar_names(true, true).into_iter().collect(),
+        float_gauges: probe.scalar_names(false, true).into_iter().collect(),
         sampling_interval_ms: probe.metadata_get("sampling_interval_ms"),
         format: probe.metadata_get(crate::format::FORMAT_KEY),
         layout: probe.metadata_get(crate::long::LAYOUT_KEY),
@@ -169,11 +180,11 @@ pub(crate) fn read(index: Option<&[u8]>) -> Option<Stored> {
             .and_then(|n| {
                 let (names, columns) = rest.split_at(n);
                 let names = decode(names, MAX_DECODED)?;
-                let names = rmp_serde::from_slice(&names).ok()?;
+                let names: SegmentNames = rmp_serde::from_slice(&names).ok()?;
                 Some((names, (!columns.is_empty()).then(|| columns.to_vec())))
             });
         return Some(names.map_or(Stored::Unreadable, |(names, columns)| {
-            Stored::Names(names, columns)
+            Stored::Names(Box::new(names), columns)
         }));
     }
     if index.starts_with(NAMES_FAMILY) {
@@ -220,7 +231,10 @@ mod tests {
         };
         let index = encode(&names, None).unwrap();
         assert!(index.starts_with(NAMES));
-        assert_eq!(read(Some(&index)), Some(Stored::Names(names.clone(), None)));
+        assert_eq!(
+            read(Some(&index)),
+            Some(Stored::Names(Box::new(names.clone()), None))
+        );
 
         let columns = SegmentColumns {
             counters: vec![(
@@ -237,7 +251,7 @@ mod tests {
         let Some(Stored::Names(read_names, Some(frame))) = read(Some(&index)) else {
             panic!("no columns frame");
         };
-        assert_eq!(read_names, names);
+        assert_eq!(*read_names, names);
         assert_eq!(super::columns(&frame), Some(columns));
     }
 
@@ -263,7 +277,10 @@ mod tests {
             gauges: later.gauges,
             ..Default::default()
         };
-        assert_eq!(read(Some(&index)), Some(Stored::Names(expected, None)));
+        assert_eq!(
+            read(Some(&index)),
+            Some(Stored::Names(Box::new(expected), None))
+        );
     }
 
     /// A parquet segment with one timestamp column and `interval` as its

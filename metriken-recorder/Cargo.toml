@@ -49,6 +49,9 @@ bytes = "1"
 futures-util = { version = "0.3", default-features = false }
 metriken = { path = "../metriken" }
 metriken-exposition = { path = "../metriken-exposition", features = ["stream-tokio"] }
+# `float_scalars` queries the archive a scrape is written to. Path-only, so
+# `cargo publish` strips it.
+metriken-query = { path = "../metriken-query" }
 metriken-storage = { path = "../metriken-storage", features = ["write"] }
 parquet = { workspace = true, features = ["arrow"] }
 tempfile.workspace = true

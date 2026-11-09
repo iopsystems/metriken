@@ -26,12 +26,44 @@ use std::sync::Arc;
 
 use crate::display::BucketReducer;
 use crate::labels::Labels;
-use crate::promql::streaming::conflicts::{Conflicts, Row, SourceName};
+use crate::promql::streaming::conflicts::{Conflicts, Reading, Row, SourceName};
 use crate::promql::streaming::{
     derive_group_labels, scalar_point, AggOp, BinOp, GroupBy, LabeledPoints, Point, RateEdges,
     SPACING_PROBE,
 };
 use crate::scan::LaterRows;
+use crate::types::CounterValue;
+
+/// A counter column of a decoded batch: `UInt64` for an integer counter,
+/// `Float64` for a float counter.
+#[derive(Clone, Copy)]
+pub(crate) enum CounterColumn<'b> {
+    Int(&'b arrow::array::UInt64Array),
+    Float(&'b arrow::array::Float64Array),
+}
+
+impl<'b> CounterColumn<'b> {
+    /// Column `col` (a schema index) of `batch`; `None` when it is neither.
+    pub(crate) fn of(
+        columns: &metriken_storage::parquet::BatchColumns,
+        batch: &'b arrow::record_batch::RecordBatch,
+        col: usize,
+    ) -> Option<Self> {
+        columns
+            .u64s(batch, col)
+            .map(CounterColumn::Int)
+            .or_else(|| columns.f64s(batch, col).map(CounterColumn::Float))
+    }
+
+    /// The value at row `r`; `None` when it is null.
+    pub(crate) fn get(self, r: usize) -> Option<CounterValue> {
+        use arrow::array::Array;
+        match self {
+            CounterColumn::Int(a) => (!a.is_null(r)).then(|| CounterValue::Int(a.value(r))),
+            CounterColumn::Float(a) => (!a.is_null(r)).then(|| CounterValue::Float(a.value(r))),
+        }
+    }
+}
 
 /// What the dispatcher asks a source for.
 pub(crate) struct GridRateRequest<'a> {
@@ -367,7 +399,7 @@ impl UnionStage<'_> {
 
     /// A row of member `m`'s series the scan reads for the grid, as its
     /// rate takes it: compared with the other sources' rows (S4).
-    fn sample(&mut self, m: usize, ts: u64, window: Option<(u64, u64)>, value: u64) {
+    fn sample(&mut self, m: usize, ts: u64, window: Option<(u64, u64)>, value: CounterValue) {
         let Some(c) = &mut self.compare else {
             return;
         };
@@ -375,7 +407,12 @@ impl UnionStage<'_> {
         if !self.units[u].combine {
             return;
         }
-        c.row(u, &self.units[u].members, m, (ts, window, value));
+        c.row(
+            u,
+            &self.units[u].members,
+            m,
+            (ts, window, Reading::counter(value)),
+        );
     }
 
     /// A row of member `m`'s series.
@@ -523,7 +560,7 @@ pub(crate) enum GridRates {
 #[derive(Clone, Copy)]
 pub(crate) struct Sample {
     pub ts: u64,
-    pub value: u64,
+    pub value: CounterValue,
     pub window: Option<(u64, u64)>,
 }
 
@@ -546,7 +583,7 @@ pub(crate) struct SeriesRate {
     settled: bool,
     typical: u64,
     pulled: usize,
-    prev_value: Option<u64>,
+    prev_value: Option<CounterValue>,
     acc: f64,
     first_ts: Option<u64>,
     last_ts: Option<u64>,
@@ -681,11 +718,7 @@ impl SeriesRate {
 
     fn ingest(&mut self, s: Sample) {
         if let Some(prev) = self.prev_value {
-            self.acc += if s.value >= prev {
-                (s.value - prev) as f64
-            } else {
-                s.value as f64
-            };
+            self.acc += crate::promql::streaming::counter_increase(prev, s.value);
         }
         self.prev_value = Some(s.value);
         // A second sample at the cached edge's time is what the edge is
@@ -1620,15 +1653,14 @@ pub(crate) fn grid_rates(
                     };
                     let duration = columns.duration.and_then(|c| columns.u64s(batch, c));
                     for (col, series) in rows.cols.iter().zip(series) {
-                        let Some(values) = columns.u64s(batch, col.values) else {
+                        let Some(values) = CounterColumn::of(columns, batch, col.values) else {
                             continue;
                         };
                         let begin = col.begin.and_then(|c| columns.i64s(batch, c));
                         let width = col.width.and_then(|c| columns.u64s(batch, c));
                         let windowed = (begin.is_some() && width.is_some()) || duration.is_some();
                         let mut push = |r: usize, series: usize| {
-                            let (Some(base), Some(value)) =
-                                (get(Some(ts), r), get(Some(values), r))
+                            let (Some(base), Some(value)) = (get(Some(ts), r), values.get(r))
                             else {
                                 return;
                             };
@@ -1959,17 +1991,21 @@ mod tests {
     }
 
     fn streamed(samples: &[Sample], windowed: bool, grid: &Grid, reach_ns: u64) -> Vec<Point> {
-        let ts: Vec<u64> = samples.iter().map(|s| s.ts).collect();
-        let vs: Vec<u64> = samples.iter().map(|s| s.value).collect();
-        let ws = windowed.then(|| samples.iter().map(|s| s.window.unwrap()).collect());
-        let rate = CounterGridRate::new(
-            ts,
-            &vs,
+        let stream: Vec<crate::types::CounterSample> = samples
+            .iter()
+            .map(|s| crate::types::CounterSample {
+                ts: s.ts,
+                value: s.value,
+                window: windowed.then(|| s.window.unwrap()),
+            })
+            .collect();
+        let rate = CounterGridRate::from_stream(
+            Box::new(stream.into_iter()),
+            windowed,
             grid.start_ns,
             grid.end_ns,
             grid.step_ns,
             grid.span_ns,
-            ws,
         );
         if grid.range {
             rate.over_range(reach_ns).collect()
@@ -2009,30 +2045,46 @@ mod tests {
             let window = (ts - rng.below(1000), ts + rng.below(1_000_000));
             out.push(Sample {
                 ts,
-                value: v,
+                value: CounterValue::Int(v),
                 window: windowed.then_some(window),
             });
         }
         out
     }
 
+    /// A float counter's samples: each value scaled by a fraction, from
+    /// sample `from` on (an integer series that turns float).
+    fn as_floats(samples: &mut [Sample], from: usize) {
+        for s in samples.iter_mut().skip(from) {
+            if let CounterValue::Int(v) = s.value {
+                s.value = CounterValue::Float(v as f64 * 0.37);
+            }
+        }
+    }
+
     /// For samples in increasing time order, `SeriesRate` gives exactly
     /// `CounterGridRate`'s points: with duplicates at grid points, resets
     /// and holes, windowed or not, on several steps and spans, with and
-    /// without a `rate`'s `[range]`.
+    /// without a `rate`'s `[range]`, of integer and float counters and of
+    /// one that turns float.
     #[test]
     fn series_rate_matches_counter_grid_rate() {
-        for (class, dups, resets, holes) in [
-            ("plain", false, false, false),
-            ("resets", false, true, false),
-            ("holes", false, false, true),
-            ("duplicates", true, false, false),
-            ("all", true, true, true),
+        for (class, dups, resets, holes, floats) in [
+            ("plain", false, false, false, None),
+            ("resets", false, true, false, None),
+            ("holes", false, false, true, None),
+            ("duplicates", true, false, false, None),
+            ("all", true, true, true, None),
+            ("floats", true, true, true, Some(0)),
+            ("turns float", true, true, true, Some(5)),
         ] {
             let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
             for case in 0..4000 {
                 let windowed = rng.below(2) == 0;
-                let input = samples(&mut rng, dups, resets, holes, windowed);
+                let mut input = samples(&mut rng, dups, resets, holes, windowed);
+                if let Some(from) = floats {
+                    as_floats(&mut input, from);
+                }
                 let step = [S, S / 2, 2 * S, 2_500_000_000][rng.below(4) as usize];
                 let span = match rng.below(3) {
                     0 => step,
@@ -2367,7 +2419,7 @@ mod tests {
                     rate.push(
                         Sample {
                             ts,
-                            value: k * 3,
+                            value: CounterValue::Int(k * 3),
                             window: windowed.then_some((ts - 2, ts)),
                         },
                         &grid,

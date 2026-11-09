@@ -2,8 +2,8 @@
 
 use crate::exposition::{HistogramCount, Scrape, Value};
 use metriken_model::{
-    Counter, Gauge, GroupSchema, GroupSnapshot, Histogram as SnapshotHistogram, MetricDesc,
-    Snapshot, SnapshotV3,
+    FloatCounter, FloatGauge, GroupSchema, GroupSnapshot, Histogram as SnapshotHistogram,
+    MetricDesc, Snapshot, SnapshotV3,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -12,6 +12,14 @@ use tracing::{debug, warn};
 
 /// Converts Prometheus text format responses into snapshots the archive
 /// writer stages.
+///
+/// A Prometheus sample is an `f64`, and every scalar is stored as one: a
+/// counter, or an untyped sample whose name ends in `_total`, `_sum` or
+/// `_count` (a histogram's `_sum` and `_count` included), is a float
+/// counter; a gauge, any other untyped sample and a summary's quantile
+/// values are float gauges. The value is stored as served, whether or not
+/// it has a fraction. A NaN or infinite sample is dropped. A histogram's
+/// buckets are a histogram.
 ///
 /// Maintains a stable mapping from (metric_name, labels) to numeric IDs across
 /// scrapes within a recording session, ensuring consistent column identity.
@@ -157,7 +165,7 @@ impl PrometheusConverter {
                     }
                     let id = self.get_or_assign_id(&sample.metric, &labels);
                     counters.push(
-                        Counter::new(id, v as u64, self.build_metadata(&sample.metric, &labels))
+                        FloatCounter::new(id, v, self.build_metadata(&sample.metric, &labels))
                             .with_window(window),
                     );
                 }
@@ -167,7 +175,7 @@ impl PrometheusConverter {
                     }
                     let id = self.get_or_assign_id(&sample.metric, &labels);
                     gauges.push(
-                        Gauge::new(id, v as i64, self.build_metadata(&sample.metric, &labels))
+                        FloatGauge::new(id, v, self.build_metadata(&sample.metric, &labels))
                             .with_window(window),
                     );
                 }
@@ -186,9 +194,9 @@ impl PrometheusConverter {
                         || sample.metric.ends_with("_sum")
                         || sample.metric.ends_with("_count")
                     {
-                        counters.push(Counter::new(id, v as u64, metadata).with_window(window));
+                        counters.push(FloatCounter::new(id, v, metadata).with_window(window));
                     } else {
-                        gauges.push(Gauge::new(id, v as i64, metadata).with_window(window));
+                        gauges.push(FloatGauge::new(id, v, metadata).with_window(window));
                     }
                 }
                 Value::Histogram(ref buckets) => {
@@ -210,9 +218,9 @@ impl PrometheusConverter {
                         q_labels.sort();
                         let id = self.get_or_assign_id(&sample.metric, &q_labels);
                         gauges.push(
-                            Gauge::new(
+                            FloatGauge::new(
                                 id,
-                                quantile.count as i64,
+                                quantile.count,
                                 self.build_metadata(&sample.metric, &q_labels),
                             )
                             .with_window(window),
@@ -238,10 +246,12 @@ impl PrometheusConverter {
         by_id(&mut histograms, |h| &h.name);
 
         let schema = GroupSchema {
-            counters: counters.iter().map(desc_of).collect(),
-            gauges: gauges.iter().map(desc_of).collect(),
+            counters: Vec::new(),
+            gauges: Vec::new(),
             histograms: histograms.iter().map(desc_of).collect(),
             gauge_histograms: Vec::new(),
+            float_counters: counters.iter().map(desc_of).collect(),
+            float_gauges: gauges.iter().map(desc_of).collect(),
         };
         let group = GroupSnapshot {
             name: PROMETHEUS_GROUP.to_string(),
@@ -252,10 +262,12 @@ impl PrometheusConverter {
             // is one less thing that can go stale.
             schema: Some(Arc::new(schema)),
             window,
-            counters: counters.into_iter().map(|c| Some(c.value)).collect(),
-            gauges: gauges.into_iter().map(|g| Some(g.value)).collect(),
+            counters: Vec::new(),
+            gauges: Vec::new(),
             histograms: histograms.into_iter().map(|h| Some(h.value)).collect(),
             gauge_histograms: Vec::new(),
+            float_counters: counters.into_iter().map(|c| Some(c.value)).collect(),
+            float_gauges: gauges.into_iter().map(|g| Some(g.value)).collect(),
         };
 
         Snapshot::V3(SnapshotV3 {
@@ -337,7 +349,7 @@ macro_rules! has_name_and_metadata {
         }
     )*};
 }
-has_name_and_metadata!(Counter, Gauge, SnapshotHistogram);
+has_name_and_metadata!(FloatCounter, FloatGauge, SnapshotHistogram);
 
 /// Convert Prometheus cumulative histogram buckets into a histogram::Histogram.
 ///
@@ -558,7 +570,7 @@ mod tests {
         // of the READINGS, not of the wire shape, and it is the same accessor
         // the parquet path uses.
         let mut snap = conv.convert(text, request_ns, response_ns);
-        let w = snap.counters()[0].window.expect("window set");
+        let w = snap.float_counters()[0].window.expect("window set");
         assert_eq!(
             (w.begin_ns, w.end_ns),
             (request_ns, response_ns),
@@ -575,7 +587,7 @@ mod tests {
         // A realistic recording clock: 2026-ish, not 1970.
         let fetch_ns = 1_780_000_000_000_000_000u64;
         let mut snap = conv.convert("m_total 3 1000\n", fetch_ns, fetch_ns + 2_000_000);
-        let w = snap.counters()[0].window.expect("window set");
+        let w = snap.float_counters()[0].window.expect("window set");
         assert!(
             w.begin_ns >= fetch_ns.saturating_sub(1),
             "a window beginning {} against a row at {fetch_ns} would be decades of \
@@ -590,7 +602,7 @@ mod tests {
         let (request_ns, response_ns) = (5_000_000_000u64, 5_002_000_000u64);
         let text = "m_total 3\n";
         let mut snap = conv.convert(text, request_ns, response_ns);
-        let w = snap.counters()[0].window.expect("window set");
+        let w = snap.float_counters()[0].window.expect("window set");
         assert_eq!((w.begin_ns, w.end_ns), (request_ns, response_ns));
     }
 
@@ -607,7 +619,7 @@ a_total 1
 b 2
 ";
         let mut snap = conv.convert(text, request_ns, response_ns);
-        let (cs, gs) = (snap.counters(), snap.gauges());
+        let (cs, gs) = (snap.float_counters(), snap.float_gauges());
         assert!(!cs.is_empty() && !gs.is_empty(), "fixture");
         for w in cs
             .iter()
@@ -638,9 +650,9 @@ b{k=\"v\"} -3
 ";
         let mut snap = conv.convert(text, 1_000, 2_000);
 
-        let counters = snap.counters();
+        let counters = snap.float_counters();
         assert_eq!(counters.len(), 1);
-        assert_eq!(counters[0].value, 7);
+        assert_eq!(counters[0].value, 7.0);
         assert_eq!(
             counters[0].metadata.get("metric").map(String::as_str),
             Some("a_total")
@@ -658,9 +670,9 @@ b{k=\"v\"} -3
         let w = counters[0].window.expect("window survives the group");
         assert_eq!((w.begin_ns, w.end_ns), (1_000, 2_000));
 
-        let gauges = snap.gauges();
+        let gauges = snap.float_gauges();
         assert_eq!(gauges.len(), 1);
-        assert_eq!(gauges[0].value, -3);
+        assert_eq!(gauges[0].value, -3.0);
         assert_eq!(gauges[0].metadata.get("k").map(String::as_str), Some("v"));
     }
 
@@ -692,7 +704,11 @@ b{k=\"v\"} -3
         assert!(!conv.skips_warned);
         let mut snap = conv.convert("ok 1\nm{a=1} 2\n", 1_000, 2_000);
         assert!(conv.skips_warned);
-        assert_eq!(snap.gauges().len(), 1, "the good line is still converted");
+        assert_eq!(
+            snap.float_gauges().len(),
+            1,
+            "the good line is still converted"
+        );
     }
 
     /// A label value is stored as the exposition text spells it, `=`, `,`,
@@ -709,9 +725,10 @@ xss_total{case=\"comma\",op=\"x=1,y=2\"} 2
 xss_total{case=\"brace\",op=\"a}b\"} 3
 xss_total{case=\"escapes\",op=\"q\\\"b\\\\s\\nn\"} 4
 ";
-        let mut snap = conv.convert(text, 1_000, 2_000);
-        let mut got: Vec<(String, Option<String>, u64)> = snap
-            .counters()
+        // Read once: each accessor drains the values it returns.
+        let counters = conv.convert(text, 1_000, 2_000).float_counters();
+        assert_eq!(counters.len(), 4);
+        let mut got: Vec<(String, Option<String>, f64)> = counters
             .iter()
             .map(|c| {
                 (
@@ -721,21 +738,19 @@ xss_total{case=\"escapes\",op=\"q\\\"b\\\\s\\nn\"} 4
                 )
             })
             .collect();
-        got.sort();
+        got.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let want = |case: &str, op: &str, v| (case.to_string(), Some(op.to_string()), v);
         assert_eq!(
             got,
             vec![
-                want("brace", "a}b", 3),
-                want("comma", "x=1,y=2", 2),
-                want("eq", "a=b", 1),
-                want("escapes", "q\"b\\s\nn", 4),
+                want("brace", "a}b", 3.0),
+                want("comma", "x=1,y=2", 2.0),
+                want("eq", "a=b", 1.0),
+                want("escapes", "q\"b\\s\nn", 4.0),
             ]
         );
         assert!(
-            snap.counters()
-                .iter()
-                .all(|c| !c.metadata.contains_key("y")),
+            counters.iter().all(|c| !c.metadata.contains_key("y")),
             "no label is invented from a value"
         );
     }
@@ -761,8 +776,8 @@ b 3
         };
         assert_eq!(v3.groups.len(), 1);
         let g = &v3.groups[0];
-        assert_eq!(g.counters.len(), 2);
-        assert_eq!(g.gauges.len(), 1);
+        assert_eq!(g.float_counters.len(), 2);
+        assert_eq!(g.float_gauges.len(), 1);
         assert!(g.window.is_some(), "the group carries the scrape's window");
         assert_eq!(v3.duration.as_nanos(), 1_000, "the round trip");
     }

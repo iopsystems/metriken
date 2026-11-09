@@ -105,7 +105,7 @@ pub enum WalValue {
 /// `materialize_wal_tail` rebuild a group table from WAL rows ALONE, with no
 /// external schema cache — required because both the writer thread and a
 /// fresh reader process call it (see `materialize_wal_tail`'s doc).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct WalGroupRow {
     /// Which schema (by content hash) these values align with.
     pub schema_hash: (u64, u64),
@@ -119,14 +119,37 @@ pub struct WalGroupRow {
     /// `(grouping_power, max_value_power, buckets)` per counting histogram
     /// slot — the same shape `WalValue::Histogram` carries.
     pub histograms: Vec<Option<(u8, u8, Vec<u64>)>>,
-    /// Gauge histograms: the last field, and left out of the encoding when
-    /// empty, so a row without one encodes as it did before the field
-    /// existed, and decoders from before it read it. One that holds a gauge
-    /// histogram is an array one element longer, which those decoders refuse
-    /// (rmp-serde's `LengthMismatch`) rather than read the state as counts.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Gauge histograms, in [`histograms`](Self::histograms)' shape.
+    ///
+    /// This and the float fields after it were added after the struct
+    /// shipped. They are written up to the last non-empty one and the empty
+    /// ones after it are left out (see the `trailing` module), so a row
+    /// without them encodes as it did before they existed, and decoders from
+    /// before them read it. A row that holds one is a longer array, which
+    /// those decoders refuse (rmp-serde's `LengthMismatch`) rather than read
+    /// it as another kind.
+    #[serde(default)]
     pub gauge_histograms: Vec<Option<(u8, u8, Vec<u64>)>>,
+    /// Float counter slots, in the schema's `float_counters` order.
+    #[serde(default)]
+    pub float_counters: Vec<Option<f64>>,
+    /// Float gauge slots, in the schema's `float_gauges` order.
+    #[serde(default)]
+    pub float_gauges: Vec<Option<f64>>,
 }
+
+crate::trailing::serialize_with_trailing!(WalGroupRow {
+    schema_hash,
+    schema,
+    window,
+    counters,
+    gauges,
+    histograms,
+} trailing {
+    gauge_histograms,
+    float_counters,
+    float_gauges,
+});
 
 pub fn encode_wal_group_row(row: &WalGroupRow) -> Result<Vec<u8>, String> {
     rmp_serde::to_vec(row).map_err(|e| format!("failed to encode a group WAL row: {e}"))
@@ -165,8 +188,9 @@ pub fn encode_wal_group_row_with_schema(
 /// start that way.
 fn schema_nil_offset(payload: &[u8]) -> Option<usize> {
     let mut rest = payload;
-    // 7 when the row carries gauge histograms.
-    if !matches!(rmp::decode::read_array_len(&mut rest).ok()?, 6 | 7) {
+    // 6 required fields, and up to 3 trailing ones (gauge histograms, float
+    // counters, float gauges).
+    if !matches!(rmp::decode::read_array_len(&mut rest).ok()?, 6..=9) {
         return None;
     }
     if rmp::decode::read_array_len(&mut rest).ok()? != 2 {
@@ -211,21 +235,43 @@ pub struct WalLongRow {
 }
 
 /// One occupant's values in a [`WalLongRow`], in its schema's order.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct LongOccupant {
     pub occupant: u64,
     pub counters: Vec<Option<u64>>,
     pub gauges: Vec<Option<i64>>,
     /// `(grouping_power, max_value_power, buckets)` per counting histogram.
     pub histograms: Vec<Option<(u8, u8, Vec<u64>)>>,
-    /// Gauge histograms: the last field, and left out of the encoding when
-    /// empty, so an occupant without one encodes as it did before the field
-    /// existed, and decoders from before it read it. One that holds a gauge
-    /// histogram is an array one element longer, which those decoders refuse
-    /// (rmp-serde's `LengthMismatch`, which refuses the whole long row) rather than read the state as counts.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Gauge histograms, in [`histograms`](Self::histograms)' shape.
+    ///
+    /// This and the float fields after it were added after the struct
+    /// shipped. They are written up to the last non-empty one and the empty
+    /// ones after it are left out (see the `trailing` module), so an
+    /// occupant without them encodes as it did before they existed, and
+    /// decoders from before them read it. An occupant that holds one is a
+    /// longer array, which those decoders refuse (rmp-serde's
+    /// `LengthMismatch`, which refuses the whole long row) rather than read
+    /// it as another kind.
+    #[serde(default)]
     pub gauge_histograms: Vec<Option<(u8, u8, Vec<u64>)>>,
+    /// Float counter values, in the schema's `float_counters` order.
+    #[serde(default)]
+    pub float_counters: Vec<Option<f64>>,
+    /// Float gauge values, in the schema's `float_gauges` order.
+    #[serde(default)]
+    pub float_gauges: Vec<Option<f64>>,
 }
+
+crate::trailing::serialize_with_trailing!(LongOccupant {
+    occupant,
+    counters,
+    gauges,
+    histograms,
+} trailing {
+    gauge_histograms,
+    float_counters,
+    float_gauges,
+});
 
 pub fn encode_wal_long_row(row: &WalLongRow) -> Result<Vec<u8>, String> {
     rmp_serde::to_vec(row).map_err(|e| format!("failed to encode a WAL long row: {e}"))
@@ -261,6 +307,8 @@ mod with_schema_tests {
                 metadata: [("metric".to_string(), "latency".to_string())].into(),
             }],
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         }
     }
 
@@ -273,6 +321,8 @@ mod with_schema_tests {
             gauges: vec![Some(-5)],
             histograms: vec![Some((3, 8, vec![0, 1, 2]))],
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         }
     }
 
@@ -302,6 +352,37 @@ mod with_schema_tests {
                     "hash {hash:?}, window {window:?}"
                 );
             }
+        }
+    }
+
+    /// Every row length an encoder writes (6 to 9 fields: none, some or all
+    /// of the trailing gauge histogram and float lists) takes the splice.
+    #[test]
+    fn the_splice_is_taken_for_every_row_length() {
+        let fills: [(bool, bool, bool, usize); 5] = [
+            (false, false, false, 6),
+            (true, false, false, 7),
+            (false, true, false, 8),
+            (false, false, true, 9),
+            (true, true, true, 9),
+        ];
+        for (gh, fc, fg, len) in fills {
+            let mut bare = row((1, 2), None);
+            if gh {
+                bare.gauge_histograms = vec![None];
+            }
+            if fc {
+                bare.float_counters = vec![Some(0.5)];
+            }
+            if fg {
+                bare.float_gauges = vec![None];
+            }
+            let bytes = encode_wal_group_row(&bare).unwrap();
+            assert_eq!(
+                rmp::decode::read_array_len(&mut &bytes[..]).unwrap() as usize,
+                len
+            );
+            assert!(schema_nil_offset(&bytes).is_some(), "length {len}");
         }
     }
 

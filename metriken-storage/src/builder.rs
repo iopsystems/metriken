@@ -165,20 +165,12 @@ impl TableBuilder {
     /// How many rows `col` holds so far (a sparse column is shorter than the
     /// table until padded).
     pub fn col_len(col: &Column) -> usize {
-        match &col.values {
-            Values::Counter(v) => v.len(),
-            Values::Gauge(v) => v.len(),
-            Values::Histogram(v) => v.len(),
-        }
+        values_len(&col.values)
     }
 
     fn pad(col: &mut Column, to: usize) {
         while Self::col_len(col) < to {
-            match &mut col.values {
-                Values::Counter(v) => v.push(None),
-                Values::Gauge(v) => v.push(None),
-                Values::Histogram(v) => v.push(None),
-            }
+            push_none(&mut col.values);
             col.windows.push(None);
         }
     }
@@ -270,11 +262,7 @@ impl TableBuilder {
     /// over-allocates badly for exactly the wide tables that seal on the byte
     /// cap long before they reach the row cap.
     fn shrink(col: &mut Column) {
-        match &mut col.values {
-            Values::Counter(v) => v.shrink_to_fit(),
-            Values::Gauge(v) => v.shrink_to_fit(),
-            Values::Histogram(v) => v.shrink_to_fit(),
-        }
+        shrink_values(&mut col.values);
         col.windows.shrink_to_fit();
     }
 
@@ -314,6 +302,36 @@ impl TableBuilder {
     }
 }
 
+/// How many rows a column holds.
+fn values_len(values: &Values) -> usize {
+    match values {
+        Values::Counter(v) => v.len(),
+        Values::Gauge(v) => v.len(),
+        Values::Histogram(v) => v.len(),
+        Values::FloatCounter(v) | Values::FloatGauge(v) => v.len(),
+    }
+}
+
+/// Add an empty row to a column.
+fn push_none(values: &mut Values) {
+    match values {
+        Values::Counter(v) => v.push(None),
+        Values::Gauge(v) => v.push(None),
+        Values::Histogram(v) => v.push(None),
+        Values::FloatCounter(v) | Values::FloatGauge(v) => v.push(None),
+    }
+}
+
+/// Return a column's growth slack to the allocator.
+fn shrink_values(values: &mut Values) {
+    match values {
+        Values::Counter(v) => v.shrink_to_fit(),
+        Values::Gauge(v) => v.shrink_to_fit(),
+        Values::Histogram(v) => v.shrink_to_fit(),
+        Values::FloatCounter(v) | Values::FloatGauge(v) => v.shrink_to_fit(),
+    }
+}
+
 /// A group row's counter, gauge and counting histogram slots, as
 /// [`GroupTableBuilder::push_row`] takes them.
 pub type RowValues<'a> = (
@@ -322,11 +340,27 @@ pub type RowValues<'a> = (
     &'a [Option<(u8, u8, Vec<u64>)>],
 );
 
+/// Every slot of one group row, aligned with its
+/// [`GroupSchema`](crate::schema::GroupSchema)'s lists, as
+/// [`GroupTableBuilder::push_group_row`] takes them.
+#[derive(Clone, Copy, Default)]
+pub struct GroupRowValues<'a> {
+    pub counters: &'a [Option<u64>],
+    pub gauges: &'a [Option<i64>],
+    /// `(grouping_power, max_value_power, buckets)` per counting histogram.
+    pub histograms: &'a [Option<(u8, u8, Vec<u64>)>],
+    /// Gauge histograms, in `histograms`' shape.
+    pub gauge_histograms: &'a [Option<(u8, u8, Vec<u64>)>],
+    pub float_counters: &'a [Option<f64>],
+    pub float_gauges: &'a [Option<f64>],
+}
+
 /// Set a column's `metric_type` to `kind`, the kind of the value that
 /// created it. A histogram's kind is the list its value arrived in (a
 /// counting or a gauge histogram), so it replaces whatever `metric_type` the
 /// producer's metadata carried; a counter's or gauge's leaves a producer's
-/// value in place, as it always has.
+/// value in place, as it always has. A float column's is set by
+/// [`stamp_float_metric_type`].
 pub(crate) fn stamp_metric_type(metadata: &mut HashMap<String, String>, kind: &str) {
     let key = metriken_model::METRIC_TYPE;
     if kind == metriken_model::COUNTER_HISTOGRAM || kind == metriken_model::GAUGE_HISTOGRAM {
@@ -336,6 +370,14 @@ pub(crate) fn stamp_metric_type(metadata: &mut HashMap<String, String>, kind: &s
             .entry(key.to_string())
             .or_insert_with(|| kind.to_string());
     }
+}
+
+/// Set a float column's `metric_type` to `kind` (`counter` or `gauge`),
+/// replacing whatever the producer's metadata carried: a reader tells a
+/// float counter from a float gauge by it alone, so an exporter label named
+/// `metric_type` must not change it.
+pub(crate) fn stamp_float_metric_type(metadata: &mut HashMap<String, String>, kind: &str) {
+    metadata.insert(metriken_model::METRIC_TYPE.to_string(), kind.to_string());
 }
 
 /// The keys [`GroupTableBuilder::push_row`] adds to a histogram column's
@@ -403,11 +445,7 @@ impl GroupTableBuilder {
     }
 
     fn col_len(col: &Column) -> usize {
-        match &col.values {
-            Values::Counter(v) => v.len(),
-            Values::Gauge(v) => v.len(),
-            Values::Histogram(v) => v.len(),
-        }
+        values_len(&col.values)
     }
 
     /// Pad a column up to `to` rows. Unlike `TableBuilder::pad`, this never
@@ -416,11 +454,7 @@ impl GroupTableBuilder {
     /// column (see `Table::table_window`).
     fn pad(col: &mut Column, to: usize) {
         while Self::col_len(col) < to {
-            match &mut col.values {
-                Values::Counter(v) => v.push(None),
-                Values::Gauge(v) => v.push(None),
-                Values::Histogram(v) => v.push(None),
-            }
+            push_none(&mut col.values);
         }
     }
 
@@ -461,20 +495,27 @@ impl GroupTableBuilder {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        stamp_metric_type(&mut metadata, metric_type);
+        match empty {
+            Values::FloatCounter(_) | Values::FloatGauge(_) => {
+                stamp_float_metric_type(&mut metadata, metric_type)
+            }
+            _ => stamp_metric_type(&mut metadata, metric_type),
+        }
 
         // The live column for this descriptor name, if its labels still match.
         // Compared on the FULL metadata map, `metric_type` included: the map is
         // what becomes the column's parquet field metadata, so anything that
         // differs in it is a different column. The histogram configuration
         // this builder stamps on a column (`push_row`) is left out where the
-        // descriptor does not carry it.
+        // descriptor does not carry it. A member whose values change type (an
+        // integer counter that becomes a float one) starts a column of its
+        // own too, rather than having its values skipped.
         let key = match self.live.get(desc.name.as_str()) {
             Some(key)
-                if self
-                    .columns
-                    .get(key)
-                    .is_some_and(|c| same_column(&c.metadata, &metadata)) =>
+                if self.columns.get(key).is_some_and(|c| {
+                    std::mem::discriminant(&c.values) == std::mem::discriminant(&empty)
+                        && same_column(&c.metadata, &metadata)
+                }) =>
             {
                 key.clone()
             }
@@ -558,6 +599,44 @@ impl GroupTableBuilder {
         (counters, gauges, histograms): RowValues<'_>,
         gauge_histograms: &[Option<(u8, u8, Vec<u64>)>],
     ) {
+        self.push_group_row(
+            ts,
+            wall_offset_ns,
+            window,
+            schema,
+            GroupRowValues {
+                counters,
+                gauges,
+                histograms,
+                gauge_histograms,
+                ..GroupRowValues::default()
+            },
+        );
+    }
+
+    /// [`push_row`](Self::push_row) with every slot of the row: gauge
+    /// histograms as in
+    /// [`push_row_with_gauge_histograms`](Self::push_row_with_gauge_histograms),
+    /// and float counters and gauges, aligned with `schema.float_counters`
+    /// and `schema.float_gauges`, each a `Float64` column whose
+    /// `metric_type` is `counter` or `gauge`. A NaN or infinite float value
+    /// is stored as absent.
+    pub fn push_group_row(
+        &mut self,
+        ts: u64,
+        wall_offset_ns: i64,
+        window: Option<Window>,
+        schema: &crate::schema::GroupSchema,
+        values: GroupRowValues<'_>,
+    ) {
+        let GroupRowValues {
+            counters,
+            gauges,
+            histograms,
+            gauge_histograms,
+            float_counters,
+            float_gauges,
+        } = values;
         let row = self.timestamps.len();
         self.timestamps.push(ts);
         self.wall_offsets.push(wall_offset_ns);
@@ -575,6 +654,20 @@ impl GroupTableBuilder {
             Self::pad(col, row);
             if let Values::Gauge(vs) = &mut col.values {
                 vs.push(*v);
+            }
+        }
+        for (desc, v) in schema.float_counters.iter().zip(float_counters) {
+            let col = self.get_or_create(desc, "counter", Values::FloatCounter(Vec::new()));
+            Self::pad(col, row);
+            if let Values::FloatCounter(vs) = &mut col.values {
+                vs.push(v.filter(|x| x.is_finite()));
+            }
+        }
+        for (desc, v) in schema.float_gauges.iter().zip(float_gauges) {
+            let col = self.get_or_create(desc, "gauge", Values::FloatGauge(Vec::new()));
+            Self::pad(col, row);
+            if let Values::FloatGauge(vs) = &mut col.values {
+                vs.push(v.filter(|x| x.is_finite()));
             }
         }
         self.push_histograms(
@@ -682,11 +775,7 @@ impl GroupTableBuilder {
             .map(|name| {
                 let mut col = self.columns.remove(name).unwrap();
                 Self::pad(&mut col, rows);
-                match &mut col.values {
-                    Values::Counter(v) => v.shrink_to_fit(),
-                    Values::Gauge(v) => v.shrink_to_fit(),
-                    Values::Histogram(v) => v.shrink_to_fit(),
-                }
+                shrink_values(&mut col.values);
                 col
             })
             .collect();
@@ -759,6 +848,74 @@ mod tests {
         assert_eq!(powers[1].map(String::as_str), Some("5"));
     }
 
+    /// Float members become `Float64` columns whose `metric_type` is the
+    /// list they arrived in, whatever the producer's metadata said, and read
+    /// back with their values; an integer counter keeps a producer's
+    /// `metric_type`, as it always has.
+    #[test]
+    fn a_float_column_is_stamped_with_its_kind() {
+        let d = |name: &str, kind: &str| crate::schema::MetricDesc {
+            name: name.to_string(),
+            metadata: [
+                ("metric".to_string(), name.to_string()),
+                ("metric_type".to_string(), kind.to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let schema = crate::schema::GroupSchema {
+            counters: vec![d("int", "producer")],
+            float_counters: vec![d("fc", "gauge")],
+            float_gauges: vec![d("fg", "counter")],
+            ..Default::default()
+        };
+        let mut b = GroupTableBuilder::new("p/g".to_string());
+        for row in 0..3u64 {
+            b.push_group_row(
+                row,
+                0,
+                None,
+                &schema,
+                GroupRowValues {
+                    counters: &[Some(row)],
+                    float_counters: &[Some(row as f64 + 0.5)],
+                    float_gauges: &[(row != 1).then_some(-0.25 * row as f64)],
+                    ..GroupRowValues::default()
+                },
+            );
+        }
+        let table = b.finish();
+        let kinds: Vec<(&str, Option<&str>)> = table
+            .columns
+            .iter()
+            .map(|c| {
+                (
+                    c.name.as_str(),
+                    c.metadata.get("metric_type").map(String::as_str),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("int", Some("producer")),
+                ("fc", Some("counter")),
+                ("fg", Some("gauge"))
+            ]
+        );
+        let bytes = crate::table::write_table_parquet(&table).unwrap();
+        let read = crate::table::read_table_parquet("p/g".to_string(), bytes).unwrap();
+        let values: Vec<&Values> = read.columns.iter().map(|c| &c.values).collect();
+        assert_eq!(
+            values,
+            [
+                &Values::Counter(vec![Some(0), Some(1), Some(2)]),
+                &Values::FloatCounter(vec![Some(0.5), Some(1.5), Some(2.5)]),
+                &Values::FloatGauge(vec![Some(-0.0), None, Some(-0.5)]),
+            ]
+        );
+    }
+
     // `approx_bytes` bounds the DATA, and a `Vec` grown by push carries up to
     // 2x that in capacity, which a writer would then hold across its channel
     // and the encode. `finish` returns the slack. 100 rows is chosen to land
@@ -813,6 +970,7 @@ mod tests {
                 Values::Counter(v) => (v.len(), v.capacity()),
                 Values::Gauge(v) => (v.len(), v.capacity()),
                 Values::Histogram(v) => (v.len(), v.capacity()),
+                Values::FloatCounter(v) | Values::FloatGauge(v) => (v.len(), v.capacity()),
             };
             assert_eq!(cap, len, "{} values", col.name);
             assert_eq!(

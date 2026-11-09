@@ -141,6 +141,8 @@ fn schema(gauge: bool) -> GroupSchema {
         } else {
             Vec::new()
         },
+        float_counters: Vec::new(),
+        float_gauges: Vec::new(),
     }
 }
 
@@ -157,6 +159,8 @@ fn group_row(gauge: bool) -> WalGroupRow {
         gauges: Vec::new(),
         histograms: vec![cell()],
         gauge_histograms: if gauge { vec![cell()] } else { Vec::new() },
+        float_counters: Vec::new(),
+        float_gauges: Vec::new(),
     }
 }
 
@@ -204,6 +208,8 @@ fn snapshots(gauge: bool) -> [Snapshot; 3] {
                 gauges: Vec::new(),
                 histograms: vec![Some(h2())],
                 gauge_histograms: if gauge { vec![Some(h2())] } else { Vec::new() },
+                float_counters: Vec::new(),
+                float_gauges: Vec::new(),
             }],
         }),
     ]
@@ -243,6 +249,8 @@ fn rows_without_one_decode_with_the_old_types() {
             gauges: Vec::new(),
             histograms: vec![cell()],
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         }],
     };
     let _: OldLongRow = rmp_serde::from_slice(&encode_wal_long_row(&long).unwrap()).unwrap();
@@ -290,6 +298,8 @@ fn rows_with_one_are_refused_by_the_old_types() {
             gauges: Vec::new(),
             histograms: Vec::new(),
             gauge_histograms: vec![cell()],
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         }],
     };
     assert!(rmp_serde::from_slice::<OldLongRow>(&encode_wal_long_row(&long).unwrap()).is_err());

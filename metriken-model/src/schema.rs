@@ -68,23 +68,44 @@ pub struct MetricDesc {
 }
 
 /// The membership of one acquisition group: descriptors for every counter,
-/// gauge, counting histogram and gauge histogram slot, in the order the
-/// value arrays use.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// gauge, counting histogram, gauge histogram, float counter and float gauge
+/// slot, in the order the value arrays use.
+///
+/// `gauge_histograms`, `float_counters` and `float_gauges` were added after
+/// the struct shipped. They are written up to the last non-empty one and the
+/// empty ones after it are left out (see the `trailing` module), so a schema
+/// without them encodes, and [`hash`](Self::hash)es, as it did before they
+/// existed, and decoders from before them read it. A schema that holds one
+/// is a longer array, which those decoders refuse (rmp-serde's
+/// `LengthMismatch`) rather than read it as another kind.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 pub struct GroupSchema {
     pub counters: Vec<MetricDesc>,
     pub gauges: Vec<MetricDesc>,
     /// Counting histograms.
     pub histograms: Vec<MetricDesc>,
-    /// Gauge histograms: the last field, and left out of the encoding when
-    /// empty, so a schema without one encodes, and [`hash`](Self::hash)es,
-    /// as it did before the field existed, and decoders from before it read
-    /// it. One that holds a gauge histogram is an array one element longer,
-    /// which those decoders refuse (rmp-serde's `LengthMismatch`) rather
-    /// than read the state as counts.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Gauge histograms. Absent from encodings by metriken-model 0.1.
+    #[serde(default)]
     pub gauge_histograms: Vec<MetricDesc>,
+    /// Counters whose values are `f64` (a Prometheus endpoint's). Absent
+    /// from encodings by metriken-model 0.2.
+    #[serde(default)]
+    pub float_counters: Vec<MetricDesc>,
+    /// Gauges whose values are `f64`. Absent from encodings by
+    /// metriken-model 0.2.
+    #[serde(default)]
+    pub float_gauges: Vec<MetricDesc>,
 }
+
+crate::trailing::serialize_with_trailing!(GroupSchema {
+    counters,
+    gauges,
+    histograms,
+} trailing {
+    gauge_histograms,
+    float_counters,
+    float_gauges,
+});
 
 impl GroupSchema {
     /// FNV-1a-128 over the schema's canonical msgpack encoding, returned as

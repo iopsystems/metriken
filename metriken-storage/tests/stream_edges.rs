@@ -69,6 +69,8 @@ fn columns(metric: &str) -> GroupSchema {
         gauges: Vec::new(),
         histograms: Vec::new(),
         gauge_histograms: Vec::new(),
+        float_counters: Vec::new(),
+        float_gauges: Vec::new(),
     }
 }
 
@@ -92,6 +94,8 @@ fn long_row(
                     gauges: Vec::new(),
                     histograms: Vec::new(),
                     gauge_histograms: Vec::new(),
+                    float_counters: Vec::new(),
+                    float_gauges: Vec::new(),
                 })
                 .collect(),
         },
@@ -142,6 +146,8 @@ fn a_group_that_turns_long_keeps_its_series() {
             gauges: Vec::new(),
             histograms: Vec::new(),
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         });
         for t in 0..5u64 {
             let ts = BASE + t * S;
@@ -158,6 +164,8 @@ fn a_group_that_turns_long_keeps_its_series() {
                     gauges: Vec::new(),
                     histograms: Vec::new(),
                     gauge_histograms: Vec::new(),
+                    float_counters: Vec::new(),
+                    float_gauges: Vec::new(),
                 }],
             });
             let staged = source.stage(&snap, ts, 0).unwrap();

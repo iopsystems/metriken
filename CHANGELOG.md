@@ -7,6 +7,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-model 0.3.0
+
+- **Added (breaking):** `GroupSchema`, `GroupSnapshot`, `WalGroupRow` and
+  `LongOccupant` gain two last fields, `float_counters` and `float_gauges`
+  (descriptors in the schema, `Option<f64>` slots in the snapshot and
+  rows), for counters and gauges whose values are `f64`. Struct literals
+  must add them. `Snapshot::float_counters` and `Snapshot::float_gauges`
+  read them as `FloatCounter` and `FloatGauge`; `GroupSnapshot::validate`
+  checks their arity; `convert::wal_group_row` copies them; the cost meters
+  charge a present float slot as a counter or gauge slot.
+- **Changed:** the four structs encode `gauge_histograms`,
+  `float_counters` and `float_gauges` up to the last non-empty one,
+  writing an empty one before it, and leave out the empty ones after it.
+  A value without floats encodes byte for byte as in 0.2.2, so schema
+  hashes and existing archives are unchanged and 0.2.2 decoders read it.
+  A value with floats is a longer array, which 0.2.2 refuses (a schema or
+  row with a length error, a snapshot with no matching variant) rather
+  than read the floats as gauge histograms.
+  `encode_wal_group_row_with_schema` splices rows of 6 to 9 fields.
+
+### metriken-exposition 0.26.0
+
+Requires metriken-model 0.3.0.
+
+- **Breaking:** the re-exported `GroupSchema` and `GroupSnapshot` gain
+  `float_counters` and `float_gauges` fields (metriken-model 0.3.0), so
+  struct literals of them must add the fields. `GroupBuilder` makes no
+  float members. `EncodedGroup::encode` carries a `GroupSnapshot`'s floats
+  into its row; `EncodedLongGroup::encode` writes none, since a
+  `LongGroupSnapshot` has no float members.
+
+### metriken-storage 0.8.0
+
+Requires metriken-model 0.3.0.
+
+- **Added (breaking):** float counters and float gauges. A group's
+  `float_counters` and `float_gauges` are stored as `Float64` columns whose
+  `metric_type` is `counter` or `gauge`, stamped by the writers whatever
+  the producer's metadata says. They are written by `ArchiveWriter` from
+  snapshots and from a replication stream (`StreamDecoder` carries them),
+  replayed from the WAL, and kept in the long layout: a group whose
+  members carry an `id` is written long with float members too. A NaN or
+  infinite float value is dropped when `ArchiveWriter` builds a segment
+  (sealed or materialized from the live tail) and by `Memory`'s float
+  upserts, so it reads as absent. `write_table_parquet` writes a `Table`'s
+  float values as given.
+- **Breaking:** the read types carry integer or `f64` values per series:
+  `Counter::values` and `ColumnChunk::values` are `CounterValues` (`Int`
+  of `u64` or `Float` of `f64`), `Gauge::values` is `GaugeValues` (`Int`
+  of `i64` or `Float`), and `CounterSample::value` is `CounterValue`.
+  `CounterStream` gains `float`, set when its samples can be floats.
+  `ColumnPosition` gains `float`. Struct literals wrap a `Vec<u64>` or
+  `Vec<i64>` with `.into()`. A series stored as integers in some segments
+  and floats in others reads as one `Float` series, whose integer values
+  above 2^53 are rounded. `CounterSample` no longer implements `Eq`.
+- **Breaking:** `table::Values` gains `FloatCounter` and `FloatGauge`, so
+  an exhaustive match on it must handle them.
+- **Added:** the counter and gauge listings (`*_names`, `*_labels`,
+  `SamplerReader::holds_counter` and `holds_gauge`) include float columns;
+  `MultiParquetSource::float_counter_columns`, `float_gauge_columns` and
+  `BatchColumns::f64s`; `GroupTableBuilder::push_group_row` with
+  `GroupRowValues`. A `Float64` column of another `metric_type` is not
+  read.
+- **Changed:** a segment holding a float column is written as segment
+  format 3 (`format::FORMAT_FLOAT`; `format::FORMAT_VERSION`, the newest
+  format read, is now 3), which metriken-storage 0.7.0 refuses ("segment
+  format 3 is newer than this reader, which reads up to 2");
+  without the bump it would drop the column without an error. Segments
+  without one stay format 1 or 2. A segment's names index records float
+  columns in sets of their own, which a reader lists as counters and
+  gauges.
+- **Added:** `Memory::upsert_float_counter_sample` and
+  `upsert_float_gauge_sample` (feature `ingest`). An integer series a float
+  sample is appended to becomes a float series; a NaN or infinite sample
+  is dropped.
+- **Changed:** `DataSource::counter_scan` of a segmented source scans
+  float counter columns as it scans integer ones; a `ScanColumn`'s values
+  column is `UInt64` or `Float64`.
+
+### metriken-query 0.45.0
+
+Requires metriken-storage 0.8.0.
+
+- **Added:** float counters and gauges evaluate as counters and gauges in
+  every function that reads them (`rate`, `irate`, a bare selector,
+  `avg_over_time`, `idelta`, `deriv`), on the batched rate path and per
+  series. Integer counters keep exact `u64` differencing; a float counter
+  differences in `f64`, and any decrease, however small, is a reset whose
+  increase is the value after it, as for integers. A series stored as
+  integers and then as floats rates across the change. Gauge values are
+  read as `f64` as before, so a float gauge's fractions are returned as
+  stored.
+- **Added:** `MemoryStore::ingest_snapshot` ingests a snapshot's
+  `float_counters` and `float_gauges` as counters and gauges, dropping a
+  NaN or infinite value.
+- **Changed:** a process group's sources are compared for conflicts by
+  number: an integer reading and a float reading of the same number (a
+  recording made before its recorder stored floats and one after) are
+  not a conflict; different numbers are.
+- **Changed:** adapted to metriken-storage 0.8's read types; integer
+  counters and gauges evaluate as before.
+
+### metriken-recorder 0.9.0
+
+Requires metriken-model 0.3.0 and metriken-storage 0.8.0.
+
+- **Changed (breaking):** a Prometheus endpoint's scalars are recorded as
+  float counters and float gauges, so a fraction is kept: a gauge of 0.25
+  reads 0.25 where it read 0, and a counter in seconds moves by its
+  fractions where it moved in whole seconds. This covers typed counters
+  and gauges, untyped samples (a name ending in `_total`, `_sum` or
+  `_count` is a counter, any other a gauge), a summary's quantiles (gauges)
+  and a histogram's `_sum` and `_count` (counters), whole-numbered or not.
+  A histogram's buckets are a histogram as before, NaN and infinite
+  samples are still dropped, and a counter's values are stored as served.
+  A scrape whose samples carry an `id` is still written long. A recording
+  of a Prometheus endpoint holds segment format 3, which a reader needs
+  metriken-storage 0.8.0 to read; metriken-storage 0.7.0 refuses it.
+  Recordings of streamed producers and of the process's registry are
+  unchanged.
+
 ### metriken 0.11.7
 
 - **Changed:** `ShardedCounterHistogram::add` and `increment` skip their

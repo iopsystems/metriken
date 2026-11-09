@@ -813,10 +813,13 @@ pub(crate) enum MetricKind {
 }
 
 impl TableNames {
-    /// Add the names a segment's names index gives.
+    /// Add the names a segment's names index gives. A float counter or
+    /// gauge is listed as a counter or a gauge.
     fn add(&mut self, names: &crate::names::SegmentNames) {
         self.counters.extend(names.counters.iter().cloned());
+        self.counters.extend(names.float_counters.iter().cloned());
         self.gauges.extend(names.gauges.iter().cloned());
+        self.gauges.extend(names.float_gauges.iter().cloned());
         self.histograms.extend(names.histograms.iter().cloned());
         self.gauge_histograms
             .extend(names.gauge_histograms.iter().cloned());

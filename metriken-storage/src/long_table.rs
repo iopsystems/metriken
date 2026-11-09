@@ -5,7 +5,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Int64Array, ListBuilder, UInt64Array, UInt64Builder};
+use arrow::array::{
+    Array, ArrayRef, Float64Array, Int64Array, ListBuilder, UInt64Array, UInt64Builder,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -28,6 +30,8 @@ enum LongValues {
     Gauge(Vec<Option<i64>>),
     /// `(grouping_power, max_value_power, buckets)`.
     Histogram(Vec<Option<(u8, u8, Vec<u64>)>>),
+    /// A float counter or gauge (its `metric_type` says which).
+    Float(Vec<Option<f64>>),
 }
 
 struct LongColumn {
@@ -42,6 +46,7 @@ impl LongColumn {
             LongValues::Counter(v) => v.resize(to, None),
             LongValues::Gauge(v) => v.resize(to, None),
             LongValues::Histogram(v) => v.resize(to, None),
+            LongValues::Float(v) => v.resize(to, None),
         }
     }
 
@@ -51,6 +56,7 @@ impl LongColumn {
             LongValues::Counter(v) => v[i].is_some(),
             LongValues::Gauge(v) => v[i].is_some(),
             LongValues::Histogram(v) => v[i].is_some(),
+            LongValues::Float(v) => v[i].is_some(),
         }
     }
 
@@ -111,7 +117,12 @@ impl LongTableBuilder {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-            crate::builder::stamp_metric_type(&mut metadata, metric_type);
+            match empty {
+                LongValues::Float(_) => {
+                    crate::builder::stamp_float_metric_type(&mut metadata, metric_type)
+                }
+                _ => crate::builder::stamp_metric_type(&mut metadata, metric_type),
+            }
             self.order.push(desc.name.clone());
             self.columns.insert(
                 desc.name.clone(),
@@ -154,6 +165,19 @@ impl LongTableBuilder {
                 col.pad(row);
                 if let LongValues::Gauge(vs) = &mut col.values {
                     vs.push(*v);
+                }
+            }
+            for (kind, descs, values) in [
+                ("counter", &schema.float_counters, &occ.float_counters),
+                ("gauge", &schema.float_gauges, &occ.float_gauges),
+            ] {
+                for (desc, v) in descs.iter().zip(values) {
+                    let col = self.column(desc, kind, LongValues::Float(Vec::new()));
+                    col.pad(row);
+                    // A NaN or infinite value is stored as absent.
+                    if let LongValues::Float(vs) = &mut col.values {
+                        vs.push(v.filter(|x| x.is_finite()));
+                    }
                 }
             }
             for (desc, v) in schema.histograms.iter().zip(&occ.histograms) {
@@ -242,6 +266,15 @@ impl LongTableBuilder {
                     );
                     arrays.push(Arc::new(Int64Array::from_iter(order.iter().map(|&i| v[i]))));
                 }
+                LongValues::Float(v) => {
+                    fields.push(
+                        Field::new(&col.name, DataType::Float64, true)
+                            .with_metadata(col.metadata.clone()),
+                    );
+                    arrays.push(Arc::new(Float64Array::from_iter(
+                        order.iter().map(|&i| v[i]),
+                    )));
+                }
                 LongValues::Histogram(v) => {
                     let mut b = ListBuilder::new(UInt64Builder::new());
                     for &i in &order {
@@ -322,6 +355,8 @@ mod tests {
             gauges: vec![d("8", "depth")],
             histograms: vec![d("9", "lat")],
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         }
     }
 
@@ -332,6 +367,8 @@ mod tests {
             gauges: vec![n.is_multiple_of(2).then_some(v as i64)],
             histograms: vec![Some((2, 8, vec![v, 0, 1]))],
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         }
     }
 

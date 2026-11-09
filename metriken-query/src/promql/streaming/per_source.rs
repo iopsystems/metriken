@@ -1179,7 +1179,10 @@ impl Tap {
             if !g.timestamps.iter().all(|&t| self.keeps(t)) {
                 let keep: Vec<bool> = g.timestamps.iter().map(|&t| self.keeps(t)).collect();
                 retain_by(&keep, &mut g.timestamps);
-                retain_by(&keep, &mut g.values);
+                match &mut g.values {
+                    crate::types::GaugeValues::Int(v) => retain_by(&keep, v),
+                    crate::types::GaugeValues::Float(v) => retain_by(&keep, v),
+                }
                 if let Some(w) = &mut g.windows {
                     retain_by(&keep, w);
                 }
@@ -1220,11 +1223,13 @@ impl crate::scan::ChunkReader for RecordingChunks<'_> {
                     continue;
                 };
                 for (col, series) in seg.cols.iter().zip(series) {
-                    let Some(values) = columns.u64s(batch, col.values) else {
+                    let Some(values) =
+                        crate::batch_rate::CounterColumn::of(columns, batch, col.values)
+                    else {
                         continue;
                     };
                     let mut push = |r: usize, s: usize| {
-                        if !ts.is_null(r) && !values.is_null(r) {
+                        if !ts.is_null(r) && values.get(r).is_some() {
                             if let Some(v) = rows.get_mut(s) {
                                 v.push(ts.value(r));
                             }
@@ -1298,7 +1303,10 @@ impl DataSource for Tap {
             if !c.timestamps.iter().all(|&t| self.keeps(t)) {
                 let keep: Vec<bool> = c.timestamps.iter().map(|&t| self.keeps(t)).collect();
                 retain_by(&keep, &mut c.timestamps);
-                retain_by(&keep, &mut c.values);
+                match &mut c.values {
+                    crate::types::CounterValues::Int(v) => retain_by(&keep, v),
+                    crate::types::CounterValues::Float(v) => retain_by(&keep, v),
+                }
                 if let Some(w) = &mut c.windows {
                     retain_by(&keep, w);
                 }
@@ -1327,6 +1335,7 @@ impl DataSource for Tap {
                     CounterStream {
                         labels: s.labels,
                         windowed: s.windowed,
+                        float: s.float,
                         interval: s.interval,
                         samples: Box::new(
                             s.samples

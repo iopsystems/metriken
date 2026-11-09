@@ -10,7 +10,33 @@
 use std::collections::VecDeque;
 
 use super::{Point, RateEdges};
-use crate::types::CounterSample;
+use crate::types::{CounterSample, CounterValue};
+
+/// The increase of a counter from reading `prev` to reading `cur`. A
+/// decrease is a reset: the counter started again from zero, so `cur` is
+/// the increase. Two integer readings difference exactly in `u64`; a float
+/// reading on either side differences in `f64`, where any decrease, however
+/// small, is a reset, and an integer reading above 2^53 is rounded (a
+/// series that turns float, read across the change).
+pub(crate) fn counter_increase(prev: CounterValue, cur: CounterValue) -> f64 {
+    match (prev, cur) {
+        (CounterValue::Int(p), CounterValue::Int(c)) => {
+            if c >= p {
+                (c - p) as f64
+            } else {
+                c as f64
+            }
+        }
+        (p, c) => {
+            let (p, c) = (p.as_f64(), c.as_f64());
+            if c >= p {
+                c - p
+            } else {
+                c
+            }
+        }
+    }
+}
 
 /// A boxed sample stream a producer consumes; see [`crate::CounterStream`].
 pub type Samples<'a> = Box<dyn Iterator<Item = CounterSample> + 'a>;
@@ -27,13 +53,13 @@ fn stream_of(
     let windows = windows.unwrap_or_default();
     Box::new((0..n).map(move |i| CounterSample {
         ts: timestamps[i],
-        value: values[i],
+        value: crate::types::CounterValue::Int(values[i]),
         window: windows.get(i).copied(),
     }))
 }
 
 /// A sample as the pair-wise producer keeps it: stamp, value, window.
-type Sample = (u64, u64, Option<(u64, u64)>);
+type Sample = (u64, CounterValue, Option<(u64, u64)>);
 
 /// Pair-wise rate producer over a counter sample stream, for `irate` in raw
 /// mode: one point per sample up to `end_ns`, from the first read, the rate
@@ -117,11 +143,7 @@ impl<'a> Iterator for CounterPairwiseRate<'a> {
 fn pair_rate(
     ((ts_prev, v_prev, w_prev), (ts_cur, v_cur, w_cur)): (Sample, Sample),
 ) -> Option<Point> {
-    let delta = if v_cur >= v_prev {
-        (v_cur - v_prev) as f64
-    } else {
-        v_cur as f64
-    };
+    let delta = counter_increase(v_prev, v_cur);
     let dur_s = (ts_cur.checked_sub(ts_prev)?) as f64 / 1e9;
     if dur_s <= 0.0 {
         return None;
@@ -202,7 +224,7 @@ pub struct CounterGridRate<'a> {
     /// Samples pulled so far.
     pulled: usize,
     /// The previous raw value and the running reset-adjusted cumulative.
-    prev_value: Option<u64>,
+    prev_value: Option<CounterValue>,
     acc: f64,
     /// The gaps between the first samples, for the typical spacing that
     /// tells a hole from jitter — see [`Self::sampled_window`].
@@ -326,15 +348,11 @@ impl<'a> CounterGridRate<'a> {
             self.exhausted = true;
             return false;
         };
-        // Reset-adjusted cumulative: same convention as CounterRate's
-        // total_increase (a decrease is treated as a fresh counter start,
-        // contributing its own value as the increment).
+        // Reset-adjusted cumulative: a decrease is treated as a fresh
+        // counter start, contributing its own value as the increment
+        // (`counter_increase`).
         if let Some(prev) = self.prev_value {
-            self.acc += if sample.value >= prev {
-                (sample.value - prev) as f64
-            } else {
-                sample.value as f64
-            };
+            self.acc += counter_increase(prev, sample.value);
         }
         self.prev_value = Some(sample.value);
         if let Some(last) = self.last_ts {

@@ -29,7 +29,8 @@ pub enum RowSeries {
     PerRow(Vec<u32>),
 }
 
-/// A read column's schema positions in its segment.
+/// A read column's schema positions in its segment. The values column is
+/// `UInt64`, or `Float64` for a float counter.
 pub struct ScanColumn {
     pub values: usize,
     pub begin: Option<usize>,

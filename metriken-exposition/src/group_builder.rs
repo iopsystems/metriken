@@ -831,6 +831,8 @@ fn build_wide<R: Router, N: MemberNames>(
                 gauges: group.gauge_descs,
                 histograms: group.histogram_descs,
                 gauge_histograms: group.gauge_histogram_descs,
+                float_counters: Vec::new(),
+                float_gauges: Vec::new(),
             };
             let hash = schema.hash();
             let schema = Arc::new(schema);
@@ -883,6 +885,8 @@ fn build_wide<R: Router, N: MemberNames>(
             gauges: group.gauge_values,
             histograms: group.histogram_values,
             gauge_histograms: group.gauge_histogram_values,
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         });
     }
 
@@ -1097,6 +1101,8 @@ fn build_long<R: Router, N: MemberNames>(
                     })
                     .collect(),
                 gauge_histograms: Vec::new(),
+                float_counters: Vec::new(),
+                float_gauges: Vec::new(),
             });
             acc.state.hash = columns.hash();
             acc.state.columns = columns;

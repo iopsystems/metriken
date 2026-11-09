@@ -102,6 +102,68 @@ impl Histogram {
     }
 }
 
+/// A counter whose value is an `f64`, as a Prometheus endpoint serves it.
+/// Read from a V3 group's `float_counters` by [`Snapshot::float_counters`];
+/// V1 and V2 snapshots carry none.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct FloatCounter {
+    pub name: String,
+    pub value: f64,
+    pub metadata: HashMap<String, String>,
+    pub window: Option<Window>,
+}
+
+impl FloatCounter {
+    /// A float counter with no acquisition window. Add one with
+    /// [`with_window`](Self::with_window).
+    pub fn new(name: String, value: f64, metadata: HashMap<String, String>) -> Self {
+        Self {
+            name,
+            value,
+            metadata,
+            window: None,
+        }
+    }
+
+    /// Attach (or clear) the acquisition window.
+    pub fn with_window(mut self, window: Option<Window>) -> Self {
+        self.window = window;
+        self
+    }
+}
+
+/// A gauge whose value is an `f64`, as a Prometheus endpoint serves it.
+/// Read from a V3 group's `float_gauges` by [`Snapshot::float_gauges`]; V1
+/// and V2 snapshots carry none.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct FloatGauge {
+    pub name: String,
+    pub value: f64,
+    pub metadata: HashMap<String, String>,
+    pub window: Option<Window>,
+}
+
+impl FloatGauge {
+    /// A float gauge with no acquisition window. Add one with
+    /// [`with_window`](Self::with_window).
+    pub fn new(name: String, value: f64, metadata: HashMap<String, String>) -> Self {
+        Self {
+            name,
+            value,
+            metadata,
+            window: None,
+        }
+    }
+
+    /// Attach (or clear) the acquisition window.
+    pub fn with_window(mut self, window: Option<Window>) -> Self {
+        self.window = window;
+        self
+    }
+}
+
 /// Contains a snapshot of metric readings.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotV1 {
@@ -147,10 +209,13 @@ pub struct SnapshotV2 {
 
 // SnapshotV3, GroupSnapshot and GroupSchema deliberately do NOT follow the
 // `#[non_exhaustive]` + `new(..)`/`with_window(..)` convention used above for
-// Counter/Gauge/Histogram. Their arity is frozen the moment they ship (see
-// the arity note on SnapshotV3 and on the Snapshot enum below); advertising
-// room to grow via `#[non_exhaustive]` would be false. A future field means
-// a V4, not an addition here.
+// Counter/Gauge/Histogram. Their encoded arity is fixed for every value a
+// deployed decoder can read (see the arity note on SnapshotV3 and on the
+// Snapshot enum below). GroupSnapshot and GroupSchema have gained trailing
+// fields (`gauge_histograms`, `float_counters`, `float_gauges`) that are
+// left out when empty, so a value without them keeps the old arity and a
+// value with them is refused by older decoders; each such field is a
+// breaking change for code that builds these structs with a literal.
 
 /// One acquisition group's readings for one tick.
 ///
@@ -167,12 +232,13 @@ pub struct SnapshotV2 {
 /// increment does not change the schema, and the schema (hence its hash)
 /// changes only on true membership events.
 ///
-/// Serialization note: every field but the last is serialized
+/// Serialization note: the fields up to `histograms` are serialized
 /// unconditionally (an absent `Option` is msgpack nil). The untagged
 /// [`Snapshot`] enum tells versions apart by `SnapshotV3`'s own shape, which
-/// a group's arity does not change; `gauge_histograms` alone is left out
-/// when empty, so a group without one encodes as before (see its doc).
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+/// a group's arity does not change. `gauge_histograms`, `float_counters` and
+/// `float_gauges` are written up to the last non-empty one, so a group
+/// without them encodes as before (see `gauge_histograms`' doc).
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 pub struct GroupSnapshot {
     /// Stable group identity, `"<sampler>/<group>"` (e.g. `"cpu_usage/percpu"`).
     pub name: String,
@@ -205,14 +271,39 @@ pub struct GroupSnapshot {
     pub gauges: Vec<Option<i64>>,
     /// Counting histograms.
     pub histograms: Vec<Option<histogram::Histogram>>,
-    /// Gauge histograms: the last field, and left out of the encoding when
-    /// empty, so a group without one encodes as it did before the field
-    /// existed, and decoders from before it read it. One that holds a gauge
-    /// histogram is an array one element longer, which those decoders refuse
-    /// (no variant of the untagged [`Snapshot`] matching the snapshot that holds it) rather than read the state as counts.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Gauge histograms.
+    ///
+    /// This and the float fields after it were added after the struct
+    /// shipped. They are written up to the last non-empty one and the empty
+    /// ones after it are left out (see the `trailing` module), so a group
+    /// without them encodes as it did before they existed, and decoders from
+    /// before them read it. A group that holds one is a longer array, which
+    /// those decoders refuse (no variant of the untagged [`Snapshot`]
+    /// matching the snapshot that holds it) rather than read it as another
+    /// kind.
+    #[serde(default)]
     pub gauge_histograms: Vec<Option<histogram::Histogram>>,
+    /// Float counter values, aligned with the schema's `float_counters`.
+    #[serde(default)]
+    pub float_counters: Vec<Option<f64>>,
+    /// Float gauge values, aligned with the schema's `float_gauges`.
+    #[serde(default)]
+    pub float_gauges: Vec<Option<f64>>,
 }
+
+crate::trailing::serialize_with_trailing!(GroupSnapshot {
+    name,
+    schema_hash,
+    schema,
+    window,
+    counters,
+    gauges,
+    histograms,
+} trailing {
+    gauge_histograms,
+    float_counters,
+    float_gauges,
+});
 
 /// Errors a receiver can act on; the accessors on [`Snapshot`]
 /// (`counters()`/`gauges()`/`histograms()`) skip such groups silently
@@ -240,6 +331,8 @@ impl GroupSnapshot {
             || schema.gauges.len() != self.gauges.len()
             || schema.histograms.len() != self.histograms.len()
             || schema.gauge_histograms.len() != self.gauge_histograms.len()
+            || schema.float_counters.len() != self.float_counters.len()
+            || schema.float_gauges.len() != self.float_gauges.len()
         {
             return Err(GroupValidationError::ArityMismatch);
         }
@@ -306,9 +399,12 @@ pub struct SnapshotV3 {
 ///
 /// Once a version ships, its field count and order can never change:
 /// positional decoding means trailing extra fields make an untagged decode
-/// attempt fail rather than ignore them. Adding a field to `SnapshotV3` (or
-/// `GroupSnapshot`) is a breaking change for every deployed consumer —
-/// extensions require a new `V4` variant, not an edit to an existing one.
+/// attempt fail rather than ignore them. A field added to `SnapshotV3` (or
+/// `GroupSnapshot`) is refused by every deployed consumer whenever it is
+/// encoded. `GroupSnapshot`'s trailing fields (`gauge_histograms`,
+/// `float_counters`, `float_gauges`) are left out when empty, so a snapshot
+/// that does not use them still decodes there; one that does is refused,
+/// and the refusal cannot name the field.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum Snapshot {
@@ -345,6 +441,41 @@ fn canonical(list: Vec<Histogram>) -> Vec<Histogram> {
             Some(h)
         })
         .collect()
+}
+
+/// The scalars of one kind across V3 `groups`: `schema_of` picks the kind's
+/// descriptors, `values_of` its values, which are drained, and `entry`
+/// builds an entry from a name, value, metadata and the group's window. A
+/// group without a schema, or whose value count disagrees with it, is
+/// skipped, as [`Snapshot::counters`] skips it.
+fn expand_scalars<T, E>(
+    groups: &mut [GroupSnapshot],
+    schema_of: impl Fn(&GroupSchema) -> &Vec<crate::schema::MetricDesc>,
+    values_of: impl Fn(&mut GroupSnapshot) -> &mut Vec<Option<T>>,
+    entry: impl Fn(String, T, HashMap<String, String>, Option<Window>) -> E,
+) -> Vec<E> {
+    let mut out = Vec::new();
+    for g in groups {
+        let Some(schema) = g.schema.clone() else {
+            continue;
+        };
+        let descs = schema_of(&schema);
+        if descs.len() != values_of(g).len() {
+            continue;
+        }
+        let window = g.window;
+        let values = std::mem::take(values_of(g));
+        for (desc, value) in descs.iter().zip(values) {
+            let Some(value) = value else { continue };
+            let metadata = desc
+                .metadata
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            out.push(entry(desc.name.clone(), value, metadata, window));
+        }
+    }
+    out
 }
 
 /// The histograms of one kind across V3 `groups`: `schema_of` picks the
@@ -554,6 +685,40 @@ impl Snapshot {
         }
     }
 
+    /// The float counters: counters whose values are `f64`, read from each
+    /// V3 group's `float_counters` as [`counters`](Self::counters) reads
+    /// `counters`. Empty for a V1 or V2 snapshot.
+    pub fn float_counters(&mut self) -> Vec<FloatCounter> {
+        match self {
+            Snapshot::V1(_) | Snapshot::V2(_) => Vec::new(),
+            Snapshot::V3(s) => expand_scalars(
+                &mut s.groups,
+                |schema| &schema.float_counters,
+                |g| &mut g.float_counters,
+                |name, value, metadata, window| {
+                    FloatCounter::new(name, value, metadata).with_window(window)
+                },
+            ),
+        }
+    }
+
+    /// The float gauges: gauges whose values are `f64`, read from each V3
+    /// group's `float_gauges` as [`gauges`](Self::gauges) reads `gauges`.
+    /// Empty for a V1 or V2 snapshot.
+    pub fn float_gauges(&mut self) -> Vec<FloatGauge> {
+        match self {
+            Snapshot::V1(_) | Snapshot::V2(_) => Vec::new(),
+            Snapshot::V3(s) => expand_scalars(
+                &mut s.groups,
+                |schema| &schema.float_gauges,
+                |g| &mut g.float_gauges,
+                |name, value, metadata, window| {
+                    FloatGauge::new(name, value, metadata).with_window(window)
+                },
+            ),
+        }
+    }
+
     #[cfg(feature = "json")]
     pub fn to_json<T>(val: &T) -> Result<Vec<u8>, JsonError>
     where
@@ -658,6 +823,8 @@ mod v3_tests {
             gauges: vec![],
             histograms: vec![],
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         };
         let schema_hash = schema.hash();
         SnapshotV3 {
@@ -673,6 +840,8 @@ mod v3_tests {
                 gauges: vec![],
                 histograms: vec![],
                 gauge_histograms: Vec::new(),
+                float_counters: Vec::new(),
+                float_gauges: Vec::new(),
             }],
         }
     }
@@ -732,6 +901,8 @@ mod v3_tests {
             gauges: vec![],
             histograms: vec![],
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         };
         let group = GroupSnapshot {
             name: "cpu_usage/percpu".to_string(),
@@ -742,6 +913,8 @@ mod v3_tests {
             gauges: vec![],
             histograms: vec![],
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         };
         let s = SnapshotV3 {
             systemtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
@@ -783,6 +956,8 @@ mod v3_tests {
             gauges: vec![],
             histograms: vec![],
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         };
         let schema_hash = schema.hash();
         let counters = vec![Some(7), None];
@@ -796,6 +971,8 @@ mod v3_tests {
             gauges: vec![],
             histograms: vec![],
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         };
 
         let owned_form = GroupSnapshotOwnedSchema {
@@ -1030,6 +1207,8 @@ mod v3_tests {
             gauges: vec![],
             histograms: vec![],
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         };
         let b = a.clone();
         assert_eq!(a.hash(), b.hash(), "identical schemas hash identically");
@@ -1080,12 +1259,16 @@ mod v3_tests {
                 gauges: vec![desc("9", "memory_free")],
                 histograms: vec![],
                 gauge_histograms: Vec::new(),
+                float_counters: Vec::new(),
+                float_gauges: Vec::new(),
             })),
             window: None,
             counters: vec![],
             gauges: vec![Some(-5)],
             histograms: vec![],
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         });
         s
     }
@@ -1151,12 +1334,16 @@ mod v3_tests {
                 gauges: vec![],
                 histograms: vec![],
                 gauge_histograms: Vec::new(),
+                float_counters: Vec::new(),
+                float_gauges: Vec::new(),
             })),
             window: None,
             counters: vec![Some(1)], // one slot short of the schema's two
             gauges: vec![],
             histograms: vec![],
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         };
         let mut s = v3();
         s.groups.insert(0, malformed);
@@ -1175,6 +1362,8 @@ mod v3_tests {
             gauges: vec![],
             histograms: vec![],
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         };
         let good = GroupSnapshot {
             name: "cpu_usage/percpu".to_string(),
@@ -1185,6 +1374,8 @@ mod v3_tests {
             gauges: vec![],
             histograms: vec![],
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         };
         assert_eq!(good.validate(), Ok(()));
 
@@ -1261,6 +1452,8 @@ mod v3_tests {
                 .into(),
             }],
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         };
         let group = GroupSnapshot {
             name: "hist/group".to_string(),
@@ -1271,6 +1464,8 @@ mod v3_tests {
             gauges: vec![],
             histograms: vec![Some(embedded)],
             gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
         };
         let s = SnapshotV3 {
             systemtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),

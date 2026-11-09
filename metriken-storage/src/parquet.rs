@@ -9,7 +9,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use arrow::array::{Int64Array, ListArray, UInt64Array};
+use arrow::array::{Float64Array, Int64Array, ListArray, UInt64Array};
 use arrow::datatypes::DataType;
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::{
@@ -25,7 +25,9 @@ use crate::histogram_stream::{HistKind, HistogramRow, HistogramStream, Histogram
 use crate::labeled;
 use crate::labels::Labels;
 
-use crate::types::{Counter, Counters, Gauge, Gauges, HistogramSnapshot};
+use crate::types::{
+    Counter, CounterValues, Counters, Gauge, GaugeValues, Gauges, HistogramSnapshot,
+};
 use crate::DataSource;
 
 /// An already-open source handed to `metriken_query::ParquetBuilder::source_labeled`.
@@ -574,18 +576,43 @@ impl MultiParquetSource {
         out
     }
 
-    /// `(name, labels)` for every counter column, in RAW SCHEMA order —
-    /// unlike [`counter_labels`](Self::counter_labels), this does not sort
-    /// or dedupe. Footer-only: one pass over the schema, no row-group
-    /// decode. Used by [`SegmentedSource`](crate::segmented::SegmentedSource) to build an
+    /// `(name, labels)` for every integer counter column, in RAW SCHEMA
+    /// order — unlike [`counter_labels`](Self::counter_labels), this does
+    /// not sort or dedupe, and leaves out float counter columns
+    /// ([`float_counter_columns`](Self::float_counter_columns)).
+    /// Footer-only: one pass over the schema, no row-group decode. Used by
+    /// [`SegmentedSource`](crate::segmented::SegmentedSource) to build an
     /// open-time identity index that preserves "first appearance across
     /// segments" splicing order without re-scanning the schema per metric
     /// name.
     pub fn counter_columns(&self) -> Vec<(String, Labels)> {
+        self.columns_where(|k| matches!(k, ColKind::Counter))
+    }
+
+    /// Gauge twin of [`counter_columns`](Self::counter_columns).
+    pub fn gauge_columns(&self) -> Vec<(String, Labels)> {
+        self.columns_where(|k| matches!(k, ColKind::Gauge))
+    }
+
+    /// [`counter_columns`](Self::counter_columns) for the float counter
+    /// columns.
+    pub fn float_counter_columns(&self) -> Vec<(String, Labels)> {
+        self.columns_where(|k| matches!(k, ColKind::FloatCounter))
+    }
+
+    /// [`counter_columns`](Self::counter_columns) for the float gauge
+    /// columns.
+    pub fn float_gauge_columns(&self) -> Vec<(String, Labels)> {
+        self.columns_where(|k| matches!(k, ColKind::FloatGauge))
+    }
+
+    /// `(name, labels)` of every column whose kind satisfies `want`, in
+    /// schema order, with each child's injected labels.
+    fn columns_where(&self, want: impl Fn(&ColKind) -> bool) -> Vec<(String, Labels)> {
         let mut out = Vec::new();
         for (pf, extra) in &self.files {
             for col in pf.columns_desc() {
-                if matches!(col.kind, ColKind::Counter) {
+                if want(&col.kind) {
                     let mut labels = col.labels;
                     labeled::add_labels(&mut labels, extra);
                     out.push((col.name, labels));
@@ -595,19 +622,25 @@ impl MultiParquetSource {
         out
     }
 
-    /// Gauge twin of [`counter_columns`](Self::counter_columns).
-    pub fn gauge_columns(&self) -> Vec<(String, Labels)> {
-        let mut out = Vec::new();
-        for (pf, extra) in &self.files {
+    /// The names of the metrics held in integer counter or gauge columns
+    /// (`float` false), or in float ones (`float` true): what a segment's
+    /// names index records per kind (`crate::names`).
+    #[cfg_attr(not(feature = "archive"), allow(dead_code))]
+    pub(crate) fn scalar_names(&self, counter: bool, float: bool) -> Vec<String> {
+        let mut names = std::collections::BTreeSet::new();
+        for (pf, _) in &self.files {
             for col in pf.columns_desc() {
-                if matches!(col.kind, ColKind::Gauge) {
-                    let mut labels = col.labels;
-                    labeled::add_labels(&mut labels, extra);
-                    out.push((col.name, labels));
+                let kind = if counter {
+                    col.kind.is_counter()
+                } else {
+                    col.kind.is_gauge()
+                };
+                if kind && col.kind.is_float() == float {
+                    names.insert(col.name);
                 }
             }
         }
-        out
+        names.into_iter().collect()
     }
 
     /// Histogram twin of [`counter_columns`](Self::counter_columns).
@@ -972,11 +1005,11 @@ impl DataSource for FileSource {
     }
 
     fn counter_names(&self) -> Vec<String> {
-        self.0.names_of(|k| matches!(k, ColKind::Counter))
+        self.0.names_of(ColKind::is_counter)
     }
 
     fn gauge_names(&self) -> Vec<String> {
-        self.0.names_of(|k| matches!(k, ColKind::Gauge))
+        self.0.names_of(ColKind::is_gauge)
     }
 
     fn histogram_names(&self) -> Vec<String> {
@@ -989,11 +1022,11 @@ impl DataSource for FileSource {
     }
 
     fn counter_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
-        self.0.labels_of(name, |k| matches!(k, ColKind::Counter))
+        self.0.labels_of(name, ColKind::is_counter)
     }
 
     fn gauge_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
-        self.0.labels_of(name, |k| matches!(k, ColKind::Gauge))
+        self.0.labels_of(name, ColKind::is_gauge)
     }
 
     fn histogram_labels(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
@@ -1063,7 +1096,7 @@ impl DataSource for FileSource {
         self.0
             .columns()
             .iter()
-            .filter(|c| matches!(c.kind, ColKind::Counter))
+            .filter(|c| c.kind.is_counter())
             .map(|c| crate::CounterColumnRef {
                 name: c.name.clone(),
                 labels: c.labels.clone(),
@@ -1075,6 +1108,7 @@ impl DataSource for FileSource {
                     holds_values: self
                         .0
                         .column_holds_values(leaves.get(c.col_idx).copied().flatten()),
+                    float: c.kind.is_float(),
                 },
             })
             .collect()
@@ -1701,6 +1735,12 @@ fn rg_classify(rg: &RowGroupMetaData, ts_col_idx: usize, start_ns: u64, end_ns: 
 enum ColKind {
     Counter,
     Gauge,
+    /// A `Float64` column whose `metric_type` is `counter`: a counter whose
+    /// values are `f64`. Listed and read as a counter.
+    FloatCounter,
+    /// A `Float64` column whose `metric_type` is `gauge`. Listed and read as
+    /// a gauge.
+    FloatGauge,
     Histogram {
         grouping_power: u8,
         max_value_power: u8,
@@ -1714,6 +1754,22 @@ enum ColKind {
 }
 
 impl ColKind {
+    /// Whether this is a counter column, integer or float: what the
+    /// counter listings and reads take.
+    fn is_counter(&self) -> bool {
+        matches!(self, ColKind::Counter | ColKind::FloatCounter)
+    }
+
+    /// Whether this is a gauge column, integer or float.
+    fn is_gauge(&self) -> bool {
+        matches!(self, ColKind::Gauge | ColKind::FloatGauge)
+    }
+
+    /// Whether the column's values are `f64`.
+    fn is_float(&self) -> bool {
+        matches!(self, ColKind::FloatCounter | ColKind::FloatGauge)
+    }
+
     /// The bucket configuration, when this is a histogram of `kind`.
     fn histogram(&self, kind: HistKind) -> Option<(u8, u8)> {
         match (self, kind) {
@@ -1866,6 +1922,17 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
             let kind = match field.data_type() {
                 DataType::UInt64 => ColKind::Counter,
                 DataType::Int64 => ColKind::Gauge,
+                // A float scalar, in a format 3 segment, which readers that
+                // do not know it refuse (`format.rs`). Its `metric_type`,
+                // which the writers stamp, says counter or gauge; a Float64
+                // column of any other `metric_type`, or none, is not read.
+                DataType::Float64 => {
+                    match meta.get(metriken_model::METRIC_TYPE).map(String::as_str) {
+                        Some("counter") => ColKind::FloatCounter,
+                        Some("gauge") => ColKind::FloatGauge,
+                        _ => return None,
+                    }
+                }
                 DataType::List(inner) if inner.data_type() == &DataType::UInt64 => {
                     let (Some(gp), Some(mvp)) = (grouping_power, max_value_power) else {
                         return None;
@@ -2341,6 +2408,84 @@ fn read_gauge_values_per_rg(
     Ok(result)
 }
 
+/// A float counter or gauge column's values in one row group, nulls kept
+/// for row alignment, as [`read_gauge_values_per_rg`] reads an integer
+/// gauge's. Cached in the pool as a derived block.
+fn read_float_values_per_rg(
+    pf: &ParquetSource,
+    rg_idx: usize,
+    col_idx: usize,
+) -> Result<Arc<Vec<Option<f64>>>, Box<dyn Error>> {
+    let key = CacheKey {
+        source_id: pf.id,
+        column_idx: col_idx,
+        row_group_idx: rg_idx,
+    };
+
+    if let Some(pool) = &pf.pool {
+        if let Some(cached) = pool.get_derived::<Vec<Option<f64>>>(key) {
+            return Ok(cached);
+        }
+    }
+
+    let parquet_schema = pf.meta.metadata().file_metadata().schema_descr_ptr();
+    let reader =
+        pf.build_batch_reader(rg_idx, ProjectionMask::roots(&parquet_schema, [col_idx]))?;
+    let decode_result: Result<Result<Vec<Option<f64>>, Box<dyn Error>>, String> =
+        catch_decode_panic(|| {
+            let mut out = Vec::new();
+            reserve_rows(&mut out, pf.meta.metadata().row_group(rg_idx).num_rows());
+            for batch_result in reader {
+                let batch = match batch_result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            rg_idx,
+                            col_idx,
+                            source_id = pf.id,
+                            error = %e,
+                            "aborting float read on parquet error",
+                        );
+                        break;
+                    }
+                };
+                let arr = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or::<Box<dyn Error>>("float column is not Float64".into())?;
+                out.extend(arr.iter());
+            }
+            Ok(out)
+        });
+    let mut out = match decode_result {
+        Ok(inner) => inner?,
+        Err(panic_msg) => {
+            tracing::error!(
+                rg_idx,
+                col_idx,
+                source_id = pf.id,
+                panic = %panic_msg,
+                "parquet decode panic reading a float column",
+            );
+            return Err(format!(
+                "parquet decode panic reading a float column (rg={rg_idx}, col={col_idx}): \
+                 {panic_msg}"
+            )
+            .into());
+        }
+    };
+    out.shrink_to_fit();
+    let size = out.len() * std::mem::size_of::<Option<f64>>();
+    let result = Arc::new(out);
+
+    if let Some(pool) = &pf.pool {
+        pool.put_derived(key, Arc::clone(&result), size);
+    }
+
+    Ok(result)
+}
+
 // ─── Counter reader ───────────────────────────────────────────────────────────
 
 /// Resolve one row's acquisition window, `base` being the raw row timestamp.
@@ -2452,6 +2597,57 @@ impl RowSource {
         }
     }
 
+    fn f64s(
+        &self,
+        pf: &ParquetSource,
+        rg_idx: usize,
+        col: usize,
+    ) -> Result<Arc<Vec<Option<f64>>>, Box<dyn Error>> {
+        match self {
+            RowSource::Full => read_float_values_per_rg(pf, rg_idx, col),
+            RowSource::Selected(cols) => {
+                let a = cols.get(&col).ok_or("column not in the pruned read")?;
+                let a = a
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or("column is not Float64")?;
+                Ok(Arc::new(a.iter().collect()))
+            }
+        }
+    }
+
+    /// A counter column's values in one row group: `u64`, or `f64` for a
+    /// float counter.
+    fn counter_values(
+        &self,
+        pf: &ParquetSource,
+        rg_idx: usize,
+        col: usize,
+        float: bool,
+    ) -> Result<RgValues, Box<dyn Error>> {
+        Ok(if float {
+            RgValues::Float(self.f64s(pf, rg_idx, col)?)
+        } else {
+            RgValues::Unsigned(self.u64s(pf, rg_idx, col)?)
+        })
+    }
+
+    /// A gauge column's values in one row group: `i64`, or `f64` for a
+    /// float gauge.
+    fn gauge_values(
+        &self,
+        pf: &ParquetSource,
+        rg_idx: usize,
+        col: usize,
+        float: bool,
+    ) -> Result<RgValues, Box<dyn Error>> {
+        Ok(if float {
+            RgValues::Float(self.f64s(pf, rg_idx, col)?)
+        } else {
+            RgValues::Signed(self.i64s(pf, rg_idx, col)?)
+        })
+    }
+
     /// The row group's `occupant` column, when a group routes by occupant.
     fn occupants(
         &self,
@@ -2466,6 +2662,52 @@ impl RowSource {
         {
             Some(c) => Ok(Some(self.u64s(pf, rg_idx, c)?)),
             None => Ok(None),
+        }
+    }
+}
+
+/// One value column of one row group, nulls kept for row alignment.
+enum RgValues {
+    Unsigned(Arc<Vec<Option<u64>>>),
+    Signed(Arc<Vec<Option<i64>>>),
+    Float(Arc<Vec<Option<f64>>>),
+}
+
+impl RgValues {
+    fn len(&self) -> usize {
+        match self {
+            RgValues::Unsigned(v) => v.len(),
+            RgValues::Signed(v) => v.len(),
+            RgValues::Float(v) => v.len(),
+        }
+    }
+
+    /// Whether row `row` holds a value.
+    fn present(&self, row: usize) -> bool {
+        match self {
+            RgValues::Unsigned(v) => matches!(v.get(row), Some(Some(_))),
+            RgValues::Signed(v) => matches!(v.get(row), Some(Some(_))),
+            RgValues::Float(v) => matches!(v.get(row), Some(Some(_))),
+        }
+    }
+
+    /// Append row `row`'s value, which [`present`](Self::present) says
+    /// is there, to a counter series.
+    fn push_counter(&self, row: usize, to: &mut CounterValues) {
+        match self {
+            RgValues::Unsigned(v) => to.push_int(v[row].expect("present")),
+            RgValues::Float(v) => to.push_float(v[row].expect("present")),
+            RgValues::Signed(_) => unreachable!("a counter column is never Int64"),
+        }
+    }
+
+    /// Append row `row`'s value, which [`present`](Self::present) says
+    /// is there, to a gauge series.
+    fn push_gauge(&self, row: usize, to: &mut GaugeValues) {
+        match self {
+            RgValues::Signed(v) => to.push_int(v[row].expect("present")),
+            RgValues::Float(v) => to.push_float(v[row].expect("present")),
+            RgValues::Unsigned(_) => unreachable!("a gauge column is never UInt64"),
         }
     }
 }
@@ -2501,6 +2743,8 @@ fn group_columns(groups: &[ReadGroup]) -> Vec<Option<usize>> {
 /// routed, rather than every series scanning every row.
 struct ReadGroup {
     col_idx: usize,
+    /// Whether the column's values are `f64`.
+    float: bool,
     begin_col: Option<usize>,
     width_col: Option<usize>,
     /// The series, when the column is one.
@@ -2533,6 +2777,7 @@ fn plan_reads(pf: &ParquetSource, cols: &[ColDesc]) -> Vec<ReadGroup> {
         let g = *at.entry(c.col_idx).or_insert_with(|| {
             groups.push(ReadGroup {
                 col_idx: c.col_idx,
+                float: c.kind.is_float(),
                 begin_col: c.begin_col,
                 width_col: c.width_col,
                 single: None,
@@ -2564,8 +2809,21 @@ fn read_counter_column(
     let begin_col = at.begin_col.map(|i| i as usize);
     let width_col = at.width_col.map(|i| i as usize);
     let num_rgs = pf.meta.metadata().num_row_groups();
+    // The column's own type decides how its values read, whatever the
+    // position says.
+    let float = pf
+        .meta
+        .schema()
+        .fields()
+        .get(col_idx)
+        .map(|f| f.data_type())
+        == Some(&DataType::Float64);
     let mut timestamps: Vec<u64> = Vec::new();
-    let mut values: Vec<u64> = Vec::new();
+    let mut values = if float {
+        CounterValues::Float(Vec::new())
+    } else {
+        CounterValues::Int(Vec::new())
+    };
     let windowed = (begin_col.is_some() && width_col.is_some()) || dur_col_idx.is_some();
     let mut windows: Option<Vec<(u64, u64)>> = windowed.then(Vec::new);
 
@@ -2598,7 +2856,7 @@ fn read_counter_column(
             None => RowSource::Full,
         };
         let ts = src.timestamps(pf, rg_idx, ts_col_idx)?;
-        let vals = src.u64s(pf, rg_idx, col_idx)?;
+        let vals = src.counter_values(pf, rg_idx, col_idx, float)?;
         let rows: Box<dyn Iterator<Item = usize>> = match (&src, at.occupant) {
             (RowSource::Selected(_), Some(occ)) => {
                 let col = pf.occupant_col().ok_or("not a long segment")?;
@@ -2621,15 +2879,18 @@ fn read_counter_column(
         let begins = begin_col.map(|c| src.i64s(pf, rg_idx, c)).transpose()?;
         let widths = width_col.map(|c| src.u64s(pf, rg_idx, c)).transpose()?;
         for row in rows {
-            let (Some(Some(base)), Some(Some(v))) = (ts.get(row), vals.get(row)) else {
+            let Some(Some(base)) = ts.get(row) else {
                 continue;
             };
+            if !vals.present(row) {
+                continue;
+            }
             let base = *base;
             if base < start_ns || base > end_ns {
                 continue;
             }
             timestamps.push(base);
-            values.push(*v);
+            vals.push_counter(row, &mut values);
             if let Some(w) = windows.as_mut() {
                 let bo = begins.as_ref().and_then(|b| b.get(row).copied()).flatten();
                 let wd = widths.as_ref().and_then(|x| x.get(row).copied()).flatten();
@@ -2680,6 +2941,17 @@ impl BatchColumns {
     ) -> Option<&'b Int64Array> {
         let at = self.cols.binary_search(&col).ok()?;
         batch.column(at).as_any().downcast_ref::<Int64Array>()
+    }
+
+    /// Column `col` (a schema index) of `batch` as `Float64`: a float
+    /// counter or gauge, for which [`u64s`](Self::u64s) is `None`.
+    pub fn f64s<'b>(
+        &self,
+        batch: &'b arrow::record_batch::RecordBatch,
+        col: usize,
+    ) -> Option<&'b Float64Array> {
+        let at = self.cols.binary_search(&col).ok()?;
+        batch.column(at).as_any().downcast_ref::<Float64Array>()
     }
 }
 
@@ -2768,7 +3040,7 @@ fn read_counters(
         .columns()
         .iter()
         .filter(|c| {
-            matches!(c.kind, ColKind::Counter)
+            c.kind.is_counter()
                 && c.name == name
                 && (filter.inner.is_empty() || c.labels.matches(filter))
         })
@@ -2781,7 +3053,13 @@ fn read_counters(
     let wanted = wanted_occupants(&groups);
 
     let mut ts_acc: Vec<Vec<u64>> = vec![Vec::new(); cols.len()];
-    let mut val_acc: Vec<Vec<u64>> = vec![Vec::new(); cols.len()];
+    let mut val_acc: Vec<CounterValues> = cols
+        .iter()
+        .map(|c| match c.kind {
+            ColKind::FloatCounter => CounterValues::Float(Vec::new()),
+            _ => CounterValues::Int(Vec::new()),
+        })
+        .collect();
     // Reconstruct windows when a metric carries sidecars OR a duration column
     // exists to synthesize the fleet fallback.
     let mut win_acc: Vec<Option<Vec<(u64, u64)>>> = cols
@@ -2823,7 +3101,7 @@ fn read_counters(
         let durations = dur_col_idx.map(|c| src.u64s(pf, rg_idx, c)).transpose()?;
         let occupants = src.occupants(pf, rg_idx, &groups)?;
         for g in &groups {
-            let values = src.u64s(pf, rg_idx, g.col_idx)?;
+            let values = src.counter_values(pf, rg_idx, g.col_idx, g.float)?;
             debug_assert_eq!(
                 values.len(),
                 timestamps.len(),
@@ -2831,8 +3109,8 @@ fn read_counters(
             );
             let begins = g.begin_col.map(|c| src.i64s(pf, rg_idx, c)).transpose()?;
             let widths = g.width_col.map(|c| src.u64s(pf, rg_idx, c)).transpose()?;
-            for (row, (ts_opt, val_opt)) in timestamps.iter().zip(values.iter()).enumerate() {
-                if let (Some(ts), Some(v)) = (ts_opt, val_opt) {
+            for (row, ts_opt) in timestamps.iter().enumerate() {
+                if let (Some(ts), true) = (ts_opt, values.present(row)) {
                     let base = *ts;
                     if base >= start_ns && base <= end_ns {
                         let Some(i) = g.series(occupants.as_ref().map(|o| o.as_slice()), row)
@@ -2844,7 +3122,7 @@ fn read_counters(
                         // layer (see `Placement`), but there is no longer a
                         // second, rounded timestamp for it to choose between.
                         ts_acc[i].push(base);
-                        val_acc[i].push(*v);
+                        values.push_counter(row, &mut val_acc[i]);
                         if let Some(w) = win_acc[i].as_mut() {
                             let bo = begins.as_ref().and_then(|b| b.get(row).copied()).flatten();
                             let wd = widths.as_ref().and_then(|x| x.get(row).copied()).flatten();
@@ -2899,7 +3177,7 @@ fn read_gauges(
         .columns()
         .iter()
         .filter(|c| {
-            matches!(c.kind, ColKind::Gauge)
+            c.kind.is_gauge()
                 && c.name == name
                 && (filter.inner.is_empty() || c.labels.matches(filter))
         })
@@ -2912,7 +3190,13 @@ fn read_gauges(
     let wanted = wanted_occupants(&groups);
 
     let mut ts_acc: Vec<Vec<u64>> = vec![Vec::new(); cols.len()];
-    let mut val_acc: Vec<Vec<i64>> = vec![Vec::new(); cols.len()];
+    let mut val_acc: Vec<GaugeValues> = cols
+        .iter()
+        .map(|c| match c.kind {
+            ColKind::FloatGauge => GaugeValues::Float(Vec::new()),
+            _ => GaugeValues::Int(Vec::new()),
+        })
+        .collect();
     let mut win_acc: Vec<Option<Vec<(u64, u64)>>> = cols
         .iter()
         .map(|c| {
@@ -2948,7 +3232,7 @@ fn read_gauges(
         let durations = dur_col_idx.map(|c| src.u64s(pf, rg_idx, c)).transpose()?;
         let occupants = src.occupants(pf, rg_idx, &groups)?;
         for g in &groups {
-            let values = src.i64s(pf, rg_idx, g.col_idx)?;
+            let values = src.gauge_values(pf, rg_idx, g.col_idx, g.float)?;
             debug_assert_eq!(
                 values.len(),
                 timestamps.len(),
@@ -2956,8 +3240,8 @@ fn read_gauges(
             );
             let begins = g.begin_col.map(|c| src.i64s(pf, rg_idx, c)).transpose()?;
             let widths = g.width_col.map(|c| src.u64s(pf, rg_idx, c)).transpose()?;
-            for (row, (ts_opt, val_opt)) in timestamps.iter().zip(values.iter()).enumerate() {
-                if let (Some(ts), Some(v)) = (ts_opt, val_opt) {
+            for (row, ts_opt) in timestamps.iter().enumerate() {
+                if let (Some(ts), true) = (ts_opt, values.present(row)) {
                     let base = *ts;
                     if base >= start_ns && base <= end_ns {
                         let Some(i) = g.series(occupants.as_ref().map(|o| o.as_slice()), row)
@@ -2969,7 +3253,7 @@ fn read_gauges(
                         // layer (see `Placement`), but there is no longer a
                         // second, rounded timestamp for it to choose between.
                         ts_acc[i].push(base);
-                        val_acc[i].push(*v);
+                        values.push_gauge(row, &mut val_acc[i]);
                         if let Some(w) = win_acc[i].as_mut() {
                             let bo = begins.as_ref().and_then(|b| b.get(row).copied()).flatten();
                             let wd = widths.as_ref().and_then(|x| x.get(row).copied()).flatten();
@@ -3636,7 +3920,7 @@ mod interval_tests {
             Counter {
                 labels: Labels::default(),
                 timestamps: vec![0, interval_ms * 1_000_000],
-                values: vec![0, 1],
+                values: vec![0, 1].into(),
                 windows: None,
             },
         );
@@ -3721,7 +4005,7 @@ mod interval_tests {
             Counter {
                 labels: pairs(&[("job", "a")]),
                 timestamps: vec![0, 1_000_000_000],
-                values: vec![0, 1],
+                values: vec![0, 1].into(),
                 windows: None,
             },
         );
@@ -3758,7 +4042,7 @@ mod interval_tests {
             crate::types::Gauge {
                 labels: pairs(&[("job", "a")]),
                 timestamps: vec![0],
-                values: vec![1],
+                values: vec![1].into(),
                 windows: None,
             },
         );
@@ -3797,7 +4081,7 @@ mod interval_tests {
                 Counter {
                     labels: pairs(&[("job", job)]),
                     timestamps: vec![0],
-                    values: vec![0],
+                    values: vec![0].into(),
                     windows: None,
                 },
             );

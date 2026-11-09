@@ -59,6 +59,8 @@ fn group(stream: &str, ts: u64, first: bool) -> GroupSnapshot {
         }],
         histograms: Vec::new(),
         gauge_histograms: Vec::new(),
+        float_counters: Vec::new(),
+        float_gauges: Vec::new(),
     };
     GroupSnapshot {
         name: stream.to_string(),
@@ -69,6 +71,8 @@ fn group(stream: &str, ts: u64, first: bool) -> GroupSnapshot {
         gauges: vec![Some((ts / MS) as i64)],
         histograms: Vec::new(),
         gauge_histograms: Vec::new(),
+        float_counters: Vec::new(),
+        float_gauges: Vec::new(),
     }
 }
 

@@ -704,7 +704,10 @@ fn recording_selectors(recordings: &[Vec<&SamplerReader>], labels: &SeriesLabels
 }
 
 /// Refuse a query naming a metric that is a counter in one recording it
-/// reaches and a gauge (or a histogram) in another.
+/// reaches and a gauge (or a histogram) in another. A float counter column
+/// is a counter here and a float gauge column a gauge, so a recording that
+/// stored a metric as integers and one that stored it as floats are read
+/// together.
 ///
 /// Each function reads one kind: `rate(x[1m])` reads counters, a bare `x`
 /// gauges. Over such recordings it would read the series of the
@@ -2899,7 +2902,7 @@ mod tests {
             metriken_storage::types::Counter {
                 labels: metriken_storage::Labels::default(),
                 timestamps: vec![S, 2 * S, 3 * S],
-                values: vec![1, 2, 3],
+                values: vec![1, 2, 3].into(),
                 windows: None,
             },
         );

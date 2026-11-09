@@ -749,7 +749,7 @@ mod tests {
                 Counter {
                     labels: labels(own),
                     timestamps: vec![1_000_000_000],
-                    values: vec![1],
+                    values: vec![1].into(),
                     windows: None,
                 },
             );
@@ -878,7 +878,7 @@ mod tests {
                 .map(|labels| Counter {
                     labels,
                     timestamps: vec![1],
-                    values: vec![1],
+                    values: vec![1].into(),
                     windows: None,
                 })
                 .collect();

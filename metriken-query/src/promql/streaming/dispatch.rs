@@ -391,7 +391,7 @@ fn batch_rates<'a>(
     else {
         return None;
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fixtures"))]
     BATCH_RATES.with(|n| n.set(n.get() + 1));
     let series = results
         .into_iter()
@@ -600,6 +600,10 @@ fn grid_request<'c, 'g>(
 thread_local! {
     /// Display queries [`batch_display`] answered on this thread.
     pub(crate) static BATCH_DISPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+thread_local! {
     /// Queries [`batch_rates`] answered on this thread.
     pub(crate) static BATCH_RATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -1332,13 +1336,7 @@ where
                 gauges
                     .series
                     .into_iter()
-                    .map(|g| {
-                        (
-                            g.labels,
-                            g.timestamps,
-                            g.values.iter().map(|v| *v as f64).collect(),
-                        )
-                    })
+                    .map(|g| (g.labels, g.timestamps, g.values.to_f64()))
                     .collect()
             } else if let Some(counters) =
                 ctx.source
@@ -1347,13 +1345,7 @@ where
                 counters
                     .series
                     .into_iter()
-                    .map(|c| {
-                        (
-                            c.labels,
-                            c.timestamps,
-                            c.values.iter().map(|v| *v as f64).collect(),
-                        )
-                    })
+                    .map(|c| (c.labels, c.timestamps, c.values.to_f64()))
                     .collect()
             } else {
                 // Nothing matched: empty, unless the source holds the name

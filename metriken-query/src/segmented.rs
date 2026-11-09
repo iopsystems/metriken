@@ -2644,7 +2644,14 @@ pub(crate) mod tests {
                     .timestamps
                     .iter()
                     .copied()
-                    .zip(series.values.iter().copied())
+                    .zip(
+                        series
+                            .values
+                            .as_int()
+                            .expect("an integer counter")
+                            .iter()
+                            .map(|v| metriken_storage::CounterValue::Int(*v))
+                    )
                     .collect::<Vec<_>>(),
                 "{:?}",
                 series.labels
