@@ -619,7 +619,8 @@ impl GroupTableBuilder {
     /// [`push_row_with_gauge_histograms`](Self::push_row_with_gauge_histograms),
     /// and float counters and gauges, aligned with `schema.float_counters`
     /// and `schema.float_gauges`, each a `Float64` column whose
-    /// `metric_type` is `counter` or `gauge`.
+    /// `metric_type` is `counter` or `gauge`. A NaN or infinite float value
+    /// is stored as absent.
     pub fn push_group_row(
         &mut self,
         ts: u64,
@@ -659,14 +660,14 @@ impl GroupTableBuilder {
             let col = self.get_or_create(desc, "counter", Values::FloatCounter(Vec::new()));
             Self::pad(col, row);
             if let Values::FloatCounter(vs) = &mut col.values {
-                vs.push(*v);
+                vs.push(v.filter(|x| x.is_finite()));
             }
         }
         for (desc, v) in schema.float_gauges.iter().zip(float_gauges) {
             let col = self.get_or_create(desc, "gauge", Values::FloatGauge(Vec::new()));
             Self::pad(col, row);
             if let Values::FloatGauge(vs) = &mut col.values {
-                vs.push(*v);
+                vs.push(v.filter(|x| x.is_finite()));
             }
         }
         self.push_histograms(

@@ -117,7 +117,9 @@ macro_rules! scalar_values {
             /// variant; an integer and a float series (one series stored
             /// as an integer column in some segments and a float column in
             /// others) become `Float`, each integer converted as
-            /// [`to_f64`](Self::to_f64) converts it.
+            /// [`to_f64`](Self::to_f64) converts it. So a series that turns
+            /// float loses exactness for its integer readings above 2^53,
+            /// in any range that holds both.
             pub fn extend(&mut self, other: Self) {
                 match (&mut *self, other) {
                     ($ty::Int(a), $ty::Int(b)) => a.extend(b),

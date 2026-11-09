@@ -16,7 +16,8 @@ use crate::types::{CounterSample, CounterValue};
 /// decrease is a reset: the counter started again from zero, so `cur` is
 /// the increase. Two integer readings difference exactly in `u64`; a float
 /// reading on either side differences in `f64`, where any decrease, however
-/// small, is a reset.
+/// small, is a reset, and an integer reading above 2^53 is rounded (a
+/// series that turns float, read across the change).
 pub(crate) fn counter_increase(prev: CounterValue, cur: CounterValue) -> f64 {
     match (prev, cur) {
         (CounterValue::Int(p), CounterValue::Int(c)) => {

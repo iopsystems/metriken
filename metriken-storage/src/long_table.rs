@@ -174,8 +174,9 @@ impl LongTableBuilder {
                 for (desc, v) in descs.iter().zip(values) {
                     let col = self.column(desc, kind, LongValues::Float(Vec::new()));
                     col.pad(row);
+                    // A NaN or infinite value is stored as absent.
                     if let LongValues::Float(vs) = &mut col.values {
-                        vs.push(*v);
+                        vs.push(v.filter(|x| x.is_finite()));
                     }
                 }
             }

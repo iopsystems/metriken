@@ -138,9 +138,13 @@ impl Memory {
     /// Append a float counter sample, as
     /// [`upsert_counter_sample`](Self::upsert_counter_sample) appends an
     /// integer one. An integer series it is appended to becomes a float
-    /// series (`CounterValues::push_float`).
+    /// series (`CounterValues::push_float`). A NaN or infinite value is
+    /// dropped.
     #[cfg(feature = "ingest")]
     pub fn upsert_float_counter_sample(&mut self, name: &str, labels: Labels, ts: u64, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
         let series = self.counters.entry(name.to_string()).or_default();
         if let Some(c) = series.iter_mut().find(|c| c.labels == labels) {
             c.timestamps.push(ts);
@@ -157,9 +161,13 @@ impl Memory {
 
     /// Append a float gauge sample, as
     /// [`upsert_gauge_sample`](Self::upsert_gauge_sample) appends an integer
-    /// one. An integer series it is appended to becomes a float series.
+    /// one. An integer series it is appended to becomes a float series. A
+    /// NaN or infinite value is dropped.
     #[cfg(feature = "ingest")]
     pub fn upsert_float_gauge_sample(&mut self, name: &str, labels: Labels, ts: u64, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
         let series = self.gauges.entry(name.to_string()).or_default();
         if let Some(g) = series.iter_mut().find(|g| g.labels == labels) {
             g.timestamps.push(ts);

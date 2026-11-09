@@ -136,8 +136,8 @@ fn check_up_to(kv: Option<&Vec<KeyValue>>, newest: u32) -> Result<(), FormatErro
 }
 
 /// `props` with [`FORMAT_KEY`] = 1 added to its key-value metadata, keeping
-/// any the caller set: for a file with no gauge histogram column. A segment
-/// writer stamps [`stamped_for`] its schema instead.
+/// any the caller set: for a file with no gauge histogram or float column. A
+/// segment writer stamps [`stamped_for`] its schema instead.
 pub fn stamped(props: WriterProperties) -> WriterProperties {
     stamped_as(props, 1)
 }

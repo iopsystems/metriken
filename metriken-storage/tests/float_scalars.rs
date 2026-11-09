@@ -10,7 +10,8 @@
 //! beside them stay exact above 2^53; a segment holding a float column is
 //! format 3, one without stays 1; a producer's `metric_type` label does not
 //! change a float column's kind; two recordings of one name, one integer
-//! and one float, read as two series.
+//! and one float, read as two series; a NaN or infinite float value is
+//! dropped (decision 4).
 //!
 //! Queried through metriken-query, on the batched rate path and per
 //! series: float counters and gauges evaluate in every function that reads
@@ -19,7 +20,9 @@
 //! recording and a float recording reads both (decision 1); one process
 //! recorded as integers and then as floats reads as it does recorded as
 //! integers throughout, and its overlapping rows conflict only where the
-//! numbers differ.
+//! numbers differ; a process whose source turns float inside a segment
+//! rates on the batched path as it does per series, and a conflict between
+//! its float rows is found there.
 #![cfg(feature = "write")]
 
 use std::collections::BTreeMap;
@@ -1372,8 +1375,9 @@ fn a_float_column_is_written_with_its_own_kind() {
 /// recording ticks 0 to 7 as integer columns and the second ticks 4 to 11,
 /// as float columns when `float`, with a counter growing 10 a tick and a
 /// gauge holding the tick. `edit` changes the second source's reading at
-/// tick 6 by 0.5.
-fn write_process(path: &Path, float: bool, edit: bool) {
+/// tick 6 by 0.5. `first_turns` makes the first source record floats from
+/// that tick on.
+fn write_process(path: &Path, float: bool, edit: bool, first_turns: Option<u64>) {
     let mut writer = ArchiveWriter::create(path, config()).unwrap();
     let metadata = BTreeMap::from([("producer_epoch".to_string(), "e".to_string())]);
     let mut first = writer
@@ -1404,9 +1408,17 @@ fn write_process(path: &Path, float: bool, edit: bool) {
         let ts = BASE + t * S;
         let mut staged = Vec::new();
         if t < 8 {
-            let mut g = group(NODE, &int_schema, t);
-            g.counters = vec![Some(10 * t)];
-            g.gauges = vec![Some(t as i64)];
+            let g = if first_turns.is_some_and(|turn| t >= turn) {
+                let mut g = group(NODE, &float_schema, t);
+                g.float_counters = vec![Some(10.0 * t as f64)];
+                g.float_gauges = vec![Some(t as f64)];
+                g
+            } else {
+                let mut g = group(NODE, &int_schema, t);
+                g.counters = vec![Some(10 * t)];
+                g.gauges = vec![Some(t as i64)];
+                g
+            };
             staged.push(first.stage(&snap(g, ts), ts, 0).unwrap());
         }
         if t >= 4 {
@@ -1450,7 +1462,7 @@ fn a_process_recorded_as_integers_then_floats_reads_as_one_series() {
     let dir = tempfile::tempdir().unwrap();
     let path = |name: &str, float: bool, edit: bool| {
         let path = dir.path().join(name);
-        write_process(&path, float, edit);
+        write_process(&path, float, edit, None);
         open_process(&path)
     };
     let floats = path("floats.dendro", true, false);
@@ -1512,5 +1524,204 @@ fn a_process_recorded_as_integers_then_floats_reads_as_one_series() {
         assert_eq!(series["__name__"], metric, "{q}");
         assert_eq!(*first, (BASE + 6 * S) as f64 / 1e9, "{q}");
         assert_eq!(*count, 1, "{q}");
+    }
+}
+
+/// A process whose first source turns float inside a segment (tick 2 of a
+/// five-row segment, so the segment holds the series in both columns) and
+/// whose second source records floats from tick 4: the batched rate path
+/// reads every row the per-series path does.
+#[test]
+fn a_process_turning_float_inside_a_segment_rates_on_both_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("turns.dendro");
+    write_process(&path, true, false, Some(2));
+    let reader = open_process(&path);
+    let q = "irate(work_total[2s])";
+    let per_series = one(&reader, q, true);
+    assert_eq!(
+        per_series,
+        (1..TICKS).map(|t| (t, 10.0)).collect::<Vec<_>>(),
+        "per series"
+    );
+    metriken_query::fixtures::take_batch_rates();
+    assert_eq!(one(&reader, q, false), per_series, "batched");
+    assert_eq!(metriken_query::fixtures::take_batch_rates(), 1, "batched");
+}
+
+/// Two sources of one process recording counter `work_total` over the same
+/// 40 ticks, the second reading 0.5 more at tick 20. The first records
+/// integers at ticks 0 and 1 and floats after, so its first segment holds
+/// the series in both columns; every other row is a float.
+fn write_float_pair(path: &Path) -> u64 {
+    const LONG: u64 = 40;
+    let mut writer = ArchiveWriter::create(path, config()).unwrap();
+    let metadata = BTreeMap::from([("producer_epoch".to_string(), "e".to_string())]);
+    let mut sources: Vec<_> = (0..2)
+        .map(|_| {
+            writer
+                .add_source(labels(&[("host", "a")]), metadata.clone(), BASE)
+                .unwrap()
+        })
+        .collect();
+    let schema = Arc::new(GroupSchema {
+        float_counters: vec![desc("0", &[("metric", "work_total")])],
+        ..GroupSchema::default()
+    });
+    let int_schema = Arc::new(GroupSchema {
+        counters: vec![desc("0", &[("metric", "work_total")])],
+        ..GroupSchema::default()
+    });
+    for t in 0..LONG {
+        let ts = BASE + t * S;
+        let mut staged = Vec::new();
+        for (i, source) in sources.iter_mut().enumerate() {
+            let delta = if i == 1 && t == 20 { 0.5 } else { 0.0 };
+            let g = if i == 0 && t < 2 {
+                let mut g = group(NODE, &int_schema, t);
+                g.counters = vec![Some(10 * t)];
+                g
+            } else {
+                let mut g = group(NODE, &schema, t);
+                g.float_counters = vec![Some(10.0 * t as f64 + delta)];
+                g
+            };
+            let snap = Snapshot::V3(SnapshotV3 {
+                systemtime: std::time::UNIX_EPOCH + std::time::Duration::from_nanos(ts),
+                duration: std::time::Duration::from_millis(1),
+                metadata: Default::default(),
+                groups: vec![g],
+            });
+            staged.push(source.stage(&snap, ts, 0).unwrap());
+        }
+        writer.commit(staged).unwrap();
+        for source in &mut sources {
+            source.maybe_seal().unwrap();
+        }
+    }
+    for source in sources {
+        source.finalize((BASE + (LONG - 1) * S, 0)).unwrap();
+    }
+    writer.join().unwrap();
+    LONG
+}
+
+/// A conflict between two float recordings of one process, in the middle
+/// of a long overlap, is found on the batched rate path as it is per
+/// series. The segment holding both columns makes the union scan decline,
+/// so the batched path scans each source and compares the float rows the
+/// scan reads (the rows read for coverage context, near the ends of the
+/// range, do not reach tick 20).
+#[test]
+fn a_float_conflict_is_found_from_the_batched_scan() {
+    use metriken_query::{MetricsSource, Notice, QueryOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pair.dendro");
+    let ticks = write_float_pair(&path);
+    let reader = open_process(&path);
+    let (lo, hi) = (BASE / S, BASE / S + ticks - 1);
+    for (path, per_series) in PATHS {
+        metriken_query::fixtures::take_batch_rates();
+        let got = reader
+            .query_range_opts(
+                "irate(work_total[2s])",
+                lo as f64,
+                hi as f64,
+                1.0,
+                &QueryOptions::default().with_per_series_rates(per_series),
+            )
+            .unwrap();
+        assert_eq!(
+            metriken_query::fixtures::take_batch_rates(),
+            usize::from(!per_series),
+            "{path}"
+        );
+        let [Notice::Conflict { first, count, .. }] = got.notices() else {
+            panic!("{path}: {:?}", got.notices());
+        };
+        assert_eq!(*first, (BASE + 20 * S) as f64 / 1e9, "{path}");
+        assert_eq!(*count, 1, "{path}");
+    }
+}
+
+/// The non-finite readings a producer other than metriken-recorder can
+/// send, by tick: NaN at 3, +Inf at 5, -Inf at 8 and NaN at 10 (in the
+/// live tail when the archive is not finalized).
+fn non_finite(t: u64) -> Option<f64> {
+    match t {
+        3 | 10 => Some(f64::NAN),
+        5 => Some(f64::INFINITY),
+        8 => Some(f64::NEG_INFINITY),
+        _ => None,
+    }
+}
+
+/// A non-finite float counter or gauge value staged through the writer is
+/// dropped, wide and long, sealed and in the live tail: the row reads back
+/// without it, and a rate after it is finite.
+#[test]
+fn a_non_finite_float_value_is_dropped() {
+    let wide = Arc::new(GroupSchema {
+        float_counters: vec![desc("0", &[("metric", "odd_total")])],
+        float_gauges: vec![desc("1", &[("metric", "odd_level")])],
+        ..GroupSchema::default()
+    });
+    let long = Arc::new(GroupSchema {
+        float_counters: vec![desc("0", &[("metric", "odd_long_total"), ("id", "a")])],
+        float_gauges: vec![desc("1", &[("metric", "odd_long_level"), ("id", "a")])],
+        ..GroupSchema::default()
+    });
+    let counter_at = |t: u64| non_finite(t).unwrap_or(10.0 * t as f64);
+    let gauge_at = |t: u64| non_finite(t).unwrap_or(t as f64 + 0.5);
+    for finalize in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("odd.dendro");
+        record(&path, finalize, |source, t| {
+            let groups = [("prom/odd", &wide), ("prom/odd_long", &long)]
+                .into_iter()
+                .map(|(name, schema)| {
+                    let mut g = group(name, schema, t);
+                    g.float_counters = vec![Some(counter_at(t))];
+                    g.float_gauges = vec![Some(gauge_at(t))];
+                    g
+                })
+                .collect();
+            let snap = Snapshot::V3(SnapshotV3 {
+                systemtime: std::time::UNIX_EPOCH + std::time::Duration::from_nanos(BASE + t * S),
+                duration: std::time::Duration::from_millis(1),
+                metadata: Default::default(),
+                groups,
+            });
+            source.stage(&snap, BASE + t * S, 0).unwrap()
+        });
+        let reader = open(&path);
+        let kept: Vec<u64> = (0..TICKS).filter(|&t| non_finite(t).is_none()).collect();
+        let ts: Vec<u64> = kept.iter().map(|t| BASE + t * S).collect();
+        for (counter, gauge, id) in [
+            ("odd_total", "odd_level", None),
+            ("odd_long_total", "odd_long_level", Some("a")),
+        ] {
+            let source = table_source(&reader, counter);
+            let want: Vec<f64> = kept.iter().map(|&t| counter_at(t)).collect();
+            assert_eq!(
+                float_counter(source.as_ref(), counter, id),
+                (ts.clone(), bits(&want)),
+                "{counter} finalize {finalize}"
+            );
+            let want: Vec<f64> = kept.iter().map(|&t| gauge_at(t)).collect();
+            assert_eq!(
+                float_gauge(source.as_ref(), gauge, id),
+                (ts.clone(), bits(&want)),
+                "{gauge} finalize {finalize}"
+            );
+            for (path, per_series) in PATHS {
+                let rate = one(&reader, &format!("irate({counter}[3s])"), per_series);
+                assert_eq!(
+                    rate,
+                    (1..TICKS).map(|t| (t, 10.0)).collect::<Vec<_>>(),
+                    "{counter} finalize {finalize} {path}"
+                );
+            }
+        }
     }
 }

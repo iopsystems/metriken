@@ -1,34 +1,36 @@
 # Float scalars: Prometheus counters and gauges without truncation
 
 **Status:** OPEN. Design 2026-11-06, owner decisions the same day (below).
-Steps 1–4 are built on branch `feat/float-scalars`, not yet released.
+Steps 1–4 are built and reviewed on branch `feat/float-scalars`, not yet
+released.
 Issue #378. rezolus 6.0.0 waits for it (rezolus
 `docs/journal/2026-10-08-6-0-release-readiness.md`, decision 13).
 
 ## Goal
 
-A Prometheus sample is an f64. metriken-recorder stores a Prometheus counter
-as `u64` and a gauge as `i64` (`metriken-recorder/src/prometheus.rs:160`,
-`:170`, `:189`, `:191`; a summary's quantile values at `:215`), so every
-fractional value is truncated: a CPU limit of 0.25 cores reads 0, a counter
-in seconds moves in whole seconds, a histogram's `_sum` in seconds loses its
-fraction, a ratio reads 0. After this change, every scalar a Prometheus
-endpoint serves is stored as an f64 and read back unchanged. Native metriken
-producers keep their integer types.
+A Prometheus sample is an f64. Before this change metriken-recorder stored
+a Prometheus counter as `u64` and a gauge as `i64`
+(`PrometheusConverter::convert` in `metriken-recorder/src/prometheus.rs`,
+summary quantile values included), so every fractional value was
+truncated: a CPU limit of 0.25 cores read 0, a counter in seconds moved in
+whole seconds, a histogram's `_sum` in seconds lost its fraction, a ratio
+read 0. After this change, every scalar a Prometheus endpoint serves is
+stored as an f64 and read back unchanged. Native metriken producers keep
+their integer types.
 
 It lands before rezolus 6.0.0 because a reader without the float kinds
 cannot read a recording that has them: if 6.0.0 shipped first, a 6.0.0
 reader could not read a later 6.x recording of a Prometheus endpoint.
 
-## Where a Prometheus scalar goes today
+## Where a Prometheus scalar went before this change
 
 `PrometheusConverter::convert` emits `Snapshot::V3` groups. The writer stores
-a group as a `WalGroupRow` (`metriken_model::convert::wal_group_row`,
-`metriken-storage/src/writer.rs:1225`), or, when its members carry an `id`
-(`writer.rs:412-419`, `slotted`), in the long layout as `WalLongRow` and
-`LongOccupant`; groups are sealed into parquet segments. `WalValue` and
-`CellValue` carry only V1/V2 sampler cells, which the Prometheus path does
-not use.
+a group as a `WalGroupRow` (`metriken_model::convert::wal_group_row`, called
+from `SourceRecorder::stage_group` in `metriken-storage/src/writer.rs`), or,
+when its members carry an `id` (`slotted` in `writer.rs`), in the long
+layout as `WalLongRow` and `LongOccupant`; groups are sealed into parquet
+segments. `WalValue` and `CellValue` carry only V1/V2 sampler cells, which
+the Prometheus path does not use.
 
 ## Decisions (owner, 2026-11-06)
 
@@ -36,18 +38,25 @@ not use.
    float gauge is a gauge to every query, catalog and viewer. An endpoint
    recorded before this change (integer columns) and after it (float
    columns) unions in one query; `refuse_kinds_across_recordings`
-   (`metriken-query/src/archive.rs:712`) would otherwise refuse it. The
+   (`metriken-query/src/archive.rs`) would otherwise refuse it. The
    storage read types carry either integer or f64 values per series. The
    alternative, separate kinds everywhere, was rejected.
 2. **Floats in the long layout.** A group whose members carry an `id`, such
    as cAdvisor's, keeps the long layout: `LongOccupant` and long tables gain
    float columns. Forcing such a group wide, as gauge histograms are, was
-   rejected: a cAdvisor scrape would switch layouts compared with today.
+   rejected: a cAdvisor scrape would switch layouts compared with before
+   this change.
 3. **Any decrease of a counter is a reset**, as Prometheus and the integer
    path do. No tolerance for float noise.
 4. **Non-finite samples are still dropped** by the recorder
-   (`prometheus.rs:155`, `:165`, `:175`), so NaN never enters a counter's
-   accumulation.
+   (`PrometheusConverter::convert`). Storage also drops a NaN or infinite
+   float value at ingest (`GroupTableBuilder::push_group_row`,
+   `LongTableBuilder::push_tick`, `Memory::upsert_float_counter_sample` and
+   `upsert_float_gauge_sample`), so a value from another producer, staged
+   through `ArchiveWriter` or a `StreamDecoder` or ingested by
+   `MemoryStore::ingest_snapshot`, never enters a counter's accumulation
+   either. The WAL keeps the value as sent; a segment built from it, sealed
+   or materialized from the live tail, does not.
 
 ## Design
 
@@ -59,19 +68,24 @@ values in the snapshot and rows), after `gauge_histograms`.
 
 rmp-serde encodes these structs as positional arrays, and `gauge_histograms`
 is left out of the encoding when it is empty. Appending fields the same way
-is unsafe: tested against the published metriken-model 0.2.1, a schema with
+is unsafe: tested against the types of metriken-model 0.2.1, whose wire
+layout 0.2.2 (the latest release) keeps unchanged, a schema with
 float descriptors and no gauge histograms decodes with the float
 descriptors read as `gauge_histograms`, and a row whose float slots are all
 `None` decodes with them as gauge histogram slots. So the encoding writes
 every field up to the last non-empty one, the empty ones before it
 included, by a hand-written `Serialize`. A schema or row with no floats
-encodes exactly as today, byte for byte, so its hash and every existing
-archive are unchanged. With floats, a 0.2.1 decoder refuses with a length
-error ("array had incorrect length, expected 7"); it cannot name the kind,
-since the refusal comes from the array length. `schema_nil_offset`
-(`wal.rs:166-179`) accepts the new lengths. `GroupSnapshot::validate`,
+encodes exactly as before, byte for byte, so its hash and every existing
+archive are unchanged. With floats, a 0.2.2 decoder refuses with a length
+error: "array had incorrect length, expected 4" for a schema, a group or a
+row carrying its schema, "expected 7" for a bare `WalGroupRow`, and
+"expected 5" for a long row's occupant. A snapshot is refused as matching
+no variant of the untagged `Snapshot`. None of these names the kind.
+`schema_nil_offset` (`metriken-model/src/wal.rs`) accepts the new
+lengths. `GroupSnapshot::validate`,
 `counters()`/`gauges()`-style accessors for floats, `convert::wal_group_row`
-and the cost meters (`cost.rs:24-59`) cover the new fields.
+and the cost meters (`group_approx_bytes`, `wal_group_row_approx_bytes`,
+`wal_long_row_approx_bytes` in `cost.rs`) cover the new fields.
 
 The `SnapshotV3` doc says a future field means a V4. A V4 would let an old
 decoder name the refusal; it would also change every consumer's untagged
@@ -105,10 +119,19 @@ decoder name the refusal; it would also change every consumer's untagged
 Integer counters keep exact `u64` differencing; float counters difference in
 f64 with the same reset rule (decision 3). Gauges evaluate in f64 already
 (`gauge.rs`), so an f64 gauge is read directly. The batched rate scan gains
-an f64 column path; without one, a float column makes `u64s()` return
-`None` and the series is skipped without an error
-(`batch_rate.rs:524-528`). The per-source union, conflict detection and the
-in-memory store (`memory_store.rs`, the live path) take f64 values.
+an f64 column path: before this change it read a values column only as
+`UInt64` (`grid_rates` in `batch_rate.rs`), so a float column made `u64s()`
+return `None` and the series was skipped without an error. Every reader of
+a scan's chunks reads either column type (`batch_rate::CounterColumn`): the
+rates, the per-source union's row coverage (`RecordingChunks`) and conflict
+detection (`RecordedChunks`). The in-memory store (`memory_store.rs`, the
+live path) takes f64 values.
+
+Limit: integer counter values are exact as `u64`, but a series that turns
+float (stored as integers in some segments and floats in others) reads as
+one `Float` series, so its integer readings above 2^53 lose exactness in a
+range that spans the change (`CounterValues::extend` and `to_f64` in
+metriken-storage).
 
 ### Recorder (metriken-recorder)
 
@@ -129,7 +152,7 @@ metriken releases.
 
 `WalValue`, `CellValue` and V1/V2 snapshots (no Prometheus data passes
 through them); metriken-core's `Value` and native producers;
-`prometheus_text` output; NaN handling.
+`prometheus_text` output.
 
 ## Order of work
 

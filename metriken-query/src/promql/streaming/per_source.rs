@@ -1223,11 +1223,13 @@ impl crate::scan::ChunkReader for RecordingChunks<'_> {
                     continue;
                 };
                 for (col, series) in seg.cols.iter().zip(series) {
-                    let Some(values) = columns.u64s(batch, col.values) else {
+                    let Some(values) =
+                        crate::batch_rate::CounterColumn::of(columns, batch, col.values)
+                    else {
                         continue;
                     };
                     let mut push = |r: usize, s: usize| {
-                        if !ts.is_null(r) && !values.is_null(r) {
+                        if !ts.is_null(r) && values.get(r).is_some() {
                             if let Some(v) = rows.get_mut(s) {
                                 v.push(ts.value(r));
                             }

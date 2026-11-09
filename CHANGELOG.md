@@ -22,9 +22,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writing an empty one before it, and leave out the empty ones after it.
   A value without floats encodes byte for byte as in 0.2.2, so schema
   hashes and existing archives are unchanged and 0.2.2 decoders read it.
-  A value with floats is a longer array, which 0.2.2 refuses ("array had
-  incorrect length") rather than read the floats as gauge histograms.
+  A value with floats is a longer array, which 0.2.2 refuses (a schema or
+  row with a length error, a snapshot with no matching variant) rather
+  than read the floats as gauge histograms.
   `encode_wal_group_row_with_schema` splices rows of 6 to 9 fields.
+
+### metriken-exposition 0.26.0
+
+Requires metriken-model 0.3.0.
+
+- **Breaking:** the re-exported `GroupSchema` and `GroupSnapshot` gain
+  `float_counters` and `float_gauges` fields (metriken-model 0.3.0), so
+  struct literals of them must add the fields. `GroupBuilder` makes no
+  float members. `EncodedGroup::encode` carries a `GroupSnapshot`'s floats
+  into its row; `EncodedLongGroup::encode` writes none, since a
+  `LongGroupSnapshot` has no float members.
 
 ### metriken-storage 0.8.0
 
@@ -36,7 +48,10 @@ Requires metriken-model 0.3.0.
   the producer's metadata says. They are written by `ArchiveWriter` from
   snapshots and from a replication stream (`StreamDecoder` carries them),
   replayed from the WAL, and kept in the long layout: a group whose
-  members carry an `id` is written long with float members too.
+  members carry an `id` is written long with float members too. A NaN or
+  infinite float value is dropped when a segment is built (sealed or
+  materialized from the live tail) and by `Memory`'s float upserts, so it
+  reads as absent.
 - **Breaking:** the read types carry integer or `f64` values per series:
   `Counter::values` and `ColumnChunk::values` are `CounterValues` (`Int`
   of `u64` or `Float` of `f64`), `Gauge::values` is `GaugeValues` (`Int`
@@ -44,23 +59,28 @@ Requires metriken-model 0.3.0.
   `CounterStream` gains `float`, set when its samples can be floats.
   `ColumnPosition` gains `float`. Struct literals wrap a `Vec<u64>` or
   `Vec<i64>` with `.into()`. A series stored as integers in some segments
-  and floats in others reads as one `Float` series.
+  and floats in others reads as one `Float` series, whose integer values
+  above 2^53 are rounded. `CounterSample` no longer implements `Eq`.
+- **Breaking:** `table::Values` gains `FloatCounter` and `FloatGauge`, so
+  an exhaustive match on it must handle them.
 - **Added:** the counter and gauge listings (`*_names`, `*_labels`,
   `SamplerReader::holds_counter` and `holds_gauge`) include float columns;
   `MultiParquetSource::float_counter_columns`, `float_gauge_columns` and
-  `BatchColumns::f64s`; `table::Values::FloatCounter` and `FloatGauge`;
-  `GroupTableBuilder::push_group_row` with `GroupRowValues`. A `Float64`
-  column of another `metric_type` is not read.
+  `BatchColumns::f64s`; `GroupTableBuilder::push_group_row` with
+  `GroupRowValues`. A `Float64` column of another `metric_type` is not
+  read.
 - **Changed:** a segment holding a float column is written as segment
-  format 3 (`format::FORMAT_FLOAT`), which metriken-storage 0.7.0 refuses
-  ("segment format 3 is newer than this reader, which reads up to 2");
+  format 3 (`format::FORMAT_FLOAT`; `format::FORMAT_VERSION`, the newest
+  format read, is now 3), which metriken-storage 0.7.0 refuses ("segment
+  format 3 is newer than this reader, which reads up to 2");
   without the bump it would drop the column without an error. Segments
   without one stay format 1 or 2. A segment's names index records float
   columns in sets of their own, which a reader lists as counters and
   gauges.
 - **Added:** `Memory::upsert_float_counter_sample` and
   `upsert_float_gauge_sample` (feature `ingest`). An integer series a float
-  sample is appended to becomes a float series.
+  sample is appended to becomes a float series; a NaN or infinite sample
+  is dropped.
 - **Changed:** `DataSource::counter_scan` of a segmented source scans
   float counter columns as it scans integer ones; a `ScanColumn`'s values
   column is `UInt64` or `Float64`.
@@ -79,7 +99,8 @@ Requires metriken-storage 0.8.0.
   read as `f64` as before, so a float gauge's fractions are returned as
   stored.
 - **Added:** `MemoryStore::ingest_snapshot` ingests a snapshot's
-  `float_counters` and `float_gauges` as counters and gauges.
+  `float_counters` and `float_gauges` as counters and gauges, dropping a
+  NaN or infinite value.
 - **Changed:** a process group's sources are compared for conflicts by
   number: an integer reading and a float reading of the same number (a
   recording made before its recorder stored floats and one after) are

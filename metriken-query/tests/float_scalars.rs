@@ -6,8 +6,9 @@
 //!
 //! What is checked, from `docs/journal/2026-11-06-float-scalars.md`: a
 //! float counter is listed and evaluated as a counter and a float gauge as
-//! a gauge (decision 1), fractions read back exactly, and any decrease of a
-//! float counter is a reset (decision 3).
+//! a gauge (decision 1), fractions read back exactly, any decrease of a
+//! float counter is a reset (decision 3), and a NaN or infinite sample is
+//! dropped (decision 4).
 #![cfg(feature = "ingest")]
 
 use std::collections::HashMap;
@@ -169,4 +170,58 @@ fn a_counter_that_turns_float_rates_across_the_change() {
         .map(|t| (t, if t == 4 { 10.5 } else { 10.0 }))
         .collect();
     assert_eq!(irate, want);
+}
+
+/// The non-finite readings a producer other than metriken-recorder can
+/// send, by tick: NaN at 3, +Inf at 5, -Inf at 8.
+fn non_finite(t: u64) -> Option<f64> {
+    match t {
+        3 => Some(f64::NAN),
+        5 => Some(f64::INFINITY),
+        8 => Some(f64::NEG_INFINITY),
+        _ => None,
+    }
+}
+
+/// A non-finite float sample is dropped at ingest: a gauge reads its
+/// previous value there (the lookback finds no sample at that tick), and a
+/// counter's rate after it is finite and unchanged.
+#[test]
+fn a_non_finite_float_sample_is_dropped() {
+    let schema = Arc::new(GroupSchema {
+        float_counters: vec![desc("0", "odd_total")],
+        float_gauges: vec![desc("1", "odd_level")],
+        ..GroupSchema::default()
+    });
+    let store = MemoryStore::builder().sampling_interval_ms(1000).build();
+    for t in 0..TICKS {
+        let bad = non_finite(t);
+        store.ingest_snapshot(Snapshot::V3(SnapshotV3 {
+            systemtime: SystemTime::UNIX_EPOCH + Duration::from_secs(T0 + t),
+            duration: Duration::from_millis(1),
+            metadata: HashMap::new(),
+            groups: vec![GroupSnapshot {
+                name: "prom/odd".to_string(),
+                schema_hash: schema.hash(),
+                schema: Some(Arc::clone(&schema)),
+                window: None,
+                counters: Vec::new(),
+                gauges: Vec::new(),
+                histograms: Vec::new(),
+                gauge_histograms: Vec::new(),
+                float_counters: vec![Some(bad.unwrap_or(10.0 * t as f64))],
+                float_gauges: vec![Some(bad.unwrap_or(t as f64 + 0.5))],
+            }],
+        }));
+    }
+    let level = one(&store, "odd_level");
+    let want: Vec<(u64, f64)> = (0..TICKS)
+        .map(|t| {
+            let held = (0..=t).rev().find(|&u| non_finite(u).is_none()).unwrap();
+            (t, held as f64 + 0.5)
+        })
+        .collect();
+    assert_eq!(level, want);
+    let irate = one(&store, "irate(odd_total[3s])");
+    assert_eq!(irate, (1..TICKS).map(|t| (t, 10.0)).collect::<Vec<_>>());
 }
