@@ -40,7 +40,7 @@ Requires metriken-model 0.3.0.
 
 ### metriken-storage 0.8.0
 
-Requires metriken-model 0.3.0.
+Requires metriken-model 0.3.0 and metriken-exposition 0.26.0.
 
 - **Added (breaking):** float counters and float gauges. A group's
   `float_counters` and `float_gauges` are stored as `Float64` columns whose
@@ -88,7 +88,7 @@ Requires metriken-model 0.3.0.
 
 ### metriken-query 0.45.0
 
-Requires metriken-storage 0.8.0.
+Requires metriken-storage 0.8.0 and metriken-model 0.3.0.
 
 - **Added:** float counters and gauges evaluate as counters and gauges in
   every function that reads them (`rate`, `irate`, a bare selector,
@@ -111,7 +111,8 @@ Requires metriken-storage 0.8.0.
 
 ### metriken-recorder 0.9.0
 
-Requires metriken-model 0.3.0 and metriken-storage 0.8.0.
+Requires metriken-model 0.3.0, metriken-exposition 0.26.0 and
+metriken-storage 0.8.0.
 
 - **Changed (breaking):** a Prometheus endpoint's scalars are recorded as
   float counters and float gauges, so a fraction is kept: a gauge of 0.25
