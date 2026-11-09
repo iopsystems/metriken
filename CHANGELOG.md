@@ -87,6 +87,25 @@ Requires metriken-storage 0.8.0.
 - **Changed:** adapted to metriken-storage 0.8's read types; integer
   counters and gauges evaluate as before.
 
+### metriken-recorder 0.9.0
+
+Requires metriken-model 0.3.0 and metriken-storage 0.8.0.
+
+- **Changed (breaking):** a Prometheus endpoint's scalars are recorded as
+  float counters and float gauges, so a fraction is kept: a gauge of 0.25
+  reads 0.25 where it read 0, and a counter in seconds moves by its
+  fractions where it moved in whole seconds. This covers typed counters
+  and gauges, untyped samples (a name ending in `_total`, `_sum` or
+  `_count` is a counter, any other a gauge), a summary's quantiles (gauges)
+  and a histogram's `_sum` and `_count` (counters), whole-numbered or not.
+  A histogram's buckets are a histogram as before, NaN and infinite
+  samples are still dropped, and a counter's values are stored as served.
+  A scrape whose samples carry an `id` is still written long. A recording
+  of a Prometheus endpoint holds segment format 3, which a reader needs
+  metriken-storage 0.8.0 to read; metriken-storage 0.7.0 refuses it.
+  Recordings of streamed producers and of the process's registry are
+  unchanged.
+
 ### metriken 0.11.7
 
 - **Changed:** `ShardedCounterHistogram::add` and `increment` skip their

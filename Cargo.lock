@@ -1438,6 +1438,7 @@ dependencies = [
  "metriken",
  "metriken-exposition",
  "metriken-model",
+ "metriken-query",
  "metriken-storage",
  "metriken-types",
  "parquet",

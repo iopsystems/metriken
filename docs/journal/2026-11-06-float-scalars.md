@@ -1,7 +1,8 @@
 # Float scalars: Prometheus counters and gauges without truncation
 
-**Status:** OPEN. Design 2026-11-06, owner decisions the same day (below);
-not built. Issue #378. rezolus 6.0.0 waits for it (rezolus
+**Status:** OPEN. Design 2026-11-06, owner decisions the same day (below).
+Steps 1–4 are built on branch `feat/float-scalars`, not yet released.
+Issue #378. rezolus 6.0.0 waits for it (rezolus
 `docs/journal/2026-10-08-6-0-release-readiness.md`, decision 13).
 
 ## Goal
