@@ -230,6 +230,7 @@ const REFUSED: &[(&str, &str)] = &[
     ("histogram_mean(h)", "h"),
     ("histogram_count(h)", "h"),
     ("histogram_sum(h)", "h"),
+    ("histogram_quantile(0.5, h{job=\"j\" or job=\"\"})", "h"),
     ("rate(h_overflow[3s])", "h_overflow"),
 ];
 
@@ -250,7 +251,8 @@ fn an_archive_written_before_the_rename_refuses_the_joined_series() {
                 .to_string();
             let series = format!("{name}{{source=\"e\"}}");
             assert!(
-                err.contains(&series) && err.contains("two or more stored series"),
+                err.contains(&series)
+                    && err.contains("is two or more stored series with one label set"),
                 "per_series={per_series} {query}: {err}"
             );
             assert!(
@@ -292,7 +294,8 @@ fn a_live_store_refuses_a_series_given_twice_in_one_snapshot() {
     for (query, name) in REFUSED {
         let err = range(&store, query, false).expect_err(query).to_string();
         assert!(
-            err.contains(&format!("{name}{{}}")) && err.contains("two or more stored series"),
+            err.contains(&format!("{name}{{}}"))
+                && err.contains("is two or more stored series with one label set"),
             "{query}: {err}"
         );
     }

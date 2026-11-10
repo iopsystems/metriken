@@ -131,15 +131,17 @@ pub(crate) fn renamed_filter(mut filter: Labels, original: &str) -> Labels {
 pub(crate) type Resolve<'a> = dyn Fn(&str, &Labels) -> Result<Option<String>, QueryError> + 'a;
 
 /// The check [`resolve_selectors`] runs on a selector it does not resolve
-/// (one with `or` matchers): its name and the filter a read applies.
+/// (one with `or` matchers): its name and an empty filter, every series of
+/// the name, which is what such a selector reads.
 pub(crate) type Check<'a> = dyn Fn(&str, &Labels) -> Result<(), QueryError> + 'a;
 
 /// Point each named selector of `expr` that `resolve` resolves at the
 /// stored name, adding the `__prometheus_name__` matcher. `resolve` takes
 /// the selector's name and filter. A selector with `or` matchers is not
-/// resolved; `check` is run on its name and the filter its read applies,
-/// which is its matchers outside the `or` branches (the readers do not
-/// apply the branches). The first error either returns is returned.
+/// resolved; `check` is run on its name with the filter its read applies:
+/// every series of the name, which is what such a selector reads (the
+/// parser moves every matcher into the `or` branches, and the readers do
+/// not apply them). The first error either returns is returned.
 pub(crate) fn resolve_selectors(
     expr: &mut Expr,
     resolve: &Resolve,
@@ -181,10 +183,10 @@ fn resolve_selector(
     let Some(name) = sel.name.clone() else {
         return Ok(());
     };
-    let filter = extract_filter_labels(&sel.matchers.matchers);
     if !sel.matchers.or_matchers.is_empty() {
-        return check(&name, &filter);
+        return check(&name, &Labels::default());
     }
+    let filter = extract_filter_labels(&sel.matchers.matchers);
     let Some(stored) = resolve(&name, &filter)? else {
         return Ok(());
     };
