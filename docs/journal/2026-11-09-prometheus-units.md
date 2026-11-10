@@ -319,7 +319,7 @@ A histogram with no unit token whose smallest bound is below 1 is stored
   scalars in non-normalized units, bits) and labels change for a
   Prometheus endpoint.
 
-metriken-charts 0.1.3 (fix): its `STORAGE_KEYS` copy
+metriken-charts 0.1.4 (fix; 0.1.3 is #390): its `STORAGE_KEYS` copy
 (`assets/charts/util/labels.js`) had not taken `overflow` and
 `overflow_bound` from #388; it takes them and `scale`.
 
