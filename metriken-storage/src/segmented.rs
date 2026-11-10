@@ -1550,15 +1550,25 @@ fn relabel_histogram_stream(
     // complete before the rows are consumed, so it is built from every
     // identity each column can present as, in column order, and rows map
     // into it.
+    //
+    // A set is keyed with how many earlier columns carry the column's own
+    // labels: a stream's second column of one label set (two columns that
+    // differ only by a storage key) presents under indices of its own, as
+    // it has in the stream, rather than joining the first's.
+    let nth: Vec<usize> = base
+        .iter()
+        .enumerate()
+        .map(|(i, labels)| base[..i].iter().filter(|l| *l == labels).count())
+        .collect();
     let mut series: Vec<Labels> = Vec::new();
-    let mut position: HashMap<Labels, usize, LabelsHash> = HashMap::default();
-    for labels in &base {
+    let mut position: HashMap<(Labels, usize), usize> = HashMap::default();
+    for (labels, k) in base.iter().zip(&nth) {
         let sets = relabel
             .identities(&name, labels)
             .unwrap_or_else(|| vec![labels.clone()]);
         for l in sets {
-            if !position.contains_key(&l) {
-                position.insert(l.clone(), series.len());
+            if let std::collections::hash_map::Entry::Vacant(e) = position.entry((l.clone(), *k)) {
+                e.insert(series.len());
                 series.push(l);
             }
         }
@@ -1571,7 +1581,7 @@ fn relabel_histogram_stream(
         if !labels.matches(&filter) {
             return None;
         }
-        row.series_idx = *position.get(&labels)?;
+        row.series_idx = *position.get(&(labels, nth[row.series_idx]))?;
         Some(row)
     });
     HistogramStream {

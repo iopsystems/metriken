@@ -511,3 +511,158 @@ fn joined_histogram_columns_across_segments_are_refused() {
         );
     }
 }
+
+/// Two recordings in one archive, `source="e"` from `a` and `source="f"`
+/// from `b`, sealing every 5 rows, read through `ArchiveReader::flatten`.
+fn record_two(path: &Path, a: Vec<(u64, Snapshot)>, b: Vec<(u64, Snapshot)>) -> ArchiveReader {
+    let config = WriterConfig {
+        seal: SealPolicy {
+            max_rows: 5,
+            ..SealPolicy::default()
+        },
+        ..WriterConfig::default()
+    };
+    let mut writer = ArchiveWriter::create(path, config).unwrap();
+    let source = |s: &str| BTreeMap::from([("source".to_string(), s.to_string())]);
+    let mut s1 = writer
+        .add_source(source("e"), BTreeMap::new(), BASE)
+        .unwrap();
+    let mut s2 = writer
+        .add_source(source("f"), BTreeMap::new(), BASE)
+        .unwrap();
+    for ((ts, x), (_, y)) in a.into_iter().zip(b) {
+        let st1 = s1.stage(&x, ts, 0).unwrap();
+        let st2 = s2.stage(&y, ts, 0).unwrap();
+        writer.commit(vec![st1, st2]).unwrap();
+        for s in [&mut s1, &mut s2] {
+            s.maybe_seal().unwrap();
+            s.sync().unwrap();
+        }
+    }
+    for s in [s1, s2] {
+        s.finalize((BASE + (TICKS - 1) * S, 0)).unwrap();
+    }
+    writer.join().unwrap();
+    let recordings = ArchiveReader::from_catalog(
+        Box::new(DendroCatalog::open(path).unwrap()),
+        None,
+        BufferPool::new(64 << 20),
+        None,
+    )
+    .unwrap();
+    ArchiveReader::flatten(recordings.into_iter().map(|(_, r)| r).collect(), None)
+}
+
+/// A recording's joined histogram columns sharing a time, read with
+/// another recording's histogram of the same name, whose streams are
+/// merged onto one clock: within one segment (`a` at ticks 0, 1; `b` at 1,
+/// 2) and across two (`a` at 0, 1, 5, 6; `b` at 1, 2, 6, 7). The merge
+/// keeps the recording's two indices of one label set apart, so the shared
+/// time is refused on both rate paths, while a query of the other
+/// recording alone reads.
+#[test]
+fn joined_histogram_columns_are_refused_beside_another_recording() {
+    let within = |t: u64| sparse(t, &|t| t <= 1, &|t| (1..=2).contains(&t));
+    let across = |t: u64| {
+        sparse(t, &|t| [0, 1, 5, 6].contains(&t), &|t| {
+            [1, 2, 6, 7].contains(&t)
+        })
+    };
+    let plain = |t: u64| sparse(t, &|_| true, &|_| false);
+    for (case, text) in [
+        ("within", &within as &dyn Fn(u64) -> String),
+        ("across", &across),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let reader = record_two(
+            &dir.path().join("a.dendro"),
+            scrapes_of(text, true),
+            scrapes_of(&plain, true),
+        );
+        for per_series in [false, true] {
+            for query in ["histogram_quantile(0.5, h)", "histogram_irate(h)"] {
+                let err = match range(&reader, query, per_series) {
+                    Err(e) => e.to_string(),
+                    Ok(r) => panic!("{case} per_series={per_series} {query}: {r:?}"),
+                };
+                assert!(
+                    err.contains("h{source=\"e\"}")
+                        && err.contains("at or before the one read before it"),
+                    "{case} {query}: {err}"
+                );
+            }
+            let f = matrix(
+                &reader,
+                "histogram_quantile(0.5, h{source=\"f\"})",
+                per_series,
+            );
+            assert_eq!(f.len(), 1, "{case}: {f:?}");
+        }
+    }
+}
+
+/// An exporter's `id` label makes its group a long table, whose reads
+/// relabel each occupant's columns. Two histogram columns of one occupant
+/// with one label set (`scale="a"` at ticks 0, 1 and `scale="b"` at 1, 2,
+/// recorded the old way) keep apart through the relabelling, so the shared
+/// time is refused; another occupant's series reads.
+#[test]
+fn joined_histogram_columns_in_a_long_table_are_refused() {
+    let text = |t: u64| {
+        let mut s = String::from("# TYPE h histogram\n");
+        for (scale, held) in [("a", t <= 1), ("b", (1..=2).contains(&t))] {
+            if held {
+                s.push_str(&format!(
+                    "h_bucket{{id=\"1\",scale=\"{scale}\",le=\"1\"}} {t}\n\
+                     h_bucket{{id=\"1\",scale=\"{scale}\",le=\"+Inf\"}} {t}\n"
+                ));
+            }
+        }
+        s.push_str(&format!(
+            "h_bucket{{id=\"2\",le=\"1\"}} {t}\nh_bucket{{id=\"2\",le=\"+Inf\"}} {t}\n"
+        ));
+        s
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let reader = record(&dir.path().join("a.dendro"), scrapes_of(&text, true)).unwrap();
+    for per_series in [false, true] {
+        for query in ["histogram_quantile(0.5, h)", "histogram_irate(h)"] {
+            let err = match range(&reader, query, per_series) {
+                Err(e) => e.to_string(),
+                Ok(r) => panic!("per_series={per_series} {query}: {r:?}"),
+            };
+            assert!(
+                err.contains("id=\"1\"") && err.contains("at or before the one read before it"),
+                "{query}: {err}"
+            );
+        }
+        let other = matrix(&reader, "histogram_quantile(0.5, h{id=\"2\"})", per_series);
+        assert_eq!(other.len(), 1, "{other:?}");
+    }
+}
+
+/// Control: a histogram whose two columns follow one another (`scale="a"`
+/// to tick 2, `scale="b"` from 3, as a bound that moved mid-segment) reads
+/// beside another recording as it reads alone.
+#[test]
+fn columns_that_follow_one_another_read_beside_another_recording() {
+    let moved = |t: u64| sparse(t, &|t| t <= 2, &|t| t >= 3);
+    let plain = |t: u64| sparse(t, &|_| true, &|_| false);
+    let dir = tempfile::tempdir().unwrap();
+    let alone = record(&dir.path().join("a.dendro"), scrapes_of(&moved, true)).unwrap();
+    let both = record_two(
+        &dir.path().join("b.dendro"),
+        scrapes_of(&moved, true),
+        scrapes_of(&plain, true),
+    );
+    for per_series in [false, true] {
+        for query in ["histogram_quantile(0.5, h)", "histogram_irate(h)"] {
+            let filtered = query.replace("h)", "h{source=\"e\"})");
+            let want = series_of(range(&alone, query, per_series).unwrap());
+            let got = series_of(range(&both, &filtered, per_series).unwrap());
+            let got: Vec<_> = got.into_iter().map(|(_, v)| v).collect();
+            let want: Vec<_> = want.into_iter().map(|(_, v)| v).collect();
+            assert_eq!(got, want, "per_series={per_series} {query}");
+        }
+    }
+}

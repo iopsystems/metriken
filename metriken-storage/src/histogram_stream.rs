@@ -194,15 +194,27 @@ fn merge_streams(streams: Vec<HistogramStream>, clock: Option<usize>) -> Option<
     }
     let config = common_config(streams.iter().map(|s| s.meta.config))?;
 
-    // Build unified series list; record per-stream remapping tables.
+    // Build unified series list; record per-stream remapping tables. A
+    // series is keyed by its labels and how many earlier indices of the
+    // stream carry them: a stream's first index of a label set is one
+    // series across streams, and a second index of it (two columns of one
+    // segment with one label set, which a segmented reader's splice also
+    // keeps apart) stays its own, so a reader can see the two columns'
+    // rows at one time.
     let mut global_series: Vec<Labels> = Vec::new();
-    let mut index: std::collections::HashMap<Labels, usize> = std::collections::HashMap::new();
+    let mut index: std::collections::HashMap<(Labels, usize), usize> =
+        std::collections::HashMap::new();
     // remap[stream_idx][local_series_idx] = global_series_idx
     let mut remap: Vec<Vec<usize>> = Vec::with_capacity(streams.len());
     for stream in &streams {
         let mut local_remap = Vec::with_capacity(stream.meta.series.len());
+        let mut earlier: std::collections::HashMap<&Labels, usize> =
+            std::collections::HashMap::new();
         for labels in &stream.meta.series {
-            let global_idx = *index.entry(labels.clone()).or_insert_with(|| {
+            let k = earlier.entry(labels).or_insert(0);
+            let key = (labels.clone(), *k);
+            *k += 1;
+            let global_idx = *index.entry(key).or_insert_with(|| {
                 global_series.push(labels.clone());
                 global_series.len() - 1
             });
