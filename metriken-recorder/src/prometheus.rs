@@ -339,11 +339,14 @@ impl PrometheusConverter {
             // One series is one column: a second sample of it in this scrape
             // (a line served twice, or `exported_<key>` beside a `<key>` the
             // rename moved there) would give the column two values in one
-            // row, which the segment encoder refuses. The first is kept.
-            if !taken.insert(MetricKey {
+            // row, which the segment encoder refuses. The first value
+            // accepted is kept: a key is taken once a value is stored, so a
+            // NaN or an unconvertible histogram does not take it.
+            let key = MetricKey {
                 name: name.clone(),
                 labels: labels.clone(),
-            }) {
+            };
+            if taken.contains(&key) {
                 self.log_repeat(&name);
                 continue;
             }
@@ -365,6 +368,7 @@ impl PrometheusConverter {
                         FloatCounter::new(id, v * factor, metadata(self, &labels))
                             .with_window(window),
                     );
+                    taken.insert(key);
                 }
                 Value::Gauge(v) => {
                     if !v.is_finite() {
@@ -375,6 +379,7 @@ impl PrometheusConverter {
                         FloatGauge::new(id, v * factor, metadata(self, &labels))
                             .with_window(window),
                     );
+                    taken.insert(key);
                 }
                 Value::Untyped(v) => {
                     if !v.is_finite() {
@@ -396,6 +401,7 @@ impl PrometheusConverter {
                     } else {
                         gauges.push(FloatGauge::new(id, v * factor, metadata).with_window(window));
                     }
+                    taken.insert(key);
                 }
                 Value::Histogram(ref buckets) => {
                     if let Some((h, mut metadata, overflow)) =
@@ -406,14 +412,11 @@ impl PrometheusConverter {
                         }
                         let id = self.get_or_assign_id(&name, &labels);
                         if let Some(overflow) = overflow {
-                            let key = MetricKey {
-                                name: name.clone(),
-                                labels: labels.clone(),
-                            };
-                            overflows.push((key, overflow, histograms.len()));
+                            overflows.push((key.clone(), overflow, histograms.len()));
                         }
                         histograms
                             .push(SnapshotHistogram::new(id, h, metadata).with_window(window));
+                        taken.insert(key);
                     }
                 }
                 Value::Summary(ref quantiles) => {
@@ -430,6 +433,7 @@ impl PrometheusConverter {
                             FloatGauge::new(id, quantile.count * factor, metadata(self, &q_labels))
                                 .with_window(window),
                         );
+                        taken.insert(key.clone());
                     }
                 }
             }
@@ -1261,6 +1265,19 @@ g_seconds{unit=\"u\"} 5
         assert_eq!(g[0]["exported_unit"], "u");
         assert_eq!(g[0][UNIT_KEY], "nanoseconds");
         assert_eq!(g[0][PROMETHEUS_NAME_LABEL], "g_seconds");
+    }
+
+    /// A repeated series keeps its first value the converter accepts: a
+    /// NaN first sample is dropped and does not take the series from the
+    /// finite one after it.
+    #[test]
+    fn a_dropped_first_sample_does_not_take_its_series() {
+        let mut snap =
+            PrometheusConverter::new().convert("x_total NaN\nx_total 5\ny NaN\ny 7\ny 8\n", 0, 1);
+        let counters: Vec<f64> = snap.float_counters().iter().map(|c| c.value).collect();
+        let gauges: Vec<f64> = snap.float_gauges().iter().map(|g| g.value).collect();
+        assert_eq!(counters, [5.0]);
+        assert_eq!(gauges, [7.0]);
     }
 
     /// A wall clock that steps backwards mid-scrape (NTP, a VM migration) must
