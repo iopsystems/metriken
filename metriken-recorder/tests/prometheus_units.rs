@@ -999,7 +999,8 @@ fn offered_matcher(err: &str) -> Option<&str> {
 /// the first stored name the error gives, and which resolves the query:
 /// `alias`, the key rezolus records a user's `source=` as, and `source`.
 /// When no key tells the recordings apart (one both carry with one value,
-/// one only the first carries), it offers none.
+/// one only the first carries, or only the internal `__recording__` the
+/// reader adds to recordings of equal labels), it offers none.
 #[test]
 fn the_ambiguous_name_error_offers_a_recording_label_the_recordings_carry() {
     let a = |t: u64| format!("# TYPE x counter\n# UNIT x seconds\nx_total{{job=\"a\"}} {t}\n");
@@ -1012,7 +1013,7 @@ fn the_ambiguous_name_error_offers_a_recording_label_the_recordings_carry() {
         Vec<(&'a str, &'a str)>,
         Option<&'a str>,
     );
-    let cases: [Case; 3] = [
+    let cases: [Case; 4] = [
         (
             "alias",
             vec![("alias", "first")],
@@ -1028,6 +1029,12 @@ fn the_ambiguous_name_error_offers_a_recording_label_the_recordings_carry() {
         (
             "none",
             vec![("source", "s"), ("zone", "z")],
+            vec![("source", "s")],
+            None,
+        ),
+        (
+            "only __recording__",
+            vec![("source", "s")],
             vec![("source", "s")],
             None,
         ),
