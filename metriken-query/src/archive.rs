@@ -13,6 +13,7 @@ use metriken_storage::recordings::RecordingsSource;
 use metriken_storage::union::UnionSource;
 use metriken_storage::{table_sampler, ArchiveReader, DataSource, UnionChild, UnionError};
 
+use crate::promql::prometheus_names::NameResolution;
 use crate::promql::streaming::conflicts::{Recorded, SourceName};
 use crate::promql::streaming::per_source::{GroupSource, Member, Part, SourceGroups, Tap};
 use crate::promql::QueryEngine;
@@ -84,6 +85,12 @@ struct Plan<'a> {
     /// How a recording's labels combine with its series' own
     /// ([`QueryOptions::series_labels`]).
     precedence: Precedence,
+    /// The query's selectors, each with the names it reads: a name given
+    /// by an exporter replaced by its stored name where `names` says so.
+    selectors: Vec<crate::promql::Selector>,
+    /// The stored name of each selector naming a series by its exporter
+    /// name (see [`resolve_names`]), which the engine reads.
+    names: Arc<NameResolution>,
 }
 
 impl<'a> Plan<'a> {
@@ -131,7 +138,31 @@ impl<'a> Plan<'a> {
                  exclude several values, {label}!~\"a|b\")"
             )));
         }
-        let referenced: Vec<String> = crate::referenced_metrics(query)?.into_iter().collect();
+        let labels = reader.series_labels();
+        let written = crate::promql::selectors(query)?;
+        let names = resolve_names(reader, scope, labels, precedence, &written)?;
+        // Each selector with the names it reads.
+        let selectors: Vec<crate::promql::Selector> = written
+            .into_iter()
+            .map(|(given, filter)| {
+                let read = given
+                    .into_iter()
+                    .map(|n| {
+                        names
+                            .get(&(n.clone(), filter.clone()))
+                            .cloned()
+                            .unwrap_or(n)
+                    })
+                    .collect();
+                (read, filter)
+            })
+            .collect();
+        let mut referenced: Vec<String> = selectors
+            .iter()
+            .flat_map(|(names, _)| names.iter().cloned())
+            .collect();
+        referenced.sort();
+        referenced.dedup();
         let unscoped = reader.owners_of(&referenced);
         let all: Vec<&SamplerReader> = match scope {
             None => unscoped.clone(),
@@ -145,8 +176,6 @@ impl<'a> Plan<'a> {
                 kept
             }
         };
-        let selectors = crate::promql::selectors(query)?;
-        let labels = reader.series_labels();
         let mut passing: Vec<&SamplerReader> = Vec::new();
         for t in &all {
             let extra = labels.of(t);
@@ -176,6 +205,8 @@ impl<'a> Plan<'a> {
             missing,
             scope,
             precedence,
+            selectors,
+            names: Arc::new(names),
         })
     }
 
@@ -578,7 +609,9 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
             1 => singles.pop().expect("one"),
             _ => Arc::new(RecordingsSource::new(singles)),
         };
-        return Ok(Some(QueryEngine::new(source)));
+        return Ok(Some(
+            QueryEngine::new(source).with_names(Arc::clone(&plan.names)),
+        ));
     }
     let mut children: Vec<Arc<dyn DataSource>> = Vec::with_capacity(parts.len());
     let mut ordered: Vec<Part> = Vec::with_capacity(parts.len());
@@ -606,13 +639,68 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
         1 => children.pop().expect("one"),
         _ => Arc::new(RecordingsSource::new(children)),
     };
-    Ok(Some(QueryEngine::with_groups(
-        source,
-        SourceGroups {
-            parts: ordered,
-            conflicts,
-        },
-    )))
+    Ok(Some(
+        QueryEngine::with_groups(
+            source,
+            SourceGroups {
+                parts: ordered,
+                conflicts,
+            },
+        )
+        .with_names(Arc::clone(&plan.names)),
+    ))
+}
+
+/// The stored name each selector of `written` reads when it names a
+/// series by its exporter name (`promql::prometheus_names`), decided per
+/// selector over the tables it reaches: those in `scope` whose recording's
+/// labels its filter can match. A selector reads its own name when one of
+/// those tables holds it, and otherwise the first candidate stored name
+/// one of them holds with a series whose `__prometheus_name__` is that
+/// name. Only tables holding the name or a candidate are consulted.
+fn resolve_names(
+    reader: &ArchiveReader,
+    scope: Option<&crate::Scope>,
+    labels: &SeriesLabels,
+    precedence: Precedence,
+    written: &[crate::promql::Selector],
+) -> Result<NameResolution, QueryError> {
+    let mut names = NameResolution::new();
+    for (given, filter) in written {
+        for name in given {
+            let key = (name.clone(), filter.clone());
+            if names.contains_key(&key) {
+                continue;
+            }
+            let candidates = metriken_storage::prometheus_units::fallback_candidates(name);
+            if reader.owners_of(&candidates).is_empty() {
+                continue;
+            }
+            let mut wanted = candidates.clone();
+            wanted.push(name.clone());
+            let mut reach: Vec<&SamplerReader> = Vec::new();
+            for t in reader.owners_of(&wanted) {
+                let in_scope = match scope {
+                    Some(scope) => scope_span(reader, scope, t)?.is_some(),
+                    None => true,
+                };
+                if in_scope && translate_filter_with(labels.of(t), filter, precedence).is_some() {
+                    reach.push(t);
+                }
+            }
+            if reach.iter().any(|t| t.holds(name)) {
+                continue;
+            }
+            let label = metriken_storage::PROMETHEUS_NAME_LABEL;
+            if let Some(stored) = candidates
+                .into_iter()
+                .find(|c| reach.iter().any(|t| t.holds_labeled(c, label, name)))
+            {
+                names.insert(key, stored);
+            }
+        }
+    }
+    Ok(names)
 }
 
 /// The span `scope` reads of `table`'s source: `None` when the scope does
@@ -733,7 +821,7 @@ fn refuse_kinds_across_recordings(
         })
     };
     let which = recording_selectors(recordings, plan.labels);
-    let selectors = crate::promql::selectors(query)?;
+    let selectors = &plan.selectors;
     for name in &plan.held {
         // The recordings a selector naming `name` can read: `m{source="a"} +
         // y` reads `m` in recording a only, whatever `y` reaches.
@@ -976,7 +1064,11 @@ impl MetricsSource for ArchiveReader {
                 continue;
             };
             let source = LabeledSource::new(r.source(), plan.labels.of(t).clone());
-            out.extend(QueryEngine::new(Arc::new(source)).columns(query)?);
+            out.extend(
+                QueryEngine::new(Arc::new(source))
+                    .with_names(Arc::clone(&plan.names))
+                    .columns(query)?,
+            );
         }
         Ok(out)
     }

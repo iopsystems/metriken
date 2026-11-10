@@ -28,7 +28,8 @@ impl QueryEngine {
     /// Returns an empty set if the query parses cleanly but matches
     /// no series. Returns `QueryError::ParseError` on syntax error.
     pub fn columns(&self, query: &str) -> Result<HashSet<String>, QueryError> {
-        let expr = parse_selector_expr(query)?;
+        let mut expr = parse_selector_expr(query)?;
+        self.resolve_names(&mut expr);
         let col_map = self.source.column_map();
         let mut out = HashSet::new();
         walk(&col_map, &expr, &mut out);
