@@ -75,8 +75,11 @@ Requires metriken-storage 0.11.0.
   matchers leave; over any other source, the whole source. This applies to
   PromQL selectors and to the selectors of `histogram_quantiles`,
   `histogram_heatmap`, `histogram_irate`, `histogram_mean`,
-  `histogram_count` and `histogram_sum`. A query that was
-  `MetricNotFound` before can now return series.
+  `histogram_count` and `histogram_sum`, and to `columns`. A query that
+  was `MetricNotFound` before can now return series. When series served
+  under one name are stored under more than one name in reach (two
+  endpoints whose `# UNIT` lines differ), the query is an error naming
+  them; a recording-label matcher selects one.
 
 ### metriken-recorder 0.12.0
 
@@ -99,7 +102,12 @@ Requires metriken-storage 0.11.0.
   bound, a summary's quantiles and its `_sum`, and scalars are multiplied
   by one factor; a `_count` is renamed and not scaled. A `_seconds`
   histogram's buckets are stored as before (×1e9) and its `_sum` is now in
-  nanoseconds too. Its overflow series is `<stored name>_overflow`.
+  nanoseconds too. An untyped `_bucket` sample (no `# TYPE` histogram
+  line) is kept as served. A histogram's overflow series is
+  `<stored name>_overflow` (`rpc_nanoseconds_overflow`), so a query for
+  `<exporter name>_overflow` (`rpc_seconds_overflow`) written against
+  recordings of 0.11.0 does not find it in new recordings; the
+  histogram's `overflow` key names it either way.
 - **Changed (breaking):** a histogram whose smallest bound is below 1
   after the unit's factor has its bounds multiplied by a power of 10, as a
   histogram without a unit was before, and that power is now written as
@@ -107,10 +115,13 @@ Requires metriken-storage 0.11.0.
   truncate to 0.
 - **Added:** two exporter names stored under one name (`rpc_seconds` and
   `rpc_ms`, or `rpc_seconds` beside an `rpc_nanoseconds` the exporter
-  serves) are each stored under their own name, unscaled, from the scrape
+  serves) are each stored, with their whole family (`_bucket`, `_sum`,
+  `_count`, `_total`), under their own names, unscaled, from the scrape
   the collision appears in for the life of the converter (warned once per
   endpoint, then logged at debug). A collision that first appears mid-run
-  moves the renamed series back to its exporter's name, once.
+  moves the renamed series back to its exporter's name, once. A collided
+  `_seconds` histogram is stored in seconds × its generic scale, recorded
+  in `scale`, where 0.11.0 stored it ×1e9.
 - **Added:** `# UNIT` lines are parsed. A `# HELP` text of a renamed
   metric is kept under the stored name as well as the exporter's.
 
