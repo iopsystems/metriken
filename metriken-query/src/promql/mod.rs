@@ -11,6 +11,7 @@ use crate::labels::{Labels, MatchOp};
 use crate::{DataSource, QueryOptions};
 
 mod columns;
+mod json_f64;
 pub use columns::{referenced_metrics, selector_filter};
 #[cfg(feature = "archive")]
 pub(crate) use columns::{repeated_matcher, selectors};
@@ -196,8 +197,17 @@ pub(crate) fn nothing_read(
 #[non_exhaustive]
 pub struct Sample {
     pub metric: HashMap<String, String>,
-    pub value: (f64, f64), // (timestamp_seconds, value)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `(timestamp_seconds, value)`. A non-finite value is written as the
+    /// string `"+Inf"`, `"-Inf"` or `"NaN"`, as the Prometheus HTTP API
+    /// writes it, and read in either form; so is every number of a
+    /// result's values, intervals and bands.
+    #[serde(with = "json_f64::pair")]
+    pub value: (f64, f64),
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "json_f64::opt_pair"
+    )]
     pub interval: Option<(f64, f64)>,
 }
 
@@ -226,13 +236,20 @@ impl Sample {
 #[non_exhaustive]
 pub struct MatrixSample {
     pub metric: HashMap<String, String>,
-    pub values: Vec<(f64, f64)>, // Vec of (timestamp_seconds, value)
+    /// `(timestamp_seconds, value)` per point. A non-finite value is a
+    /// string in JSON (see [`Sample::value`]).
+    #[serde(with = "json_f64::vec_pair")]
+    pub values: Vec<(f64, f64)>,
     /// Per-value uncertainty band, present only when EVERY value has one.
     ///
     /// Kept at its original type and semantics for consumers that predate
     /// [`bands`](Self::bands); a series where only some points carry a band
     /// reports `None` here and the full picture in `bands`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "json_f64::opt_vec_pair"
+    )]
     pub intervals: Option<Vec<(f64, f64)>>,
     /// Per-value uncertainty band, present when ANY value has one, with `None`
     /// at the values that do not.
@@ -240,7 +257,11 @@ pub struct MatrixSample {
     /// A band is absent at a point whose interval nobody observed — see
     /// [`interpolated`](Self::interpolated). `intervals` cannot express that
     /// (one missing band drops the whole array), which is why this exists.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "json_f64::opt_vec_opt_pair"
+    )]
     pub bands: Option<Vec<Option<(f64, f64)>>>,
     /// Which values are interpolated across a span the producer did not read,
     /// parallel to `values`. Present when any value is.
@@ -325,6 +346,7 @@ pub enum QueryResult {
     #[serde(rename = "scalar")]
     Scalar {
         /// `(timestamp, value)`.
+        #[serde(with = "json_f64::pair")]
         result: (f64, f64),
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         notices: Vec<Notice>,

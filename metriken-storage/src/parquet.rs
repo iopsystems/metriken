@@ -21,7 +21,9 @@ use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::statistics::Statistics;
 
 use crate::buffer_pool::{content_source_id, next_source_id, BufferPool, CacheKey};
-use crate::histogram_stream::{HistKind, HistogramRow, HistogramStream, HistogramStreamMeta};
+use crate::histogram_stream::{
+    HistKind, HistogramRow, HistogramStream, HistogramStreamMeta, Overflow,
+};
 use crate::labeled;
 use crate::labels::Labels;
 
@@ -1671,14 +1673,49 @@ impl ParquetSource {
             })
             .collect();
 
+        // Each counting histogram's overflow series: the counter its column
+        // names, with the same labels (and so, in a long segment, the same
+        // occupant), read from the same rows.
+        let mut overflow_descs: Vec<ColDesc> = Vec::new();
+        let mut overflow_of: Vec<(usize, f64)> = Vec::new();
+        if kind == HistKind::Counting {
+            for (si, h) in col_descs.iter().enumerate() {
+                let Some((overflow_name, bound)) = &h.overflow else {
+                    continue;
+                };
+                if let Some(c) = self.columns().iter().find(|c| {
+                    c.kind.is_counter() && &c.name == overflow_name && c.labels == h.labels
+                }) {
+                    overflow_descs.push(c.clone());
+                    overflow_of.push((si, *bound));
+                }
+            }
+        }
+
         let groups = plan_reads(self, &col_descs);
+        let overflow_groups = plan_reads(self, &overflow_descs);
+        let wanted = match (
+            wanted_occupants(&groups),
+            wanted_occupants(&overflow_groups),
+        ) {
+            (w, _) if overflow_groups.is_empty() => w,
+            (w, o) if w.is_empty() || o.is_empty() => Vec::new(),
+            (mut w, o) => {
+                w.extend(o);
+                w.sort_unstable();
+                w.dedup();
+                w
+            }
+        };
         let cursor = ParquetHistogramCursor {
             pf: Arc::clone(self),
             ts_col_idx,
             start_ns,
             end_ns,
-            wanted: wanted_occupants(&groups),
+            wanted,
             groups,
+            overflow_groups,
+            overflow_of,
             rg_queue,
             pending: std::collections::VecDeque::new(),
         };
@@ -1812,6 +1849,11 @@ pub struct ColDesc {
     /// In a [long](crate::long) segment, the occupant whose rows of
     /// `col_idx` are this series. `None` when the column is the series.
     occupant: Option<u64>,
+    /// A histogram column's overflow series name and highest finite bound
+    /// ([`OVERFLOW_KEY`](crate::OVERFLOW_KEY),
+    /// [`OVERFLOW_BOUND_KEY`](crate::OVERFLOW_BOUND_KEY)), when it has both
+    /// and the bound parses.
+    overflow: Option<(String, f64)>,
 }
 
 /// Resolve one metric's acquisition-window sidecar columns as an ATOMIC
@@ -1919,6 +1961,10 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
             let max_value_power: Option<u8> =
                 meta.get("max_value_power").and_then(|v| v.parse().ok());
             let labels = Labels::from_metadata(meta.iter());
+            let overflow = meta.get(crate::OVERFLOW_KEY).and_then(|n| {
+                let bound: f64 = meta.get(crate::OVERFLOW_BOUND_KEY)?.parse().ok()?;
+                Some((n.clone(), bound))
+            });
             let kind = match field.data_type() {
                 DataType::UInt64 => ColKind::Counter,
                 DataType::Int64 => ColKind::Gauge,
@@ -1984,6 +2030,7 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
                 begin_col,
                 width_col,
                 occupant: None,
+                overflow,
             })
         })
         .collect::<Vec<_>>();
@@ -2682,6 +2729,15 @@ impl RgValues {
         }
     }
 
+    /// Row `row`'s value as an `f64`, if present.
+    fn as_f64(&self, row: usize) -> Option<f64> {
+        match self {
+            RgValues::Unsigned(v) => v.get(row).copied().flatten().map(|v| v as f64),
+            RgValues::Signed(v) => v.get(row).copied().flatten().map(|v| v as f64),
+            RgValues::Float(v) => v.get(row).copied().flatten(),
+        }
+    }
+
     /// Whether row `row` holds a value.
     fn present(&self, row: usize) -> bool {
         match self {
@@ -3300,6 +3356,12 @@ struct ParquetHistogramCursor {
     /// The columns to decode and the series their rows belong to, indexing
     /// the pre-filtered histogram columns for this metric (series order).
     groups: Vec<ReadGroup>,
+    /// The overflow counters' columns, their series indexing
+    /// `overflow_of`.
+    overflow_groups: Vec<ReadGroup>,
+    /// Per overflow counter: the histogram series it belongs to, and that
+    /// histogram's highest finite bound.
+    overflow_of: Vec<(usize, f64)>,
     /// In a long segment, the occupants this stream reads, for pruning.
     wanted: Vec<u64>,
     /// Overlapping row group indices remaining to process.
@@ -3320,6 +3382,7 @@ impl ParquetHistogramCursor {
                 &self.wanted,
                 group_columns(&self.groups)
                     .into_iter()
+                    .chain(group_columns(&self.overflow_groups))
                     .chain([Some(self.ts_col_idx)]),
             ) else {
                 continue;
@@ -3332,6 +3395,7 @@ impl ParquetHistogramCursor {
             let Ok(occupants) = src.occupants(&self.pf, rg_idx, &self.groups) else {
                 continue;
             };
+            let overflows = self.overflows(&src, rg_idx, occupants.as_ref().map(|o| o.as_slice()));
 
             for g in &self.groups {
                 let key = CacheKey {
@@ -3376,6 +3440,7 @@ impl ParquetHistogramCursor {
                         timestamp: *ts,
                         resumes: false,
                         snapshot: snap.clone(),
+                        overflow: overflows.get(&(row, si)).copied(),
                     });
                 }
             }
@@ -3387,6 +3452,32 @@ impl ParquetHistogramCursor {
             }
         }
         false
+    }
+
+    /// The overflow of each `(row, histogram series)` in row group
+    /// `rg_idx` whose overflow counter has a value there. Empty when no
+    /// series has an overflow counter, or one does not read (that row group
+    /// then reads as without an overflow).
+    fn overflows(
+        &self,
+        src: &RowSource,
+        rg_idx: usize,
+        occupants: Option<&[Option<u64>]>,
+    ) -> HashMap<(usize, usize), Overflow> {
+        let mut out = HashMap::new();
+        for g in &self.overflow_groups {
+            let Ok(values) = src.counter_values(&self.pf, rg_idx, g.col_idx, g.float) else {
+                continue;
+            };
+            for row in 0..values.len() {
+                let (Some(count), Some(i)) = (values.as_f64(row), g.series(occupants, row)) else {
+                    continue;
+                };
+                let (si, bound) = self.overflow_of[i];
+                out.insert((row, si), Overflow { count, bound });
+            }
+        }
+        out
     }
 
     /// Decode all rows for one histogram column in one row group.

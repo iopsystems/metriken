@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use super::Point;
-use crate::histogram_stream::{HistogramRow, HistogramStream, HistogramStreamMeta};
+use crate::histogram_stream::{HistogramRow, HistogramStream, HistogramStreamMeta, Overflow};
 use crate::labels::Labels;
 use crate::types::{CounterStream, Counters, Gauges};
 use crate::DataSource;
@@ -738,7 +738,9 @@ fn combine_histograms(
             .collect(),
         seen: vec![vec![0; n]; streams.len()],
         prev: vec![vec![None; n]; streams.len()],
+        prev_overflow: vec![vec![None; n]; streams.len()],
         counts: vec![BTreeMap::new(); n],
+        overflows: vec![None; n],
         ready: VecDeque::new(),
         warned: vec![false; streams.len()],
         series: series.clone(),
@@ -816,8 +818,13 @@ struct Combined {
     seen: Vec<Vec<usize>>,
     /// Member `r`'s previous row of series `s`, with its time.
     prev: Vec<Vec<Option<(u64, crate::types::HistogramSnapshot)>>>,
+    /// Member `r`'s previous row's overflow of series `s`.
+    prev_overflow: Vec<Vec<Option<Overflow>>>,
     /// The per-bucket counts summed so far, by series.
     counts: Vec<BTreeMap<u32, u64>>,
+    /// The overflow summed so far, by series, as the counts are: `None`
+    /// until a member row of the series has one.
+    overflows: Vec<Option<Overflow>>,
     /// The rows of the time being yielded, sorted by series.
     ready: VecDeque<HistogramRow>,
     /// Whether a member's second read was found to differ from its first.
@@ -881,28 +888,40 @@ impl Combined {
             }
         }
         let out = match emit {
-            Some(Emit::Start { resumes }) => Some(HistogramRow {
-                series_idx: s,
-                timestamp: row.timestamp,
-                snapshot: cumulative(&self.counts[s]),
-                resumes,
-            }),
+            Some(Emit::Start { resumes }) => {
+                self.overflows[s] =
+                    super::histogram::add_overflow(self.overflows[s], None, row.overflow);
+                Some(HistogramRow {
+                    series_idx: s,
+                    timestamp: row.timestamp,
+                    snapshot: cumulative(&self.counts[s]),
+                    resumes,
+                    overflow: self.overflows[s],
+                })
+            }
             Some(Emit::End { .. }) => {
                 let counts = &mut self.counts[s];
                 if let Some((_, prev)) = &self.prev[r][s] {
                     super::histogram::delta_walk(prev, &row.snapshot, |idx, d| {
                         *counts.entry(idx).or_insert(0) += d;
                     });
+                    self.overflows[s] = super::histogram::add_overflow(
+                        self.overflows[s],
+                        self.prev_overflow[r][s],
+                        row.overflow,
+                    );
                 }
                 Some(HistogramRow {
                     series_idx: s,
                     timestamp: row.timestamp,
                     snapshot: cumulative(counts),
                     resumes: false,
+                    overflow: self.overflows[s],
                 })
             }
             None => None,
         };
+        self.prev_overflow[r][s] = row.overflow;
         self.prev[r][s] = Some((row.timestamp, row.snapshot));
         out
     }
@@ -1925,6 +1944,7 @@ mod tests {
                         // source's rows; a later start row resumes from another
                         // source's rows.
                         resumes: last.is_some(),
+                        overflow: None,
                     });
                 }
                 let rs = of(r);
@@ -1940,6 +1960,7 @@ mod tests {
                     timestamp: t,
                     snapshot: snapshot(&counts),
                     resumes: false,
+                    overflow: None,
                 });
                 last = Some(t);
             }

@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-storage 0.10.0
+
+- **Added (breaking):** `HistogramRow` gains `overflow: Option<Overflow>`,
+  the series' observations above its highest finite bound at that row
+  (`Overflow { count, bound }`, cumulative), so a struct literal of it
+  must add the field. The parquet reader fills it when a counting
+  histogram column names an overflow counter (`OVERFLOW_KEY`) with the
+  same labels in the same rows; merging, re-stamping and rebucketing carry
+  it unchanged. `Memory::set_histogram_overflow` names a histogram
+  series' overflow counter for the in-memory source.
+- **Changed (breaking):** `STORAGE_KEYS` adds `overflow` and
+  `overflow_bound` (`OVERFLOW_KEY`, `OVERFLOW_BOUND_KEY`), so neither is a
+  label. A reader on metriken-storage 0.9.0 or earlier shows them as two
+  labels on a histogram recorded with them. Sealed segments' names
+  indexes are written as version 2 (`MNI2`), which 0.8.0 and earlier do
+  not take (they read such a segment's footer instead); a version 1 index
+  is still read, its label sets without the two keys.
+
+### metriken-query 0.47.0
+
+Requires metriken-storage 0.10.0.
+
+- **Changed (breaking):** `histogram_quantile` and `histogram_quantiles`
+  count a histogram's overflow, the observations above its highest finite
+  bound, in the population, when the histogram names an overflow series
+  (a Prometheus histogram recorded by metriken-recorder 0.11.0). A
+  quantile that falls in it is `+Inf`, with the band
+  `(highest finite bound, +Inf)`; quantiles below it can move, since the
+  population is larger. Histograms without one, every one recorded
+  before, read as before. `histogram_count`, `histogram_sum`,
+  `histogram_mean`, `histogram_irate` and the heatmap do not count the
+  overflow. An older metriken-query reading a recording with an overflow
+  returns the quantile over the finite buckets only, which is lower than
+  this one's, without an error.
+- **Changed (breaking):** in a query result's JSON (`Sample`,
+  `MatrixSample`, a scalar `QueryResult`), a non-finite value, interval or
+  band end is the string `"+Inf"`, `"-Inf"` or `"NaN"`, as the Prometheus
+  HTTP API writes it, where it was `null`; deserialization reads numbers
+  and these strings. Finite values are numbers as before.
+- **Added:** `MemoryStore::ingest_snapshot` takes a histogram's overflow
+  link from its metadata, so the live path counts the overflow as a
+  recording does.
+
+### metriken-recorder 0.11.0
+
+Requires metriken-storage 0.10.0.
+
+- **Added (breaking):** a Prometheus histogram's observations above its
+  highest finite bucket, its `+Inf` bucket less that bucket, are recorded
+  as the float counter `<histogram>_overflow` with the histogram's labels,
+  and the histogram's column names it (`overflow`) and holds the highest
+  finite bound in the buckets' units (`overflow_bound`). metriken-query
+  0.47.0 counts it in `histogram_quantile`. A reader that does not know it
+  lists one more counter per histogram, and returns the quantile over the
+  finite buckets, as before. A scrape that has its own sample of that name
+  and labels keeps it, and that histogram gets no overflow series (logged
+  once). A histogram without a `+Inf` bucket gets none either.
+
 ### metriken-exposition 0.27.0
 
 Requires dendro 0.7.0.

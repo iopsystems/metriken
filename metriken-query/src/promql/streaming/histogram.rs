@@ -23,7 +23,7 @@ use std::collections::{HashMap, VecDeque};
 
 use ::histogram::{Config, CumulativeROHistogramRef, Quantile, QuantilesResult};
 
-use crate::histogram_stream::{HistogramRow, HistogramStream};
+use crate::histogram_stream::{HistogramRow, HistogramStream, Overflow};
 use crate::labels::Labels;
 use crate::promql::streaming::{derive_group_labels, Band, GroupBy};
 use crate::promql::{HistogramHeatmapResult, MatrixSample};
@@ -233,6 +233,23 @@ impl Splitter {
         curr: &HistogramSnapshot,
         emit: &mut impl FnMut(Option<u64>, &mut [Accum]),
     ) {
+        self.row_with_overflow(series, group, prev, t, curr, None, emit);
+    }
+
+    /// [`row`](Self::row), with the series' overflow since its previous
+    /// row (a count, and the bound it is above), shared among the windows
+    /// as the buckets' deltas are.
+    #[allow(clippy::too_many_arguments)]
+    fn row_with_overflow(
+        &mut self,
+        series: usize,
+        group: usize,
+        prev: Option<&HistogramSnapshot>,
+        t: u64,
+        curr: &HistogramSnapshot,
+        overflow: Option<(u64, f64)>,
+        emit: &mut impl FnMut(Option<u64>, &mut [Accum]),
+    ) {
         let before = self.latest[series].map(|(at, _)| at);
         self.latest[series] = Some((t, before.map_or(0, |at| t.saturating_sub(at))));
         let kt = self.stride.window(t);
@@ -241,7 +258,7 @@ impl Splitter {
         }
         self.last_t = t;
         if let (Some(p), Some(prev)) = (before, prev) {
-            self.share(group, p, prev, t, curr, emit);
+            self.share(group, p, prev, t, curr, overflow, emit);
         }
         if kt > self.newest {
             self.newest = kt;
@@ -256,6 +273,7 @@ impl Splitter {
     /// `(p, t]` overlaps. Windows it fills before the last close as they are
     /// filled when no series still reporting can add to them, so a long
     /// interval holds one window open rather than every one it spans.
+    #[allow(clippy::too_many_arguments)]
     fn share(
         &mut self,
         group: usize,
@@ -263,6 +281,7 @@ impl Splitter {
         prev: &HistogramSnapshot,
         t: u64,
         curr: &HistogramSnapshot,
+        overflow: Option<(u64, f64)>,
         emit: &mut impl FnMut(Option<u64>, &mut [Accum]),
     ) {
         let kt = self.stride.window(t);
@@ -272,6 +291,9 @@ impl Splitter {
             delta_walk(prev, curr, |idx, d| {
                 accum.add(idx, d.saturating_mul(SHARE_SCALE))
             });
+            if let Some((d, bound)) = overflow {
+                accum.add_overflow(d.saturating_mul(SHARE_SCALE), bound);
+            }
             self.close_excess(t, emit);
             return;
         }
@@ -285,12 +307,19 @@ impl Splitter {
             let upto = u128::from(self.stride.closes_ns(k).min(t) - p);
             let before = u128::from(self.stride.opens_ns(k).max(p) - p);
             let accum = &mut self.accums(k)[group];
-            for &(idx, d) in &deltas {
+            let window_share = |d: u64| {
                 let d = u128::from(d) * u128::from(SHARE_SCALE);
                 let share = mul_div_floor(d, upto, dt) - mul_div_floor(d, before, dt);
+                u64::try_from(share).unwrap_or(u64::MAX)
+            };
+            for &(idx, d) in &deltas {
+                let share = window_share(d);
                 if share > 0 {
-                    accum.add(idx, u64::try_from(share).unwrap_or(u64::MAX));
+                    accum.add(idx, share);
                 }
+            }
+            if let Some((d, bound)) = overflow {
+                accum.add_overflow(window_share(d), bound);
             }
             if k < kt {
                 self.close_through(settled.min(self.stride.closes_ns(k)), t, emit);
@@ -510,6 +539,10 @@ pub(super) struct Accum {
     counts: Vec<u64>,
     touched: Vec<u32>,
     buckets: usize,
+    /// Observations above the histograms' highest finite bounds, which no
+    /// bucket holds, and the lowest of the bounds they are above.
+    overflow: u64,
+    overflow_bound: f64,
 }
 
 impl Accum {
@@ -518,7 +551,26 @@ impl Accum {
             counts: Vec::new(),
             touched: Vec::new(),
             buckets: config.total_buckets(),
+            overflow: 0,
+            overflow_bound: f64::INFINITY,
         }
+    }
+
+    /// Adds `c` observations above `bound`.
+    fn add_overflow(&mut self, c: u64, bound: f64) {
+        if c == 0 {
+            return;
+        }
+        self.overflow = self.overflow.saturating_add(c);
+        self.overflow_bound = self.overflow_bound.min(bound);
+    }
+
+    /// The overflow added since the last take, and the bound it is above,
+    /// or `None` when there is none. Clears it.
+    fn take_overflow(&mut self) -> Option<(u64, f64)> {
+        let c = std::mem::take(&mut self.overflow);
+        let bound = std::mem::replace(&mut self.overflow_bound, f64::INFINITY);
+        (c > 0).then_some((c, bound))
     }
 
     pub(super) fn add(&mut self, idx: u32, c: u64) {
@@ -579,6 +631,35 @@ pub(super) fn delta_walk(
     }
 }
 
+/// The observations a series' overflow gained from `prev` to `curr`,
+/// rounded to whole observations: 0 when either row has none, or when the
+/// count went down (a reset, which the buckets' `delta_walk` also reads as
+/// no change).
+pub(super) fn overflow_delta(prev: Option<Overflow>, curr: Option<Overflow>) -> u64 {
+    match (prev, curr) {
+        (Some(p), Some(c)) if c.count > p.count => (c.count - p.count).round() as u64,
+        _ => 0,
+    }
+}
+
+/// `running`, a sum of overflow deltas, plus the delta from `prev` to
+/// `curr` (see [`overflow_delta`]), above `curr`'s bound. `running` as it
+/// is when `curr` has no overflow.
+pub(super) fn add_overflow(
+    running: Option<Overflow>,
+    prev: Option<Overflow>,
+    curr: Option<Overflow>,
+) -> Option<Overflow> {
+    let Some(c) = curr else {
+        return running;
+    };
+    let base = running.map_or(0.0, |r| r.count);
+    Some(Overflow {
+        count: base + overflow_delta(prev, curr) as f64,
+        bound: c.bound,
+    })
+}
+
 // ─── Internal implementations ────────────────────────────────────────────────
 
 /// The quantiles that parse, each with its position in `quantiles_in`, and
@@ -619,6 +700,9 @@ fn quantiles_impl(
     // quantization band from the bucket the quantile lands in.
     let mut outputs: Vec<Vec<QuantileRow>> = vec![Vec::new(); quantiles_in.len()];
     let mut prev_per_series: Vec<Option<HistogramSnapshot>> = vec![None; n];
+    // Each series' previous row's overflow: the observations above its
+    // highest finite bound, which are in the population and no bucket.
+    let mut prev_overflow: Vec<Option<Overflow>> = vec![None; n];
     let mut tick_accum = Accum::new(config);
     let mut scratch_idx: Vec<u32> = Vec::new();
     let mut scratch_cnt: Vec<u64> = Vec::new();
@@ -626,12 +710,14 @@ fn quantiles_impl(
     let (mut window_idx, mut window_cnt) = (Vec::new(), Vec::new());
     let mut emit_window =
         |at: Option<u64>, accums: &mut [Accum], outputs: &mut Vec<Vec<QuantileRow>>| {
-            if flush_accum(&mut accums[0], &mut window_idx, &mut window_cnt) {
+            let overflow = accums[0].take_overflow();
+            if flush_accum(&mut accums[0], &mut window_idx, &mut window_cnt) || overflow.is_some() {
                 if let Some(at) = at {
-                    apply_quantiles(
+                    apply_quantiles_with_overflow(
                         config,
                         &window_idx,
                         &window_cnt,
+                        overflow,
                         &quantile_floats,
                         &quantile_keys,
                         at,
@@ -646,18 +732,29 @@ fn quantiles_impl(
         series_idx,
         timestamp: t,
         snapshot,
+        overflow,
         ..
     } in rows
     {
         if t > end_ns {
             continue;
         }
+        let overflow_since = overflow
+            .map(|o| (overflow_delta(prev_overflow[series_idx], Some(o)), o.bound))
+            .filter(|(d, _)| *d > 0);
+        prev_overflow[series_idx] = overflow;
 
         if let Some(sp) = splitter.as_mut() {
             let prev = prev_per_series[series_idx].as_ref();
-            sp.row(series_idx, 0, prev, t, &snapshot, &mut |at, accums| {
-                emit_window(at, accums, &mut outputs)
-            });
+            sp.row_with_overflow(
+                series_idx,
+                0,
+                prev,
+                t,
+                &snapshot,
+                overflow_since,
+                &mut |at, accums| emit_window(at, accums, &mut outputs),
+            );
             prev_per_series[series_idx] = Some(snapshot);
             continue;
         }
@@ -665,19 +762,22 @@ fn quantiles_impl(
         // Emit previous tick on tick boundary.
         {
             if let Some(prev_t) = current_t {
-                if prev_t != t
-                    && prev_t >= start_ns
-                    && flush_accum(&mut tick_accum, &mut scratch_idx, &mut scratch_cnt)
-                {
-                    apply_quantiles(
-                        config,
-                        &scratch_idx,
-                        &scratch_cnt,
-                        &quantile_floats,
-                        &quantile_keys,
-                        prev_t,
-                        &mut outputs,
-                    );
+                if prev_t != t && prev_t >= start_ns {
+                    let overflow = tick_accum.take_overflow();
+                    if flush_accum(&mut tick_accum, &mut scratch_idx, &mut scratch_cnt)
+                        || overflow.is_some()
+                    {
+                        apply_quantiles_with_overflow(
+                            config,
+                            &scratch_idx,
+                            &scratch_cnt,
+                            overflow,
+                            &quantile_floats,
+                            &quantile_keys,
+                            prev_t,
+                            &mut outputs,
+                        );
+                    }
                 }
             }
         }
@@ -686,6 +786,9 @@ fn quantiles_impl(
         if t >= start_ns {
             if let Some(prev) = &prev_per_series[series_idx] {
                 accumulate_delta_into(prev, &snapshot, &mut tick_accum);
+                if let Some((d, bound)) = overflow_since {
+                    tick_accum.add_overflow(d, bound);
+                }
             }
         }
         prev_per_series[series_idx] = Some(snapshot);
@@ -695,11 +798,13 @@ fn quantiles_impl(
     if let Some(sp) = splitter.as_mut() {
         sp.finish(&mut |at, accums| emit_window(at, accums, &mut outputs));
     } else if let Some(t) = current_t.filter(|&t| t >= start_ns) {
-        if flush_accum(&mut tick_accum, &mut scratch_idx, &mut scratch_cnt) {
-            apply_quantiles(
+        let overflow = tick_accum.take_overflow();
+        if flush_accum(&mut tick_accum, &mut scratch_idx, &mut scratch_cnt) || overflow.is_some() {
+            apply_quantiles_with_overflow(
                 config,
                 &scratch_idx,
                 &scratch_cnt,
+                overflow,
                 &quantile_floats,
                 &quantile_keys,
                 t,
@@ -943,6 +1048,7 @@ fn irate_impl(
         timestamp: t,
         snapshot,
         resumes,
+        ..
     } in rows
     {
         if t > end_ns {
@@ -1244,6 +1350,48 @@ pub(super) fn apply_quantiles(
     t_ns: u64,
     out: &mut [Vec<QuantileRow>],
 ) {
+    apply_quantiles_with_overflow(config, idx, cnt, None, quantile_floats, keys, t_ns, out);
+}
+
+/// [`apply_quantiles`] over a population that also holds `overflow`
+/// observations above every bucket, above the bound given with them.
+///
+/// The rank is the histogram crate's nearest rank, `max(1, ceil(q·N))`,
+/// taken over the buckets and the overflow together. A rank past the
+/// buckets is in the overflow: the value is `+Inf`, the band
+/// `(bound, +Inf)`. A rank within them is the bucket holding it, reported
+/// as [`apply_quantiles`] reports one. With no overflow this is
+/// [`apply_quantiles`].
+#[allow(clippy::too_many_arguments)]
+pub(super) fn apply_quantiles_with_overflow(
+    config: Config,
+    idx: &[u32],
+    cnt: &[u64],
+    overflow: Option<(u64, f64)>,
+    quantile_floats: &[f64],
+    keys: &[(usize, f64, Quantile)],
+    t_ns: u64,
+    out: &mut [Vec<QuantileRow>],
+) {
+    if let Some((over, bound)) = overflow.filter(|(c, _)| *c > 0) {
+        let t_sec = t_ns as f64 / 1e9;
+        let finite = cnt.last().copied().unwrap_or(0);
+        let total = u128::from(finite) + u128::from(over);
+        let r = CumulativeROHistogramRef::from_parts_unchecked(config, idx, cnt);
+        for (out_idx, q, _) in keys {
+            let target = ((q * total as f64).ceil() as u128).clamp(1, total);
+            if target > u128::from(finite) {
+                out[*out_idx].push((t_sec, f64::INFINITY, Some((bound, f64::INFINITY))));
+                continue;
+            }
+            let pos = cnt.partition_point(|&c| u128::from(c) < target);
+            if let Some(bucket) = r.iter().nth(pos) {
+                let band = (bucket.start() as f64, bucket.end() as f64);
+                out[*out_idx].push((t_sec, band.1, Some(band)));
+            }
+        }
+        return;
+    }
     let r = CumulativeROHistogramRef::from_parts_unchecked(config, idx, cnt);
     let q_result: Result<Option<QuantilesResult>, _> = r.quantiles(quantile_floats);
     if let Ok(Some(qr)) = q_result {

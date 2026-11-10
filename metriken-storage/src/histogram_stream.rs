@@ -29,6 +29,23 @@ pub struct HistogramRow {
     /// sources marks the row before each change it takes from another
     /// source's rows; a reader of one source's rows sets it false.
     pub resumes: bool,
+    /// The series' overflow at this row, when its column names an overflow
+    /// series ([`OVERFLOW_KEY`](crate::OVERFLOW_KEY)) and that series has a
+    /// value in the same row. `None` for a histogram without one, as every
+    /// histogram recorded before the key existed is.
+    pub overflow: Option<Overflow>,
+}
+
+/// The observations of a histogram series above its highest finite bound,
+/// which its buckets do not hold.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Overflow {
+    /// The count since the series started, cumulative as the buckets are:
+    /// a reader differences it between rows, and a decrease is a reset.
+    pub count: f64,
+    /// The highest finite bound, in the histogram's value units
+    /// ([`OVERFLOW_BOUND_KEY`](crate::OVERFLOW_BOUND_KEY)).
+    pub bound: f64,
 }
 
 pub struct HistogramStream {
@@ -412,6 +429,7 @@ mod tests {
                     index: vec![1],
                     count: vec![c],
                 },
+                overflow: None,
             })),
         }
     }
@@ -434,6 +452,7 @@ mod tests {
                         index: vec![1],
                         count: vec![c],
                     },
+                    overflow: None,
                 })
             })
             .collect();

@@ -5,7 +5,8 @@ use metriken_model::{
     FloatCounter, FloatGauge, GroupSchema, GroupSnapshot, Histogram as SnapshotHistogram,
     MetricDesc, Snapshot, SnapshotV3,
 };
-use std::collections::{BTreeMap, HashMap};
+use metriken_storage::{OVERFLOW_BOUND_KEY, OVERFLOW_KEY};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tracing::{debug, warn};
@@ -19,7 +20,11 @@ use tracing::{debug, warn};
 /// counter; a gauge, any other untyped sample and a summary's quantile
 /// values are float gauges. The value is stored as served, whether or not
 /// it has a fraction. A NaN or infinite sample is dropped. A histogram's
-/// buckets are a histogram.
+/// buckets are a histogram. The observations above its highest finite
+/// bound, which only its `+Inf` bucket counts, are the float counter
+/// `<name>_overflow` with the histogram's labels, which the histogram's
+/// column names ([`OVERFLOW_KEY`], with its highest finite bound as
+/// [`OVERFLOW_BOUND_KEY`]); see [`convert_histogram`].
 ///
 /// Maintains a stable mapping from (metric_name, labels) to numeric IDs across
 /// scrapes within a recording session, ensuring consistent column identity.
@@ -37,6 +42,10 @@ pub struct PrometheusConverter {
     /// logged at `debug`, so an exporter that always serves a bad line warns
     /// once per converter (one endpoint's recording) rather than every tick.
     skips_warned: bool,
+    /// A histogram's overflow series was left out because the scrape has
+    /// a sample of the same name and labels. Logged at `warn` once per
+    /// converter, later at `debug`.
+    overflow_collision_warned: bool,
 }
 
 impl Default for PrometheusConverter {
@@ -62,6 +71,7 @@ impl PrometheusConverter {
             descriptions: BTreeMap::new(),
             descriptions_changed: false,
             skips_warned: false,
+            overflow_collision_warned: false,
         }
     }
 
@@ -112,6 +122,19 @@ impl PrometheusConverter {
         metadata
     }
 
+    fn log_overflow_collision(&mut self, name: &str) {
+        if self.overflow_collision_warned {
+            debug!("the scrape has its own {name}: the histogram's overflow series is left out");
+        } else {
+            self.overflow_collision_warned = true;
+            warn!(
+                "the scrape has its own {name}: the histogram's overflow series is left out, \
+                 and its quantiles leave out observations above its highest finite bucket \
+                 (later scrapes log at debug)"
+            );
+        }
+    }
+
     fn log_skipped(&mut self, count: usize, first: &str) {
         let (cut, more) = shown_line(first);
         let more = if more { " (cut)" } else { "" };
@@ -149,6 +172,12 @@ impl PrometheusConverter {
         let mut counters = Vec::new();
         let mut gauges = Vec::new();
         let mut histograms = Vec::new();
+        // Every scalar sample's (name, labels), which an overflow series must
+        // not take; and each histogram's overflow, written after the loop
+        // once those are all known.
+        let mut scalars: HashSet<MetricKey> = HashSet::new();
+        // (histogram name, labels, overflow, position in `histograms`)
+        let mut overflows: Vec<(MetricKey, f64, usize)> = Vec::new();
 
         // One window for the whole scrape: every sample in it was read by the
         // same request/response, so they share an acquisition instant.
@@ -157,6 +186,12 @@ impl PrometheusConverter {
         for sample in scrape.samples {
             // Sorted by name, which `MetricKey` relies on.
             let labels = sample.labels;
+            if !matches!(sample.value, Value::Histogram(_)) {
+                scalars.insert(MetricKey {
+                    name: sample.metric.clone(),
+                    labels: labels.clone(),
+                });
+            }
 
             match sample.value {
                 Value::Counter(v) => {
@@ -200,9 +235,17 @@ impl PrometheusConverter {
                     }
                 }
                 Value::Histogram(ref buckets) => {
-                    if let Some((h, metadata)) = convert_histogram(buckets, &sample.metric, &labels)
+                    if let Some((h, metadata, overflow)) =
+                        convert_histogram(buckets, &sample.metric, &labels)
                     {
                         let id = self.get_or_assign_id(&sample.metric, &labels);
+                        if let Some(overflow) = overflow {
+                            let key = MetricKey {
+                                name: sample.metric.clone(),
+                                labels: labels.clone(),
+                            };
+                            overflows.push((key, overflow, histograms.len()));
+                        }
                         histograms
                             .push(SnapshotHistogram::new(id, h, metadata).with_window(window));
                     }
@@ -228,6 +271,28 @@ impl PrometheusConverter {
                     }
                 }
             }
+        }
+
+        for (histogram, overflow, h) in overflows {
+            let key = MetricKey {
+                name: overflow_name(&histogram.name),
+                labels: histogram.labels,
+            };
+            if scalars.contains(&key) {
+                // The exporter's own series of that name is kept; this
+                // histogram reads as one without an overflow series.
+                let metadata = &mut histograms[h].metadata;
+                metadata.remove(OVERFLOW_KEY);
+                metadata.remove(OVERFLOW_BOUND_KEY);
+                self.log_overflow_collision(&key.name);
+                continue;
+            }
+            let MetricKey { name, labels } = key;
+            let id = self.get_or_assign_id(&name, &labels);
+            counters.push(
+                FloatCounter::new(id, overflow, self.build_metadata(&name, &labels))
+                    .with_window(window),
+            );
         }
 
         // One scrape is one acquisition — one request, one response, one
@@ -359,11 +424,18 @@ has_name_and_metadata!(FloatCounter, FloatGauge, SnapshotHistogram);
 /// For `_seconds` metrics, le values are multiplied by 1e9 to convert to
 /// nanoseconds, the unit metriken's latency histograms use. Other metrics use a
 /// generic power-of-10 scale that makes the smallest le boundary >= 1.
+///
+/// With a `+Inf` bucket, also returns the overflow, the `+Inf` count less
+/// the highest finite bucket's (at least 0), and writes into the metadata
+/// the overflow series' name ([`OVERFLOW_KEY`], see [`overflow_name`]) and
+/// the highest finite `le`, scaled as the buckets are
+/// ([`OVERFLOW_BOUND_KEY`]). Without one (not valid exposition), there is no
+/// overflow and the histogram is as before.
 fn convert_histogram(
     buckets: &[HistogramCount],
     metric_name: &str,
     labels: &[(String, String)],
-) -> Option<(histogram::Histogram, HashMap<String, String>)> {
+) -> Option<(histogram::Histogram, HashMap<String, String>, Option<f64>)> {
     // Filter to finite boundaries only (+Inf cannot be represented)
     let finite_buckets: Vec<_> = buckets
         .iter()
@@ -419,7 +491,29 @@ fn convert_histogram(
     metadata.insert("grouping_power".to_string(), grouping_power.to_string());
     metadata.insert("max_value_power".to_string(), max_value_power.to_string());
 
-    Some((h, metadata))
+    // The highest finite bucket, by bound rather than by position.
+    let top = finite_buckets
+        .iter()
+        .max_by(|a, b| a.less_than.total_cmp(&b.less_than))?;
+    let overflow = buckets
+        .iter()
+        .find(|b| b.less_than == f64::INFINITY && b.count.is_finite())
+        .map(|inf| (inf.count - top.count).max(0.0));
+    if overflow.is_some() {
+        metadata.insert(OVERFLOW_KEY.to_string(), overflow_name(metric_name));
+        metadata.insert(
+            OVERFLOW_BOUND_KEY.to_string(),
+            (top.less_than * scale).to_string(),
+        );
+    }
+
+    Some((h, metadata, overflow))
+}
+
+/// The name of histogram `metric`'s overflow series. Readers find it
+/// through the histogram's [`OVERFLOW_KEY`], not by this rule.
+fn overflow_name(metric: &str) -> String {
+    format!("{metric}_overflow")
 }
 
 /// Compute a power-of-10 scale factor that makes the smallest positive le
@@ -556,6 +650,44 @@ mod tests {
                 ("b".into(), "Bananas.".into()),
             ])
         );
+    }
+
+    /// A histogram's overflow is the `+Inf` count less the highest finite
+    /// bucket's, found by bound whatever the line order, and its bound is
+    /// scaled as the buckets are: ×1e9 for a `_seconds` name. A histogram
+    /// without a `+Inf` bucket has neither.
+    #[test]
+    fn the_overflow_is_above_the_highest_finite_bound_scaled() {
+        let mut conv = PrometheusConverter::new();
+        let text = "# TYPE lat_seconds histogram
+                    lat_seconds_bucket{le=\"10\"} 9
+                    lat_seconds_bucket{le=\"+Inf\"} 12
+                    lat_seconds_bucket{le=\"1\"} 5
+                    # TYPE short histogram
+                    short_bucket{le=\"1\"} 5
+";
+        let mut snap = conv.convert(text, 0, 1);
+        let overflow: Vec<_> = snap
+            .float_counters()
+            .into_iter()
+            .map(|c| (c.metadata["metric"].clone(), c.value))
+            .collect();
+        assert_eq!(overflow, vec![("lat_seconds_overflow".to_string(), 3.0)]);
+        let hists = snap.histograms();
+        let meta = |name: &str| {
+            hists
+                .iter()
+                .find(|h| h.metadata["metric"] == name)
+                .unwrap()
+                .metadata
+                .clone()
+        };
+        let lat = meta("lat_seconds");
+        assert_eq!(lat[OVERFLOW_KEY], "lat_seconds_overflow");
+        assert_eq!(lat[OVERFLOW_BOUND_KEY], "10000000000");
+        let short = meta("short");
+        assert!(!short.contains_key(OVERFLOW_KEY));
+        assert!(!short.contains_key(OVERFLOW_BOUND_KEY));
     }
 
     /// An exporter's trailing timestamp does not become the acquisition

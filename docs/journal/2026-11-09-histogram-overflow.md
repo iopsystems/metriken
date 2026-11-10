@@ -1,7 +1,8 @@
 # Histogram overflow: observations above the highest finite bucket
 
-**Status:** OPEN. Design 2026-11-09. Four decisions below need the owner
-(D1–D4); nothing is built.
+**Status:** OPEN. Design 2026-11-09, owner decisions the same day (below).
+Built on branch `feat/histogram-overflow` (see "As built"); not merged, not
+released.
 Issue #377.
 
 ## Goal
@@ -66,9 +67,10 @@ the population: a quantile that falls in it reads `+Inf`, with the band
 ## Settled from the code
 
 1. **The overflow series.** The converter writes, for each histogram whose
-   scrape has a `+Inf` bucket, a float counter named `<histogram name>_overflow`
-   with the histogram's labels, valued `+Inf count − the cumulative count
-   at the highest finite le`, clamped at 0. It is a float counter because
+   scrape has a `+Inf` bucket, a float counter named
+   `<histogram name>_overflow` with the histogram's labels, valued
+   `+Inf count − the cumulative count at the highest finite le`, clamped
+   at 0. It is a float counter because
    bucket counts are f64 in exposition and every Prometheus scalar is a
    float counter or gauge since #384. It is written every scrape,
    including when it is 0, so a rate over it has rows at the histogram's
@@ -99,14 +101,15 @@ the population: a quantile that falls in it reads `+Inf`, with the band
    join of the histogram stream with a separately read counter would
    difference the overflow over different intervals once
    `merge_on_clock` has moved the histogram rows. So the leaf readers
-   (parquet, segmented, memory) attach each row's cumulative overflow to
-   the `HistogramRow`, and merge and rebucket carry it unchanged. A
-   decrease is a reset and contributes 0, as `delta_walk` does per bucket.
-   This needs metriken-storage changes, and they are breaking
-   (`HistogramRow` and `HistogramStreamMeta` are public structs with public
-   fields; `HistogramRow {` appears, as a literal or a pattern, at 15 sites in the workspace). The work is
-   therefore recorder, storage and query, not recorder and query. That is
-   forced by the re-stamping, not chosen.
+   (the parquet reader, which the segmented reader uses per segment, and
+   `Memory`) attach each row's cumulative overflow to the `HistogramRow`,
+   and merge and rebucket carry it unchanged. A decrease is a reset and
+   contributes 0, as `delta_walk` does per bucket. This needs a breaking
+   metriken-storage change: `HistogramRow` is a public struct with public
+   fields, and gains one. (The design first named `HistogramStreamMeta`
+   too; as built, the bound travels on each row and the meta is unchanged.)
+   The work is therefore recorder, storage and query, not recorder and
+   query. That is forced by the re-stamping, not chosen.
 6. **Per-series, so per-process and multi-source.** Each histogram series
    has its own overflow series with the same labels, so a selector that
    matches several processes or sources pools each one's overflow with
@@ -124,108 +127,90 @@ the population: a quantile that falls in it reads `+Inf`, with the band
    the link and returns the old, low quantile without an error. This is
    accepted: the only way to refuse instead is a segment format bump,
    which would make an older reader refuse the whole recording to avoid
-   one low quantile (D5 below, recommended against). What else an older
-   reader shows depends on D1.
+   one low quantile (D4). An older metriken-storage (0.8.0 and before)
+   also shows the histogram's two new keys as labels (D1).
 
-## Open decisions (owner)
+## Decisions (owner, 2026-11-09)
 
-### D1. Which column metadata keys carry the link and the bound
+All four as recommended.
 
-The histogram column needs two values: the overflow series' metric name
-and the top bound. Two ways fit the code:
+- **D1. Storage keys `overflow` and `overflow_bound`** in `STORAGE_KEYS`,
+  with names index `MNI2`. The alternative, internal labels
+  `__overflow__` and `__overflow_bound__`, was rejected: they would be
+  series identity, so the same histogram before and after the change, or
+  after a change of its top bound, would be two series in every reader.
+  `MNI2` is defined so that #379's scale-factor key joins it if it is added
+  before the metriken-storage release that first writes `MNI2` (0.9.0);
+  a key added after that release needs `MNI3`. Cost, stated: a reader on
+  metriken-storage 0.8.0 or earlier shows the two keys as labels on the
+  histogram.
+- **D2. Non-finite values in a query result's JSON are the strings
+  `"+Inf"`, `"-Inf"`, `"NaN"`**, as the Prometheus HTTP API writes them,
+  and either form is read. This covers `Sample::value` and `interval`,
+  `MatrixSample::values`, `intervals` and `bands`, and a scalar result.
+  Finite values encode as before. A NaN result, `null` before, is now
+  `"NaN"`. Rejected: keeping the derived encoding (`null`, which
+  `MatrixSample`'s `Deserialize` refuses), and reporting the top bound as
+  the value (the reading the issue rejected, and the band still non-finite).
+  The rezolus frontend must handle a string in a value slot (follow-up
+  there).
+- **D3. Quantile functions only.** `histogram_count`, `histogram_sum`,
+  `histogram_mean`, `histogram_irate` and the heatmap read the finite
+  buckets as before, so `histogram_count` still differs from `_count` by
+  the overflow. Follow-up: count the overflow in `histogram_count` (exact,
+  no band), and decide what `histogram_sum` and `histogram_mean` do with an
+  unbounded part.
+- **D4. No segment format bump.** An older reader returns the old, low
+  quantile without an error (settled item 9). Versions: metriken-recorder
+  0.10.0, metriken-storage 0.9.0, metriken-query 0.46.0, all breaking. The
+  CHANGELOG says that older readers show one extra counter per histogram
+  and return the old quantile.
 
-- **(a) Storage keys `overflow` and `overflow_bound`**, added to
-  `STORAGE_KEYS`. This is the existing convention for a value that
-  describes the column (`grouping_power`, `max_value_power`). Costs: a
-  names index `MNI2` (`names.rs`); the key values must be plumbed from
-  column metadata into `HistogramStreamMeta` (per series), since today
-  only `Labels` reach it. User-visible: a reader on metriken-storage 0.8
-  or earlier (rezolus before its update, metriken-query 0.45) shows
-  `overflow="<name>_overflow"` and `overflow_bound="10000000000"` as two
-  labels on the histogram, so in such a reader the same histogram
-  recorded before and after the change is two series with different
-  label sets.
-- **(b) Internal labels `__overflow__` and `__overflow_bound__`.** No
-  storage key, no index bump; they reach the query in `Labels` already,
-  and a consumer that follows `is_internal_label` hides them from listings and legends (rezolus does, per #379). Costs: they are
-  series identity (`labels.rs`, `is_internal_label`), so the same
-  histogram before and after the change is two series in every reader,
-  new ones included, and a change of the top bound alone splits the
-  series. It contradicts `labels.rs`'s "No writer in this workspace emits
-  a `__` key into column metadata" (#379 plans `__prometheus_name__`, so
-  that sentence changes either way).
+## As built
 
-Recommendation: (a). The bound and the link describe the column, which is
-what storage keys are for, and new readers then keep one series across
-the change. #379 also adds a column key (the generic scale factor), so the
-`MNI2` bump can be shared if the two land in one storage release.
+- **Recorder** (`metriken-recorder/src/prometheus.rs`): `convert_histogram`
+  returns the overflow and writes the two keys; `convert` writes the
+  overflow counters after every sample is read, so a scrape's own sample
+  of the same name and labels, of any scalar kind, is known first. On such
+  a collision the histogram loses both keys and the converter logs once at
+  `warn`, then at `debug`. The highest finite bucket is the one with the
+  highest bound, whatever the line order.
+- **Storage**: `OVERFLOW_KEY` and `OVERFLOW_BOUND_KEY` (`labels.rs`) are in
+  `STORAGE_KEYS`, and in the writer's list of keys that describe a column
+  rather than an occupant (`writer.rs`). `HistogramRow` gains
+  `overflow: Option<Overflow>` (`histogram_stream.rs`); merge, re-stamping
+  and rebucketing move rows whole, so they carry it unchanged. The parquet
+  reader (`ParquetHistogramCursor`) reads each counting histogram's
+  overflow counter, the counter column of the named metric with the same
+  labels (so, in a long segment, the same occupant), from the same row
+  group pages, and attaches its value to the histogram row of the same row.
+  `Memory` (the live path) records the link from the ingested metadata
+  (`set_histogram_overflow`) and attaches the counter's sample at the
+  histogram row's timestamp. The names index is written as `MNI2`; an
+  `MNI1` index is still read, and its columns frame's label sets lose any
+  key that is a storage key now, which is what a read of the segment's
+  footer gives.
+- **Query**: a series' overflow delta between rows is
+  `round(curr − prev)`, 0 when either row has none or the count went down
+  (`overflow_delta`). It is pooled per tick, or shared among stride
+  windows in proportion to overlap as the bucket deltas are
+  (`Splitter::row_with_overflow`). A window's band uses the lowest bound
+  among the series whose overflow it holds. The process-group combine
+  (`per_source.rs`, `Combined`) sums the overflow deltas of the pairs it
+  takes as it sums bucket deltas. `apply_quantiles_with_overflow` applies
+  the rank rule (settled item 4). JSON: `promql/json_f64.rs`.
 
-### D2. How `+Inf` reaches a JSON consumer
-
-The issue asks for value `+Inf` and band `[top, +Inf)`. With the derived
-`Serialize`, both become `null` in JSON: the value reads as a gap in a
-chart, the band as `[top, null]`, and `MatrixSample`'s own `Deserialize`
-refuses the whole result ("invalid type: null, expected f64"). Options:
-
-- **(a) Keep the derived encoding** and accept `null`. A consumer that
-  deserializes `MatrixSample` breaks on any result with an overflow
-  quantile.
-- **(b) Write non-finite values as the strings `"+Inf"`, `"-Inf"`,
-  `"NaN"`** (Prometheus's HTTP API spelling) in `values`, `intervals` and
-  `bands`, and read both numbers and those strings. Finite values encode
-  as today. This also changes what a NaN result (a binary op's
-  `unwrap_or(f64::NAN)` in `dispatch.rs`) encodes to, which is `null`
-  today. The rezolus frontend must handle a string in a numeric slot.
-- **(c) Report the top bound as the value** with band `(top, +Inf)`, so
-  only the band is non-finite. Still `null` in the band; and the value
-  then claims the observation finished at the bound, the reading the
-  issue rejected.
-
-Recommendation: (b), with the rezolus frontend change listed as a
-follow-up there.
-
-### D3. Whether the other histogram functions count the overflow
-
-`histogram_count`, `histogram_sum`, `histogram_mean`, `histogram_irate`
-and the heatmap read the same buckets. Options:
-
-- **(a) Quantiles only** (the issue's scope). The others exclude the
-  overflow, documented; `histogram_count` still differs from `_count` by
-  the overflow.
-- **(b) Also `histogram_count`**, which is exact (no band). Then
-  `histogram_sum` and `histogram_mean`, which `reduce` computes from the
-  same pooled buckets, either stay finite-only (and disagree with count)
-  or become unbounded above (band upper end `+Inf`).
-
-Recommendation: (a) here, with (b) as a separate issue, since it changes
-three functions' results and their bands.
-
-### D4. Versions
-
-With the recommendations for D1–D3: metriken-recorder 0.10.0 (a new series per histogram
-is a change to what every recording holds, and a breaking change to any
-reader that enumerates a scrape's counters), metriken-storage 0.9.0
-(`HistogramRow`/`HistogramStreamMeta` fields, `STORAGE_KEYS` contents),
-metriken-query 0.46.0 (requires storage 0.9.0, and `histogram_quantile`
-results change). D2 (b) is a further breaking change to query's JSON.
-
-### D5. (Recommended against) a segment format bump
-
-A format bump would make metriken-storage 0.8 refuse a segment holding an
-overflow link, so an older reader could not return a low quantile. It
-would also make that reader refuse every other column in the recording.
-Not recommended; settled item 9 states the silent old answer instead.
-
-## Order of work (after D1–D4)
+## Order of work (done)
 
 1. metriken-recorder: the overflow series, the column keys, collision
    handling.
-2. metriken-storage: the keys (if D1 (a)), the per-series overflow on
-   `HistogramRow` from the parquet, segmented and memory readers, carried
-   through merge, `merge_on_clock` and rebucket.
-3. metriken-query: the rank rule and the open band in `apply_quantiles`'
-   callers; JSON encoding per D2.
-4. Tests through exposition text → `PrometheusConverter` → `ArchiveWriter`
-   → archive → PromQL: the issue's scrape; a stride window; two processes
-   pooled; two recordings, one without the overflow; an older recording
-   alone.
+2. metriken-storage: the keys, `MNI2`, the per-row overflow from the
+   parquet reader and `Memory`.
+3. metriken-query: the rank rule and the open band; the process-group
+   combine; the JSON encoding.
+4. Tests through exposition text → `PrometheusConverter` →
+   `ArchiveWriter` → archive → PromQL
+   (`metriken-recorder/tests/histogram_overflow.rs`): the issue's scrape; a
+   stride window; two series pooled; an older recording alone, pooled with
+   a newer one, and as the earlier half of one process; the name
+   collision; the live `MemoryStore`; the JSON of a `+Inf` result.

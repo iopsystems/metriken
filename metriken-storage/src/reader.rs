@@ -213,7 +213,7 @@ struct KnownNames {
 #[derive(Clone)]
 enum Listed {
     /// The columns frame of the segment's names index, compressed.
-    Frame(Arc<[u8]>),
+    Frame(crate::names::Frame),
     /// The footer of the probe at this position, parsed at open.
     Probe(usize),
     /// Read from a footer parsed at open.
@@ -328,9 +328,7 @@ fn table_probes(
                             known.first = Some(intervals);
                         }
                         match (columns, known.listed.as_mut()) {
-                            (Some(columns), Some(listed)) => {
-                                listed.push(Listed::Frame(columns.into()))
-                            }
+                            (Some(columns), Some(listed)) => listed.push(Listed::Frame(columns)),
                             _ => known.listed = None,
                         }
                         false

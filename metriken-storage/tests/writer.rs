@@ -1109,6 +1109,17 @@ fn a_metric_that_first_appears_in_a_later_segment_is_found() {
         let (_, built) = listings_and_readers_built(&counted, &path);
         assert_eq!(built.len(), 2, "finalize={finalize}: {built:?}");
 
+        // A version 1 index, as metriken-storage 0.8.0 wrote, is taken as a
+        // version 2 one: the same listing, with no reader built and no
+        // segment fetched.
+        let (counted, fetched) = open_counting_with(&path, &pool, Indexes::Version1);
+        let (v1_listed, built) = listings_and_readers_built(&counted, &path);
+        if finalize {
+            assert_eq!(v1_listed, listed);
+            assert_eq!(built, Vec::<String>::new());
+            assert_eq!(fetched.get().0, 0);
+        }
+
         // Segments sealed before names indexes: with a fingerprint each,
         // every segment whose fingerprint is new is fetched, and the names
         // are complete; with none, only each table's first.
@@ -1204,8 +1215,11 @@ enum Indexes {
     /// A names index per segment naming a segment format newer than this
     /// reader reads (the footers are not changed).
     Newer,
-    /// A names index of a version this reader does not know (`MNI2`).
+    /// A names index of a version this reader does not know (`MNI3`).
     LaterVersion,
+    /// The stored indexes relabelled as version 1 (`MNI1`), as
+    /// metriken-storage 0.8.0 and earlier wrote them: read as version 2.
+    Version1,
     /// The stored indexes with every segment's but the first removed, as
     /// dendro's compaction leaves merged segments.
     FirstOnly,
@@ -1289,7 +1303,18 @@ impl Catalog for Counting {
             Indexes::None => Vec::new(),
             Indexes::LaterVersion => stored
                 .into_iter()
-                .map(|(seq, _)| (seq, Some(b"MNI2a later index".to_vec())))
+                .map(|(seq, _)| (seq, Some(b"MNI3a later index".to_vec())))
+                .collect(),
+            Indexes::Version1 => stored
+                .into_iter()
+                .map(|(seq, index)| {
+                    let index = index.map(|mut index| {
+                        assert!(index.starts_with(b"MNI2"));
+                        index[3] = b'1';
+                        index
+                    });
+                    (seq, index)
+                })
                 .collect(),
             Indexes::FingerprintFirstOnly => stored
                 .into_iter()

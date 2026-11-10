@@ -925,6 +925,7 @@ mod tests {
                     index: vec![],
                     count: vec![],
                 },
+                overflow: None,
             });
             Some(HistogramStream {
                 meta: HistogramStreamMeta {

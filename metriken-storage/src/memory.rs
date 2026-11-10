@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::histogram_stream::{HistogramRow, HistogramStream, HistogramStreamMeta};
+use crate::histogram_stream::{HistogramRow, HistogramStream, HistogramStreamMeta, Overflow};
 use crate::labels::Labels;
 #[cfg(feature = "ingest")]
 use crate::types::HistogramSnapshot;
@@ -17,6 +17,10 @@ pub struct Memory {
     /// Gauge histogram series: stored as histograms are, listed and read
     /// apart (`DataSource::gauge_histogram_stream`).
     gauge_histograms: HashMap<String, Vec<Histogram>>,
+    /// Per histogram name and series labels: its overflow counter's name
+    /// and the histogram's highest finite bound
+    /// ([`set_histogram_overflow`](Self::set_histogram_overflow)).
+    histogram_overflows: HashMap<String, HashMap<Labels, (String, f64)>>,
     interval_ms: u64,
     /// The row timestamps a caller declared, if it did. See
     /// [`DataSource::sample_timestamps`]; a source assembled from a table
@@ -32,6 +36,7 @@ impl Memory {
             gauges: HashMap::new(),
             histograms: HashMap::new(),
             gauge_histograms: HashMap::new(),
+            histogram_overflows: HashMap::new(),
             interval_ms,
             sample_timestamps: None,
         }
@@ -65,6 +70,41 @@ impl Memory {
             .entry(name.to_string())
             .or_default()
             .push(histogram);
+    }
+
+    /// Name the overflow series of histogram `name`'s series `labels`: the
+    /// counter `overflow` with the same labels, whose value at a histogram
+    /// row's timestamp is that row's overflow, above `bound`. What a
+    /// histogram column's [`OVERFLOW_KEY`](crate::OVERFLOW_KEY) and
+    /// [`OVERFLOW_BOUND_KEY`](crate::OVERFLOW_BOUND_KEY) say in a recording.
+    pub fn set_histogram_overflow(
+        &mut self,
+        name: &str,
+        labels: Labels,
+        overflow: &str,
+        bound: f64,
+    ) {
+        self.histogram_overflows
+            .entry(name.to_string())
+            .or_default()
+            .insert(labels, (overflow.to_string(), bound));
+    }
+
+    /// The overflow of histogram `name`'s series `labels` at `ts`, when the
+    /// series names an overflow counter and that counter has a sample at
+    /// `ts`.
+    fn overflow_at(&self, name: &str, labels: &Labels, ts: u64) -> Option<Overflow> {
+        let (counter, bound) = self.histogram_overflows.get(name)?.get(labels)?;
+        let series = self
+            .counters
+            .get(counter)?
+            .iter()
+            .find(|c| &c.labels == labels)?;
+        let i = series.timestamps.binary_search(&ts).ok()?;
+        Some(Overflow {
+            count: series.values.get(i)?.as_f64(),
+            bound: *bound,
+        })
     }
 
     pub fn set_sample_timestamps(&mut self, ts: Vec<u64>) {
@@ -251,6 +291,7 @@ fn histogram_rows(
     filter: &Labels,
     start_ns: u64,
     end_ns: u64,
+    overflow: impl Fn(&Labels, u64) -> Option<Overflow>,
 ) -> Option<HistogramStream> {
     let mut series_labels: Vec<crate::labels::Labels> = Vec::new();
     let mut config: Option<::histogram::Config> = None;
@@ -283,6 +324,7 @@ fn histogram_rows(
                     index: snap.index.clone(),
                     count: snap.count.clone(),
                 },
+                overflow: overflow(&hist.labels, *ts),
             });
         }
     }
@@ -385,7 +427,13 @@ impl DataSource for Memory {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<HistogramStream> {
-        histogram_rows(self.histograms.get(name)?, filter, start_ns, end_ns)
+        histogram_rows(
+            self.histograms.get(name)?,
+            filter,
+            start_ns,
+            end_ns,
+            |labels, ts| self.overflow_at(name, labels, ts),
+        )
     }
 
     fn gauge_histogram_stream(
@@ -395,7 +443,13 @@ impl DataSource for Memory {
         start_ns: u64,
         end_ns: u64,
     ) -> Option<HistogramStream> {
-        histogram_rows(self.gauge_histograms.get(name)?, filter, start_ns, end_ns)
+        histogram_rows(
+            self.gauge_histograms.get(name)?,
+            filter,
+            start_ns,
+            end_ns,
+            |_, _| None,
+        )
     }
 
     fn interval(&self) -> f64 {
