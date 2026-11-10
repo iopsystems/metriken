@@ -1068,17 +1068,42 @@ pub(crate) fn refuse_duplicated(
     else {
         return Ok(());
     };
-    let shown: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v:?}")).collect();
-    Err(QueryError::EvaluationError(format!(
-        "the series {name}{{{}}} is two or more stored series with one label set (columns \
-         of one table, or values of one snapshot), and reading them as one series \
-         interleaves their samples. They differ only by a key that is not a label ({}); \
-         metriken-recorder 0.12.0 and earlier stored an exporter label with one of those \
-         names under that key. Select other series of {name} with a label matcher; \
+    Err(joined_series(
+        name,
+        labels.iter(),
+        "is two or more stored series with one label set (columns of one table, or values \
+         of one snapshot), and reading them as one series interleaves their samples",
+    ))
+}
+
+/// The error for series `name` with `labels` read as one series from two
+/// or more stored ones: `what` says how it was found. The footer check
+/// ([`refuse_duplicated`]) and the readers that find a series' samples out
+/// of time order give it.
+pub(crate) fn joined_series<'a>(
+    name: &str,
+    labels: impl Iterator<Item = (&'a String, &'a String)>,
+    what: &str,
+) -> QueryError {
+    let mut shown: Vec<String> = labels
+        .filter(|(k, _)| k.as_str() != "__name__")
+        .map(|(k, v)| format!("{k}={v:?}"))
+        .collect();
+    shown.sort();
+    // `metric` is the name: columns that differ by it are other series.
+    let keys: Vec<&str> = metriken_storage::STORAGE_KEYS
+        .iter()
+        .copied()
+        .filter(|k| *k != "metric")
+        .collect();
+    QueryError::EvaluationError(format!(
+        "the series {name}{{{}}} {what}. Two columns can hold one label set when they differ \
+         only by a key that is not a label ({}), as an exporter label with one of those names \
+         recorded under that key does. Select other series of {name} with a label matcher; \
          metriken-recorder 0.13.0 and later store such a label as exported_<key>",
         shown.join(", "),
-        metriken_storage::STORAGE_KEYS.join(", "),
-    )))
+        keys.join(", "),
+    ))
 }
 
 impl QueryEngine {

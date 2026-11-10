@@ -253,6 +253,10 @@ fn an_archive_written_before_the_rename_refuses_the_joined_series() {
                 err.contains(&series) && err.contains("two or more stored series"),
                 "per_series={per_series} {query}: {err}"
             );
+            assert!(
+                err.contains("(metric_type, unit,") && !err.contains("metric, "),
+                "the keys listed are those two series of one name can differ by: {err}"
+            );
         }
         let job = matrix(&reader, "rate(x_total{job=\"j\"}[3s])", per_series);
         assert_eq!(job.len(), 1, "{job:?}");

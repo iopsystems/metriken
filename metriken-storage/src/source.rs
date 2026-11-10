@@ -228,14 +228,17 @@ pub trait DataSource: Send + Sync {
     /// The label sets, as this source presents them, of metric `name`'s
     /// series that more than one column of one kind (counters, gauges,
     /// histograms, gauge histograms) carries within one parquet file or
-    /// segment. A read joins such columns into one series, interleaving
+    /// segment, where the footer's null counts show those columns holding
+    /// values in one row; and, for a live source, a series one snapshot
+    /// gave twice. A read joins such columns into one series, interleaving
     /// their samples, so metriken-query refuses a selector matching one.
     ///
-    /// Two columns of a file get one label set when they differed only by
-    /// a [storage key](crate::STORAGE_KEYS), which `Labels::from_metadata`
-    /// removes: metriken-recorder 0.12.0 and earlier stored an exporter
-    /// label named `unit`, `scale` or another storage key under that key.
-    /// The `*_labels` listings show such a series once, as before.
+    /// Two columns of a file have one label set when they differ only by a
+    /// [storage key](crate::STORAGE_KEYS), which `Labels::from_metadata`
+    /// removes. Columns that follow one another in rows, as a series whose
+    /// value type or histogram bound changed within the file does, are not
+    /// reported; nor are columns whose shared rows the null counts do not
+    /// prove. The `*_labels` listings show such a series once.
     ///
     /// Empty by default. A source wrapping others forwards this, adding
     /// the labels it adds to their series, or the duplicates are not
