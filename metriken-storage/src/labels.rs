@@ -8,9 +8,10 @@ use regex::Regex;
 ///
 /// `metric` is the series name (exposed to PromQL as `__name__`),
 /// `metric_type` and `unit` describe the value, `grouping_power` /
-/// `max_value_power` are a histogram's bucket configuration, and
+/// `max_value_power` are a histogram's bucket configuration,
 /// [`OVERFLOW_KEY`] / [`OVERFLOW_BOUND_KEY`] name a histogram's overflow
-/// series and its highest finite bound. Every loader
+/// series and its highest finite bound, and [`SCALE_KEY`] is the factor a
+/// histogram's values were stored multiplied by. Every loader
 /// consults this one list: the parquet path and the `ingest` path used to
 /// keep separate lists that had drifted by the two histogram keys, so the
 /// same recording carried two extra labels per histogram when viewed live.
@@ -35,7 +36,17 @@ pub const STORAGE_KEYS: &[&str] = &[
     "max_value_power",
     OVERFLOW_KEY,
     OVERFLOW_BOUND_KEY,
+    SCALE_KEY,
 ];
+
+/// The histogram column key holding the factor its values were stored
+/// multiplied by, as an `f64`: a stored bucket bound is the observation, in
+/// the column's `unit` (or the exporter's unit when there is none), times
+/// it. Written by metriken-recorder's Prometheus converter when the factor
+/// is not 1, which is when the bounds would otherwise have been truncated
+/// to integers (a smallest bound below 1). A reader that wants the values
+/// in their unit divides by it; metriken-query does not.
+pub const SCALE_KEY: &str = "scale";
 
 /// The histogram column key naming its overflow series: the metric name of
 /// a counter, with the histogram's labels, that counts the observations
@@ -68,10 +79,12 @@ pub fn is_storage_key(key: &str) -> bool {
 /// from listings and legends is the consumer's contract, not something done
 /// here, which is why the predicate is public.
 ///
-/// No writer in this workspace emits a `__` key into column metadata, and
-/// the loader does not check for one: a key with the prefix that did arrive
-/// would be kept as a label (the loaders strip only storage keys) and could
-/// collide with a label the engine injects.
+/// The one `__` key a writer in this workspace emits into column metadata
+/// is [`PROMETHEUS_NAME_LABEL`](crate::PROMETHEUS_NAME_LABEL), the name an
+/// exporter served a renamed series under (metriken-recorder's Prometheus
+/// converter). The loader does not check for others: a key with the
+/// prefix that did arrive would be kept as a label (the loaders strip only
+/// storage keys) and could collide with a label the engine injects.
 ///
 /// The engine's own internal labels are `__name__` (the series name) and
 /// `__run__` (a histogram whose bucket configuration changed mid-recording).
@@ -376,7 +389,8 @@ mod tests {
                 "grouping_power",
                 "max_value_power",
                 "overflow",
-                "overflow_bound"
+                "overflow_bound",
+                "scale"
             ]
         );
         for k in STORAGE_KEYS {
@@ -413,6 +427,7 @@ mod tests {
             ("unit", "nanoseconds"),
             ("grouping_power", "7"),
             ("max_value_power", "64"),
+            ("scale", "10"),
             ("cpu", "3"),
             ("__run__", "1"),
         ]

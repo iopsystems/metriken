@@ -6,12 +6,23 @@
 // Keys in column metadata that describe the column rather than the series.
 // A query result never carries them, but a listing built from raw metadata
 // can, so consumers that read metadata directly filter them the same way.
-export const STORAGE_KEYS = ['metric', 'metric_type', 'unit', 'grouping_power', 'max_value_power'];
+export const STORAGE_KEYS = [
+    'metric',
+    'metric_type',
+    'unit',
+    'grouping_power',
+    'max_value_power',
+    'overflow',
+    'overflow_bound',
+    'scale',
+];
 
 export const isStorageKey = (key) => STORAGE_KEYS.includes(key);
 
 // An internal label is part of a series' identity and matchable in a
-// selector, and never shown: `__name__`, `__run__`, `__incarnation__`. The
+// selector, and never shown: `__name__`, `__run__`, `__incarnation__`,
+// `__prometheus_name__` (the name a Prometheus exporter served a renamed
+// series under). The
 // prefix is the whole rule. The server's label order is not fixed, so a
 // legend that took "the first label that is not __name__" could print one.
 export const isInternalLabel = (key) => key.startsWith('__');

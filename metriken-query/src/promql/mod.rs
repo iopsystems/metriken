@@ -12,6 +12,9 @@ use crate::{DataSource, QueryOptions};
 
 mod columns;
 pub(crate) mod json_f64;
+pub(crate) mod prometheus_names;
+#[cfg(feature = "archive")]
+pub(crate) use columns::Selector;
 pub use columns::{referenced_metrics, selector_filter};
 #[cfg(feature = "archive")]
 pub(crate) use columns::{repeated_matcher, selectors};
@@ -678,6 +681,17 @@ pub(crate) struct QueryEngine {
     /// The process groups among `source`'s recordings that a leaf reads per
     /// member (`streaming::per_source`); `None` when there are none.
     groups: Option<Arc<streaming::per_source::SourceGroups>>,
+    /// Each selector's stored name when it names a series by its exporter
+    /// name, resolved by the caller over what each selector reaches (an
+    /// archive's `Plan`); `None` to resolve over the whole of `source`
+    /// ([`prometheus_names`]).
+    names: Option<Arc<prometheus_names::NameResolution>>,
+    /// Every name `source` holds, listed on the first selector that needs
+    /// them and kept for the engine's life: one query for `MemoryStore` and
+    /// archives; the reader's life for `ParquetReader`,
+    /// `SegmentedParquetReader` and `UnionMetricsSource`, whose names are
+    /// fixed at open.
+    held: std::sync::OnceLock<std::collections::HashSet<String>>,
 }
 
 /// Try to parse an optional stride (in seconds) from the trailing argument.
@@ -1041,7 +1055,38 @@ impl QueryEngine {
         Self {
             source,
             groups: None,
+            names: None,
+            held: std::sync::OnceLock::new(),
         }
+    }
+
+    /// This engine with the stored name of each selector that names a
+    /// series by its exporter name decided by the caller: a selector not in
+    /// `names` reads its own name.
+    #[cfg_attr(not(feature = "archive"), allow(dead_code))]
+    pub(crate) fn with_names(mut self, names: Arc<prometheus_names::NameResolution>) -> Self {
+        self.names = Some(names);
+        self
+    }
+
+    /// The stored name a selector of `name` with `filter` reads instead,
+    /// if any ([`prometheus_names`]).
+    fn stored_name(&self, name: &str, filter: &Labels) -> Result<Option<String>, QueryError> {
+        match &self.names {
+            Some(names) => Ok(names.get(&(name.to_string(), filter.clone())).cloned()),
+            None => {
+                let held = self
+                    .held
+                    .get_or_init(|| prometheus_names::held_names(&*self.source));
+                prometheus_names::stored_name(&*self.source, held, name)
+            }
+        }
+    }
+
+    /// `expr`'s selectors pointed at stored names where they name a series
+    /// by its exporter name.
+    pub(crate) fn resolve_names(&self, expr: &mut Expr) -> Result<(), QueryError> {
+        prometheus_names::resolve_selectors(expr, &|name, filter| self.stored_name(name, filter))
     }
 
     /// An engine over `source`, some of whose recordings form the process
@@ -1054,6 +1099,8 @@ impl QueryEngine {
         Self {
             source,
             groups: Some(Arc::new(groups)),
+            names: None,
+            held: std::sync::OnceLock::new(),
         }
     }
 
@@ -1180,7 +1227,21 @@ impl QueryEngine {
         })
     }
 
+    /// A histogram function's selector: its metric name and filter, the
+    /// stored name and the `__prometheus_name__` matcher when it names a
+    /// series by its exporter name.
     fn parse_metric_selector(&self, selector: &str) -> Result<(String, Labels), QueryError> {
+        let (name, filter) = self.parse_metric_selector_as_written(selector)?;
+        Ok(match self.stored_name(&name, &filter)? {
+            Some(stored) => (stored, prometheus_names::renamed_filter(filter, &name)),
+            None => (name, filter),
+        })
+    }
+
+    fn parse_metric_selector_as_written(
+        &self,
+        selector: &str,
+    ) -> Result<(String, Labels), QueryError> {
         if let Some(named) = promql_selector(selector) {
             return named;
         }
@@ -1731,6 +1792,7 @@ impl QueryEngine {
         match parser::parse(query_str) {
             Ok(mut parsed) => {
                 name_selectors(&mut parsed);
+                self.resolve_names(&mut parsed)?;
                 expr(&parsed)
             }
             Err(err) => {

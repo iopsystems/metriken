@@ -973,6 +973,30 @@ impl SamplerReader {
         self.names.holds(name)
     }
 
+    /// Whether this table holds metric `name`, of any kind, with a series
+    /// whose label `key` is `value`. Listed as
+    /// [`ArchiveReader::counter_labels`] lists, so a complete table answers
+    /// from its names index without fetching its sealed segments.
+    pub fn holds_labeled(&self, name: &str, key: &str, value: &str) -> bool {
+        [
+            (self.names.counters.contains(name), MetricKind::Counter),
+            (self.names.gauges.contains(name), MetricKind::Gauge),
+            (self.names.histograms.contains(name), MetricKind::Histogram),
+            (
+                self.names.gauge_histograms.contains(name),
+                MetricKind::GaugeHistogram,
+            ),
+        ]
+        .into_iter()
+        .filter(|(held, _)| *held)
+        .any(|(_, kind)| {
+            self.labels(kind, name).is_some_and(|sets| {
+                sets.iter()
+                    .any(|set| set.get(key).is_some_and(|v| v == value))
+            })
+        })
+    }
+
     /// Whether this table holds histogram `name`.
     pub fn holds_histogram(&self, name: &str) -> bool {
         self.names.histograms.contains(name)

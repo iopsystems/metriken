@@ -12,6 +12,10 @@
 //! (the query reads a decrease as a reset); NaN and infinite samples are
 //! dropped; an endpoint whose samples carry an `id` is written long
 //! (decision 2).
+//!
+//! The fixtures' names carry no unit token (`cpu_time_total`, not
+//! `cpu_seconds_total`), so each value is stored as served; unit
+//! normalization is `tests/prometheus_units.rs`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -81,23 +85,23 @@ fn node_text(t: u64) -> String {
         "\
 # TYPE cpu_limit gauge
 cpu_limit 0.25
-# TYPE cpu_seconds_total counter
-cpu_seconds_total {cpu}
+# TYPE cpu_time_total counter
+cpu_time_total {cpu}
 requests_total {req}
 temperature_celsius 21.5
 # TYPE resets_total counter
 resets_total {resets}
-# TYPE rpc_seconds summary
-rpc_seconds{{quantile=\"0.5\"}} 0.0125
-rpc_seconds{{quantile=\"0.99\"}} 0.25
-rpc_seconds_sum {rpc_sum}
-rpc_seconds_count {rpc_count}
-# TYPE lat_seconds histogram
-lat_seconds_bucket{{le=\"0.1\"}} {low}
-lat_seconds_bucket{{le=\"1\"}} {count}
-lat_seconds_bucket{{le=\"+Inf\"}} {count}
-lat_seconds_sum {lat_sum}
-lat_seconds_count {count}
+# TYPE rpc_time summary
+rpc_time{{quantile=\"0.5\"}} 0.0125
+rpc_time{{quantile=\"0.99\"}} 0.25
+rpc_time_sum {rpc_sum}
+rpc_time_count {rpc_count}
+# TYPE lat_time histogram
+lat_time_bucket{{le=\"0.1\"}} {low}
+lat_time_bucket{{le=\"1\"}} {count}
+lat_time_bucket{{le=\"+Inf\"}} {count}
+lat_time_sum {lat_sum}
+lat_time_count {count}
 # TYPE flaky gauge
 flaky {flaky}
 # TYPE errs_total counter
@@ -131,10 +135,10 @@ fn container_quota(i: usize) -> f64 {
 
 /// A per-container exporter: every sample but one carries an `id`.
 fn containers_text(t: u64) -> String {
-    let mut text = String::from("# TYPE container_cpu_usage_seconds_total counter\n");
+    let mut text = String::from("# TYPE container_cpu_usage_time_total counter\n");
     for (i, id) in IDS.iter().enumerate() {
         text.push_str(&format!(
-            "container_cpu_usage_seconds_total{{id=\"{id}\"}} {}\n",
+            "container_cpu_usage_time_total{{id=\"{id}\"}} {}\n",
             container_cpu(i, t)
         ));
     }
@@ -352,19 +356,19 @@ fn every_scalar_is_stored_as_a_float_of_its_kind() {
     let reader = open(&path);
 
     for name in [
-        "cpu_seconds_total",
+        "cpu_time_total",
         "requests_total",
         "resets_total",
-        "rpc_seconds_sum",
-        "rpc_seconds_count",
-        "lat_seconds_sum",
-        "lat_seconds_count",
+        "rpc_time_sum",
+        "rpc_time_count",
+        "lat_time_sum",
+        "lat_time_count",
         "errs_total",
     ] {
         assert!(reader.has_counter(name), "{name} is a counter");
         assert!(!reader.has_gauge(name), "{name} is not a gauge");
     }
-    for name in ["cpu_limit", "temperature_celsius", "rpc_seconds", "flaky"] {
+    for name in ["cpu_limit", "temperature_celsius", "rpc_time", "flaky"] {
         assert!(reader.has_gauge(name), "{name} is a gauge");
         assert!(!reader.has_counter(name), "{name} is not a counter");
     }
@@ -378,19 +382,19 @@ fn every_scalar_is_stored_as_a_float_of_its_kind() {
         (all_ticks(), vec![21.5; TICKS as usize])
     );
     assert_eq!(
-        float_counter(&reader, "cpu_seconds_total", &[]),
+        float_counter(&reader, "cpu_time_total", &[]),
         (
             all_ticks(),
             all_ticks().into_iter().map(cpu_seconds).collect()
         )
     );
     assert_eq!(
-        float_counter(&reader, "lat_seconds_sum", &[]),
+        float_counter(&reader, "lat_time_sum", &[]),
         (all_ticks(), all_ticks().into_iter().map(lat_sum).collect())
     );
     // Whole numbers are floats too: one endpoint, one kind per scalar.
     assert_eq!(
-        float_counter(&reader, "lat_seconds_count", &[]),
+        float_counter(&reader, "lat_time_count", &[]),
         (
             all_ticks(),
             all_ticks().iter().map(|t| 2.0 * *t as f64).collect()
@@ -398,13 +402,13 @@ fn every_scalar_is_stored_as_a_float_of_its_kind() {
     );
     for (q, want) in [("0.5", 0.0125), ("0.99", 0.25)] {
         assert_eq!(
-            float_gauge(&reader, "rpc_seconds", &[("quantile", q)]),
+            float_gauge(&reader, "rpc_time", &[("quantile", q)]),
             (all_ticks(), vec![want; TICKS as usize]),
             "quantile {q}"
         );
     }
     // The buckets are still a histogram.
-    assert!(reader.histogram_names().iter().any(|n| n == "lat_seconds"));
+    assert!(reader.histogram_names().iter().any(|n| n == "lat_time"));
 
     // Stored as served: the decrease at tick 6 is not accumulated over.
     assert_eq!(
@@ -462,7 +466,7 @@ fn scrapes_query_with_their_fractions() {
     record(&path, node_text);
     let reader = open(&path);
 
-    for q in ["cpu_limit", "rpc_seconds{quantile=\"0.99\"}"] {
+    for q in ["cpu_limit", "rpc_time{quantile=\"0.99\"}"] {
         all_close(q, &one(&reader, q, false), 0.25);
     }
     all_close(
@@ -472,11 +476,11 @@ fn scrapes_query_with_their_fractions() {
     );
     for per_series in [false, true] {
         for (q, want) in [
-            ("rate(cpu_seconds_total[3s])", 0.1),
-            ("irate(cpu_seconds_total[2s])", 0.1),
+            ("rate(cpu_time_total[3s])", 0.1),
+            ("irate(cpu_time_total[2s])", 0.1),
             ("rate(requests_total[3s])", 1.5),
-            ("rate(lat_seconds_sum[3s])", 0.05),
-            ("rate(lat_seconds_count[3s])", 2.0),
+            ("rate(lat_time_sum[3s])", 0.05),
+            ("rate(lat_time_count[3s])", 2.0),
         ] {
             all_close(q, &one(&reader, q, per_series), want);
         }
@@ -510,7 +514,7 @@ fn an_id_labelled_endpoint_stays_long_with_float_columns() {
     let reader = open(&path);
     for (i, id) in IDS.iter().enumerate() {
         assert_eq!(
-            float_counter(&reader, "container_cpu_usage_seconds_total", &[("id", id)]),
+            float_counter(&reader, "container_cpu_usage_time_total", &[("id", id)]),
             (
                 all_ticks(),
                 all_ticks()
@@ -534,7 +538,7 @@ fn an_id_labelled_endpoint_stays_long_with_float_columns() {
     for per_series in [false, true] {
         let rates = query(
             &reader,
-            "rate(container_cpu_usage_seconds_total[3s])",
+            "rate(container_cpu_usage_time_total[3s])",
             per_series,
         );
         assert_eq!(rates.len(), IDS.len(), "{rates:?}");

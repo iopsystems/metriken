@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-charts 0.1.4
+
+- **Fixed:** `STORAGE_KEYS` (`util/labels.js`) adds `overflow`,
+  `overflow_bound` and `scale`, so a listing built from raw column
+  metadata no longer shows them as labels, matching metriken-storage
+  0.11.0's list.
+
 ### metriken-charts 0.1.3
 
 - **Fixed:** zooming, or pinning a legend entry on, a percentile chart that
@@ -30,6 +37,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not `Infinity s` or `Infinity`, with or without a unit system. A line or
   multi-series tooltip gives an infinite gap's value, and a quantile heatmap
   delta no longer reads `++Inf (+Infinity%)`. NaN prints as before.
+
+### metriken-storage 0.11.0
+
+- **Changed (breaking):** `STORAGE_KEYS` adds `scale` (`SCALE_KEY`): the
+  factor a histogram's values were stored multiplied by, written by
+  metriken-recorder 0.12.0's Prometheus converter when it is not 1. It is
+  not a label: an exporter label named `scale` is no longer a label on any
+  series, in recordings made before this release too, and series that
+  differed only by it now have the same labels. A reader on 0.10.0 or
+  earlier shows it as a label on such a histogram. Sealed segments' names
+  indexes are written as version 3 (`MNI3`), which 0.10.0 and earlier do
+  not take (they read such a segment's footer instead); version 1 and 2
+  indexes are still read, their label sets without `scale`.
+- **Added:** `prometheus_units`, the unit tokens a Prometheus metric name
+  or OpenMetrics `# UNIT` line is matched against, what each is stored as
+  (`normalize`), and the names a series served under a given name can be
+  stored under (`fallback_candidates`); `PROMETHEUS_NAME_LABEL`
+  (`__prometheus_name__`), the internal label holding the name a renamed
+  series was served under; `SamplerReader::holds_labeled`.
+
+### metriken-query 0.48.0
+
+Requires metriken-storage 0.11.0.
+
+- **Added:** a selector whose metric name no series it can reach holds
+  reads, when there is one, the series a Prometheus exporter served under
+  that name and metriken-recorder 0.12.0 stored under a normalized name
+  (`rpc_seconds` stored as `rpc_nanoseconds` with
+  `__prometheus_name__="rpc_seconds"`). The series are read as stored, in
+  the normalized unit, and the result names them by the stored name. A
+  name some reachable series holds is always read as itself, so in an
+  archive holding an older recording of an endpoint (exporter names) and a
+  newer one (stored names), the exporter's name reads the older one and
+  the stored name the newer one. What a selector reaches is decided per
+  selector: over an archive, the recordings its scope and recording-label
+  matchers leave; over any other source, the whole source. This applies to
+  PromQL selectors and to the selectors of `histogram_quantiles`,
+  `histogram_heatmap`, `histogram_irate`, `histogram_mean`,
+  `histogram_count` and `histogram_sum`, and to `columns`. A query that
+  was `MetricNotFound` before can now return series. When series served
+  under one name are stored under more than one name in reach (two
+  endpoints whose `# UNIT` lines differ), the query is an error naming
+  them; over an archive a recording-label matcher selects one, and on any
+  source the stored name with `__prometheus_name__="<name>"` does.
+
+### metriken-recorder 0.12.0
+
+Requires metriken-storage 0.11.0.
+
+- **Changed (breaking):** a Prometheus series whose name ends in a unit
+  token (after `_bucket`, `_sum`, `_count` or `_total`), or whose metric
+  has an OpenMetrics `# UNIT` line (which takes precedence), is stored in
+  the normalized unit with the `unit` key set: `seconds`, `milliseconds`,
+  `ms`, `msec`, `microseconds`, `us`, `nanoseconds`, `ns` in nanoseconds;
+  `bytes`, `kilobytes`, `kb`, `kibibytes`, `kib`, `megabytes`, `mb`,
+  `mebibytes`, `mib`, `gigabytes`, `gb`, `gibibytes`, `gib` and `bits`
+  (divided by 8) in bytes; `percent` (unit `percentage`), `ratio`,
+  `celsius`, `hertz` and `cores` unscaled. The series is stored under its
+  name with the token replaced (`rpc_ms_sum` as `rpc_nanoseconds_sum`,
+  `rx_bits_total` as `rx_bytes_total`; with a `# UNIT` line and no token,
+  the stored token is added when the values are scaled) and, when the name
+  changed, carries the exporter's name in the internal label
+  `__prometheus_name__`. A histogram's buckets, its `_sum`, its overflow
+  bound, a summary's quantiles and its `_sum`, and scalars are multiplied
+  by one factor; a `_count` is renamed and not scaled. A `_seconds`
+  histogram's buckets are stored as before (×1e9) and its `_sum` is now in
+  nanoseconds too. An untyped `_bucket` sample (no `# TYPE` histogram
+  line) is kept as served. A histogram's overflow series is
+  `<stored name>_overflow` (`rpc_nanoseconds_overflow`), so a query for
+  `<exporter name>_overflow` (`rpc_seconds_overflow`) written against
+  recordings of 0.11.0 does not find it in new recordings; the
+  histogram's `overflow` key names it either way.
+- **Changed (breaking):** a histogram whose smallest bound is below 1
+  after the unit's factor has its bounds multiplied by a power of 10, as a
+  histogram without a unit was before, and that power is now written as
+  `scale`; a `_ratio` or `_bits` histogram's bounds below 1 no longer
+  truncate to 0.
+- **Added:** two exporter names stored under one name (`rpc_seconds` and
+  `rpc_ms`, or `rpc_seconds` beside an `rpc_nanoseconds` the exporter
+  serves) are each stored, with their whole family (`_bucket`, `_sum`,
+  `_count`, `_total`), under their own names, unscaled, from the scrape
+  the collision appears in for the life of the converter (warned once per
+  endpoint, then logged at debug). A collision that first appears mid-run
+  moves the renamed series back to its exporter's name, once. A collided
+  `_seconds` histogram is stored in seconds × its generic scale, recorded
+  in `scale`, where 0.11.0 stored it ×1e9.
+- **Added:** `# UNIT` lines are parsed. A `# HELP` text of a renamed
+  metric is kept under the stored name as well as the exporter's.
 
 ### metriken-storage 0.10.0
 

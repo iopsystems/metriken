@@ -27,7 +27,7 @@ use crate::{BufferPool, DataSource};
 /// `caller_index` written by another producer is not mistaken for one.
 const FINGERPRINT: &[u8; 4] = b"MNS1";
 
-/// Prefix naming the index as a [`SegmentNames`], version 2: msgpack with
+/// Prefix naming the index as a [`SegmentNames`], version 3: msgpack with
 /// named fields, compressed with zstd, then optionally the segment's
 /// [`SegmentColumns`] the same way, as a second zstd frame. A field added
 /// later is left out by a reader that does not know it, and a field missing
@@ -38,14 +38,19 @@ const FINGERPRINT: &[u8; 4] = b"MNS1";
 /// built from. A reader fetches the segment of an `MNI` index whose version
 /// it does not know.
 ///
-/// Version 2 adds `overflow` and `overflow_bound` to `STORAGE_KEYS`; any
-/// other storage key added before the metriken-storage release that first
-/// writes `MNI2` (0.10.0) joins version 2, and one added after it needs
-/// `MNI3`. A version 1 index is still read ([`NAMES_V1`]).
-const NAMES: &[u8; 4] = b"MNI2";
+/// Version 2 adds `overflow` and `overflow_bound` to `STORAGE_KEYS`
+/// (metriken-storage 0.10.0), version 3 adds `scale` (0.11.0). A storage
+/// key added after the release that first writes `MNI3` needs `MNI4`.
+/// Version 1 and 2 indexes are still read ([`NAMES_V1`], [`NAMES_V2`]).
+const NAMES: &[u8; 4] = b"MNI3";
+
+/// Prefix of a version 2 index, written by metriken-storage 0.10.0: laid
+/// out as version 3, its columns frame's labels taken with that release's
+/// storage keys, and read as a version 1 index is (see [`NAMES_V1`]).
+const NAMES_V2: &[u8; 4] = b"MNI2";
 
 /// Prefix of a version 1 index, written by metriken-storage 0.9.0 and
-/// earlier: laid out as version 2, with its columns frame's labels taken
+/// earlier: laid out as version 3, with its columns frame's labels taken
 /// with the storage keys of that release. Its label sets are read with every
 /// key that is a storage key now removed ([`columns`]), which for the keys
 /// version 1 knew removes nothing, so they match what this reader takes
@@ -104,12 +109,13 @@ pub(crate) enum Stored {
     Unreadable,
 }
 
-/// A names index's columns frame, compressed, and whether it is from a
-/// version 1 index.
+/// A names index's columns frame, compressed, and whether it is from an
+/// index older than this version, whose label sets may hold keys that are
+/// storage keys now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Frame {
     pub(crate) bytes: std::sync::Arc<[u8]>,
-    pub(crate) v1: bool,
+    pub(crate) older: bool,
 }
 
 /// The index to store with a sealed segment, or `None` when its footer
@@ -194,13 +200,15 @@ fn encode(names: &SegmentNames, columns: Option<&SegmentColumns>) -> Option<Vec<
 /// at all, or another producer's).
 pub(crate) fn read(index: Option<&[u8]>) -> Option<Stored> {
     let index = index?;
-    let (rest, v1) = match (
-        index.strip_prefix(NAMES.as_slice()),
-        index.strip_prefix(NAMES_V1.as_slice()),
-    ) {
-        (Some(rest), _) => (Some(rest), false),
-        (None, Some(rest)) => (Some(rest), true),
-        (None, None) => (None, false),
+    let (rest, older) = if let Some(rest) = index.strip_prefix(NAMES.as_slice()) {
+        (Some(rest), false)
+    } else if let Some(rest) = index
+        .strip_prefix(NAMES_V2.as_slice())
+        .or_else(|| index.strip_prefix(NAMES_V1.as_slice()))
+    {
+        (Some(rest), true)
+    } else {
+        (None, false)
     };
     if let Some(rest) = rest {
         // The first frame is the names; what follows it, the columns.
@@ -212,7 +220,7 @@ pub(crate) fn read(index: Option<&[u8]>) -> Option<Stored> {
                 let names: SegmentNames = rmp_serde::from_slice(&names).ok()?;
                 let frame = (!columns.is_empty()).then(|| Frame {
                     bytes: columns.into(),
-                    v1,
+                    older,
                 });
                 Some((names, frame))
             });
@@ -230,13 +238,13 @@ pub(crate) fn read(index: Option<&[u8]>) -> Option<Stored> {
 }
 
 /// A columns frame from [`Stored::Names`], decoded, or `None` when it does
-/// not decode or decompresses past [`MAX_COLUMNS_DECODED`]. A version 1
-/// frame's label sets lose every key that is a storage key now (see
-/// [`NAMES_V1`]).
+/// not decode or decompresses past [`MAX_COLUMNS_DECODED`]. An older
+/// version's frame's label sets lose every key that is a storage key now
+/// (see [`NAMES_V1`]).
 pub(crate) fn columns(frame: &Frame) -> Option<SegmentColumns> {
     let mut columns: SegmentColumns =
         rmp_serde::from_slice(&decode(&frame.bytes, MAX_COLUMNS_DECODED)?).ok()?;
-    if frame.v1 {
+    if frame.older {
         for list in [
             &mut columns.counters,
             &mut columns.gauges,
@@ -308,11 +316,13 @@ mod tests {
         assert_eq!(super::columns(&frame), Some(columns));
     }
 
-    /// A version 1 index reads, and its columns frame's label sets lose the
-    /// keys that became storage keys in version 2, as the segment's footer
-    /// read now would; a version 2 frame's label sets are read as stored.
+    /// A version 1 or 2 index reads, and its columns frame's label sets
+    /// lose the keys that became storage keys since (`overflow` and
+    /// `overflow_bound` in version 2, `scale` in version 3), as the
+    /// segment's footer read now would; a version 3 frame's label sets are
+    /// read as stored.
     #[test]
-    fn a_version_1_index_reads_without_the_new_storage_keys() {
+    fn an_older_index_reads_without_the_new_storage_keys() {
         let names = SegmentNames {
             histograms: ["h".to_string()].into(),
             ..Default::default()
@@ -328,7 +338,12 @@ mod tests {
         let columns = SegmentColumns {
             histograms: vec![(
                 "h".into(),
-                labels(&[("op", "r"), ("overflow", "x"), ("overflow_bound", "1")]),
+                labels(&[
+                    ("op", "r"),
+                    ("overflow", "x"),
+                    ("overflow_bound", "1"),
+                    ("scale", "10"),
+                ]),
             )],
             histogram_configs: [("h".to_string(), (4, 32))].into(),
             ..Default::default()
@@ -337,17 +352,19 @@ mod tests {
         let Some(Stored::Names(_, Some(frame))) = read(Some(&index)) else {
             panic!("no columns frame");
         };
-        assert!(!frame.v1);
+        assert!(!frame.older);
         assert_eq!(super::columns(&frame), Some(columns.clone()));
 
-        index[..4].copy_from_slice(NAMES_V1);
-        let Some(Stored::Names(read_names, Some(frame))) = read(Some(&index)) else {
-            panic!("no columns frame");
-        };
-        assert_eq!(*read_names, names);
-        assert!(frame.v1);
-        let read = super::columns(&frame).unwrap();
-        assert_eq!(read.histograms, vec![("h".into(), labels(&[("op", "r")]))]);
+        for prefix in [NAMES_V1, NAMES_V2] {
+            index[..4].copy_from_slice(prefix);
+            let Some(Stored::Names(read_names, Some(frame))) = read(Some(&index)) else {
+                panic!("no columns frame");
+            };
+            assert_eq!(*read_names, names);
+            assert!(frame.older);
+            let read = super::columns(&frame).unwrap();
+            assert_eq!(read.histograms, vec![("h".into(), labels(&[("op", "r")]))]);
+        }
     }
 
     /// A field this reader does not know is left out, and one it knows but
@@ -469,6 +486,6 @@ mod tests {
         assert_eq!(read(None), None);
         assert_eq!(read(Some(b"other")), None);
         assert_eq!(read(Some(b"MNI1not zstd")), Some(Stored::Unreadable));
-        assert_eq!(read(Some(b"MNI3a later index")), Some(Stored::Unreadable));
+        assert_eq!(read(Some(b"MNI4a later index")), Some(Stored::Unreadable));
     }
 }

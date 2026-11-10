@@ -770,6 +770,7 @@ mod ingest_tests {
         metadata.insert("unit".to_string(), "nanoseconds".to_string());
         metadata.insert("grouping_power".to_string(), "7".to_string());
         metadata.insert("max_value_power".to_string(), "64".to_string());
+        metadata.insert("scale".to_string(), "10".to_string());
         metadata.insert("op".to_string(), "read".to_string());
         let mut h = ::histogram::Histogram::new(7, 64).unwrap();
         h.increment(1_000).unwrap();

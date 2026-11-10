@@ -14,7 +14,16 @@ import {
 
 // The same list metriken_query::STORAGE_KEYS pins on the Rust side.
 test('storage keys match the query engine list', () => {
-    assert.deepEqual(STORAGE_KEYS, ['metric', 'metric_type', 'unit', 'grouping_power', 'max_value_power']);
+    assert.deepEqual(STORAGE_KEYS, [
+        'metric',
+        'metric_type',
+        'unit',
+        'grouping_power',
+        'max_value_power',
+        'overflow',
+        'overflow_bound',
+        'scale',
+    ]);
     for (const k of STORAGE_KEYS) assert.equal(isStorageKey(k), true, k);
     assert.equal(isStorageKey('cpu'), false);
 });
@@ -31,6 +40,20 @@ test('a series is named by its first visible label, never an internal one', () =
     const metric = { __incarnation__: '9f3a', __name__: 'cpu_usage', cpu: '3', mode: 'user' };
     assert.equal(firstVisibleLabelValue(metric), '3');
     assert.deepEqual(visibleLabels(metric), [['cpu', '3'], ['mode', 'user']]);
+});
+
+// A Prometheus series stored under a normalized name keeps the exporter's
+// name in `__prometheus_name__`: never shown, and not a label that tells
+// two series of one result apart.
+test('the exporter name of a renamed series is not shown', () => {
+    const metrics = [
+        { __name__: 'rpc_nanoseconds', __prometheus_name__: 'rpc_seconds', op: 'read' },
+        { __name__: 'rpc_nanoseconds', __prometheus_name__: 'rpc_ms', op: 'write' },
+    ];
+    assert.equal(isInternalLabel('__prometheus_name__'), true);
+    assert.deepEqual(visibleLabels(metrics[0]), [['op', 'read']]);
+    assert.deepEqual(varyingLabelKeys(metrics), ['op']);
+    assert.deepStrictEqual(metrics.map(seriesNamer(metrics)), ['read', 'write']);
 });
 
 test('a series with only internal labels has no visible name', () => {

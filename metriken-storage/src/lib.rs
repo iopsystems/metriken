@@ -87,6 +87,7 @@ pub mod overlay;
 pub mod parquet;
 #[cfg(feature = "archive")]
 pub mod process;
+pub mod prometheus_units;
 #[cfg(feature = "archive")]
 pub mod reader;
 pub mod recordings;
@@ -127,10 +128,11 @@ pub use writer::{ArchiveWriter, SourceRecorder, StreamDecoder, StreamedGroup, Wr
 pub use buffer_pool::{BufferPool, BufferPoolStats};
 pub use labels::{
     is_internal_label, is_matched_label, is_storage_key, Labels, MatchOp, OVERFLOW_BOUND_KEY,
-    OVERFLOW_KEY, STORAGE_KEYS,
+    OVERFLOW_KEY, SCALE_KEY, STORAGE_KEYS,
 };
 pub use lazy::CompositionCatalog;
 pub use parquet::CompositionSource;
+pub use prometheus_units::PROMETHEUS_NAME_LABEL;
 pub use segmented::{ColumnRelabel, Handover, InMemorySegments, Run, SegmentBytes, SegmentStore};
 pub use source::{label_walk_series_count, ColumnPosition, CounterColumnRef, DataSource};
 pub use types::{

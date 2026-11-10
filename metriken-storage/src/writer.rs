@@ -447,6 +447,7 @@ const STORAGE_KEYS: &[&str] = &[
     "max_value_power",
     crate::labels::OVERFLOW_KEY,
     crate::labels::OVERFLOW_BOUND_KEY,
+    crate::labels::SCALE_KEY,
     "sampler",
     "description",
 ];
