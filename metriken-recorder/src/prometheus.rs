@@ -70,6 +70,10 @@ pub struct PrometheusConverter {
     /// a sample of the same name and labels. Logged at `warn` once per
     /// converter, later at `debug`.
     overflow_collision_warned: bool,
+    /// A sample was dropped because the scrape already had one of the same
+    /// stored name and labels. Logged at `warn` once per converter, later at
+    /// `debug`.
+    repeat_warned: bool,
     /// Families (exporter names without a `_bucket`, `_sum`, `_count` or
     /// `_total` suffix) stored under their own names, unscaled, because a
     /// member's normalized name collided with another's in some scrape.
@@ -103,6 +107,7 @@ impl PrometheusConverter {
             descriptions_changed: false,
             skips_warned: false,
             overflow_collision_warned: false,
+            repeat_warned: false,
             keep_original: HashSet::new(),
             unit_collision_warned: false,
         }
@@ -153,6 +158,19 @@ impl PrometheusConverter {
         // converter is one endpoint), and an exporter's own `source` label
         // is kept.
         metadata
+    }
+
+    fn log_repeat(&mut self, name: &str) {
+        if self.repeat_warned {
+            debug!("the scrape has {name} twice with one label set: the later sample is dropped");
+        } else {
+            self.repeat_warned = true;
+            warn!(
+                "the scrape has {name} twice with one label set (served twice, or an \
+                 exported_<key> label beside a label <key> stored as exported_<key>): the \
+                 later sample is dropped (later scrapes log at debug)"
+            );
+        }
     }
 
     fn log_overflow_collision(&mut self, name: &str) {
@@ -318,10 +336,17 @@ impl PrometheusConverter {
                 }
                 None => (sample.metric.clone(), None, 1.0),
             };
-            taken.insert(MetricKey {
+            // One series is one column: a second sample of it in this scrape
+            // (a line served twice, or `exported_<key>` beside a `<key>` the
+            // rename moved there) would give the column two values in one
+            // row, which the segment encoder refuses. The first is kept.
+            if !taken.insert(MetricKey {
                 name: name.clone(),
                 labels: labels.clone(),
-            });
+            }) {
+                self.log_repeat(&name);
+                continue;
+            }
             let metadata = |this: &Self, labels: &[(String, String)]| {
                 let mut metadata = this.build_metadata(&name, labels);
                 if let Some(unit) = unit {

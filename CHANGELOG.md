@@ -71,6 +71,13 @@ Requires metriken-storage 0.11.1.
   exporter label `metric` no longer replaces the series' name. The rule
   applies to counters, gauges, untyped samples, histograms and their
   overflow series, and summaries' quantiles.
+- **Fixed:** a sample whose stored name and labels another sample of the
+  same scrape already has is dropped, the first kept (warned once per
+  endpoint, then logged at debug): a line the exporter serves twice, or
+  `x{exported_unit="a"}` beside `x{unit="a"}`, which the rename above
+  stores as `exported_unit="a"`. Before, both were given one column,
+  whose segment failed to seal with "all columns in a record batch must
+  have the same length", and the recorder failed the recording.
 
 ### metriken-charts 0.1.4
 

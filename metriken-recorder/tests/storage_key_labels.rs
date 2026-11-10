@@ -76,6 +76,11 @@ fn as_before(mut snapshot: Snapshot) -> Snapshot {
 
 /// The scrapes, once a second, as written today or (`old`) as before.
 fn scrapes(old: bool) -> Vec<(u64, Snapshot)> {
+    scrapes_of(&text, old)
+}
+
+/// `text`'s scrapes, once a second, as written today or (`old`) as before.
+fn scrapes_of(text: &dyn Fn(u64) -> String, old: bool) -> Vec<(u64, Snapshot)> {
     let mut converter = PrometheusConverter::new();
     (0..TICKS)
         .map(|t| {
@@ -89,6 +94,12 @@ fn scrapes(old: bool) -> Vec<(u64, Snapshot)> {
 /// The scrapes recorded into one archive as source `source="e"`, sealing
 /// every 5 rows, and opened.
 fn recorded(path: &Path, old: bool) -> ArchiveReader {
+    record(path, scrapes(old)).unwrap()
+}
+
+/// `snapshots` recorded into one archive as source `source="e"`, sealing
+/// every 5 rows, and opened; the first error writing them.
+fn record(path: &Path, snapshots: Vec<(u64, Snapshot)>) -> Result<ArchiveReader, String> {
     let config = WriterConfig {
         seal: SealPolicy {
             max_rows: 5,
@@ -96,17 +107,20 @@ fn recorded(path: &Path, old: bool) -> ArchiveReader {
         },
         ..WriterConfig::default()
     };
-    let mut writer = ArchiveWriter::create(path, config).unwrap();
+    let e = |e: Box<dyn std::error::Error + Send + Sync>| e.to_string();
+    let mut writer = ArchiveWriter::create(path, config).map_err(e)?;
     let labels = BTreeMap::from([("source".to_string(), "e".to_string())]);
-    let mut source = writer.add_source(labels, BTreeMap::new(), BASE).unwrap();
-    for (ts, snapshot) in scrapes(old) {
-        let staged = source.stage(&snapshot, ts, 0).unwrap();
-        writer.commit(vec![staged]).unwrap();
-        source.maybe_seal().unwrap();
-        source.sync().unwrap();
+    let mut source = writer
+        .add_source(labels, BTreeMap::new(), BASE)
+        .map_err(e)?;
+    for (ts, snapshot) in snapshots {
+        let staged = source.stage(&snapshot, ts, 0).map_err(e)?;
+        writer.commit(vec![staged]).map_err(e)?;
+        source.maybe_seal().map_err(e)?;
+        source.sync().map_err(e)?;
     }
-    source.finalize((BASE + (TICKS - 1) * S, 0)).unwrap();
-    writer.join().unwrap();
+    source.finalize((BASE + (TICKS - 1) * S, 0)).map_err(e)?;
+    writer.join().map_err(e)?;
     let recordings = ArchiveReader::from_catalog(
         Box::new(DendroCatalog::open(path).unwrap()),
         None,
@@ -114,7 +128,10 @@ fn recorded(path: &Path, old: bool) -> ArchiveReader {
         None,
     )
     .unwrap();
-    ArchiveReader::flatten(recordings.into_iter().map(|(_, r)| r).collect(), None)
+    Ok(ArchiveReader::flatten(
+        recordings.into_iter().map(|(_, r)| r).collect(),
+        None,
+    ))
 }
 
 /// The scrapes ingested into a live store.
@@ -276,4 +293,35 @@ fn a_live_store_refuses_a_series_given_twice_in_one_snapshot() {
     }
     let job = matrix(&store, "rate(x_total{job=\"j\"}[3s])", false);
     assert_eq!(job.len(), 1, "{job:?}");
+}
+
+/// Two exporter samples with one stored name and label set in one scrape:
+/// `x_total{unit="a"}` beside the exporter's own
+/// `x_total{exported_unit="a"}`, which the rename makes equal, and a line
+/// served twice. The first of each is kept, and the archive seals.
+#[test]
+fn a_sample_whose_series_the_scrape_already_has_is_dropped() {
+    let renamed = |t: u64| {
+        format!(
+            "# TYPE x_total counter\nx_total{{unit=\"a\"}} {t}\nx_total{{exported_unit=\"a\"}} {}\n",
+            100 * t
+        )
+    };
+    let twice = |t: u64| format!("# TYPE x_total counter\nx_total {t}\nx_total {}\n", 100 * t);
+    for (case, text) in [
+        ("renamed", &renamed as &dyn Fn(u64) -> String),
+        ("twice", &twice),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let reader = record(&dir.path().join("a.dendro"), scrapes_of(text, false))
+            .unwrap_or_else(|e| panic!("{case}: the archive seals: {e}"));
+        for per_series in [false, true] {
+            let m = matrix(&reader, "rate(x_total[3s])", per_series);
+            assert_eq!(m.len(), 1, "{case}: {m:?}");
+            assert!(
+                m[0].values.iter().all(|(_, v)| (v - 1.0).abs() < 1e-9),
+                "{case}: the first sample is kept: {m:?}"
+            );
+        }
+    }
 }
