@@ -7,8 +7,10 @@ use regex::Regex;
 /// the series, and so never become labels.
 ///
 /// `metric` is the series name (exposed to PromQL as `__name__`),
-/// `metric_type` and `unit` describe the value, and `grouping_power` /
-/// `max_value_power` are a histogram's bucket configuration. Every loader
+/// `metric_type` and `unit` describe the value, `grouping_power` /
+/// `max_value_power` are a histogram's bucket configuration, and
+/// [`OVERFLOW_KEY`] / [`OVERFLOW_BOUND_KEY`] name a histogram's overflow
+/// series and its highest finite bound. Every loader
 /// consults this one list: the parquet path and the `ingest` path used to
 /// keep separate lists that had drifted by the two histogram keys, so the
 /// same recording carried two extra labels per histogram when viewed live.
@@ -19,7 +21,9 @@ use regex::Regex;
 /// `parquet_does_not_turn_histogram_configuration_into_labels`), so a
 /// pre-filter added to one loader cannot make them disagree unnoticed.
 /// A key added here is still a label in an archive's stored names indexes
-/// (their columns frames), so it needs a new index version as well.
+/// (their columns frames) written before it, so it needs a new index
+/// version as well (`names.rs`), unless the version it joins has not been
+/// released yet.
 ///
 /// A slice rather than an array so that adding a key is not a change to a
 /// public type.
@@ -29,7 +33,22 @@ pub const STORAGE_KEYS: &[&str] = &[
     "unit",
     "grouping_power",
     "max_value_power",
+    OVERFLOW_KEY,
+    OVERFLOW_BOUND_KEY,
 ];
+
+/// The histogram column key naming its overflow series: the metric name of
+/// a counter, with the histogram's labels, that counts the observations
+/// above the histogram's highest finite bound. A Prometheus histogram's
+/// `+Inf` bucket minus its highest finite bucket. Written by
+/// metriken-recorder's Prometheus converter; a histogram without it has no
+/// overflow series.
+pub const OVERFLOW_KEY: &str = "overflow";
+
+/// The histogram column key holding its highest finite bound, as an `f64`
+/// in the histogram's value units: every observation its
+/// [overflow series](OVERFLOW_KEY) counts is above it.
+pub const OVERFLOW_BOUND_KEY: &str = "overflow_bound";
 
 /// Whether `key` is a storage key — see [`STORAGE_KEYS`].
 pub fn is_storage_key(key: &str) -> bool {
@@ -355,7 +374,9 @@ mod tests {
                 "metric_type",
                 "unit",
                 "grouping_power",
-                "max_value_power"
+                "max_value_power",
+                "overflow",
+                "overflow_bound"
             ]
         );
         for k in STORAGE_KEYS {

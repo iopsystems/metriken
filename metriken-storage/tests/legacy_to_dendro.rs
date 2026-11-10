@@ -1240,7 +1240,7 @@ fn converted_segments_declare_the_interval() {
     }
     for (seq, index) in catalog.segment_indexes(source.id, PARQUET_TABLE).unwrap() {
         assert!(
-            index.as_deref().is_some_and(|i| i.starts_with(b"MNI1")),
+            index.as_deref().is_some_and(|i| i.starts_with(b"MNI2")),
             "segment {seq}: {index:?}"
         );
     }

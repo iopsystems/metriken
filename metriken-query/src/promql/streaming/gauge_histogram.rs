@@ -379,6 +379,7 @@ mod tests {
                     timestamp,
                     snapshot,
                     resumes: false,
+                    overflow: None,
                 }
             })),
         }

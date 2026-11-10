@@ -45,14 +45,19 @@ pub struct EnvPoint {
     /// the time axis draws. (Native/undecimated points keep their exact time.)
     pub t: f64,
     /// Minimum value over the bucket (lower spike bound).
+    #[serde(with = "crate::promql::json_f64::num")]
     pub min: f64,
     /// Inner-band lower edge (quantile `band[0]` — typical-spread bottom).
+    #[serde(with = "crate::promql::json_f64::num")]
     pub lo: f64,
     /// Median value over the bucket — the drawn line.
+    #[serde(with = "crate::promql::json_f64::num")]
     pub median: f64,
     /// Inner-band upper edge (quantile `band[1]` — typical-spread top).
+    #[serde(with = "crate::promql::json_f64::num")]
     pub hi: f64,
     /// Maximum value over the bucket (upper spike bound).
+    #[serde(with = "crate::promql::json_f64::num")]
     pub max: f64,
     /// Aggregated measurement-uncertainty band lower edge for the bucket: the
     /// median of the per-sample interval lows (robust, mirroring the `median`
@@ -61,11 +66,19 @@ pub struct EnvPoint {
     /// bucket) this is exactly that sample's interval low, so zoomed-in and
     /// decimated bands are consistent. Parallel to `unc_hi` — both `Some` or
     /// both `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::promql::json_f64::opt_num"
+    )]
     pub unc_lo: Option<f64>,
     /// Aggregated measurement-uncertainty band upper edge: the median of the
     /// per-sample interval highs. See [`unc_lo`](Self::unc_lo).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::promql::json_f64::opt_num"
+    )]
     pub unc_hi: Option<f64>,
     /// Whether this point covers time the producer did not observe.
     ///
@@ -168,6 +181,9 @@ pub enum DisplayResult {
 
     #[serde(rename = "scalar")]
     Scalar {
+        /// `(timestamp, value)`; a non-finite value is a string, as in
+        /// [`QueryResult`]'s JSON.
+        #[serde(with = "crate::promql::json_f64::pair")]
         result: (f64, f64),
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         notices: Vec<Notice>,
@@ -977,6 +993,71 @@ mod tests {
             "absent band omitted: {s_without}"
         );
     }
+
+    /// A display point's and a scalar's non-finite numbers are the
+    /// Prometheus strings in JSON, finite ones numbers, and both read back;
+    /// a point written as numbers only, as before, still reads.
+    #[test]
+    fn non_finite_display_numbers_are_strings_and_read_back() {
+        let p = EnvPoint::new(
+            1.0,
+            f64::NEG_INFINITY,
+            0.5,
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NAN,
+        )
+        .with_band(Some((2.0, f64::INFINITY)));
+        let json = serde_json::to_value(p).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "t": 1.0, "min": "-Inf", "lo": 0.5, "median": "+Inf",
+                "hi": "+Inf", "max": "NaN", "unc_lo": 2.0, "unc_hi": "+Inf",
+            })
+        );
+        let back: EnvPoint = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            (
+                back.min,
+                back.lo,
+                back.median,
+                back.hi,
+                back.unc_lo,
+                back.unc_hi
+            ),
+            (
+                f64::NEG_INFINITY,
+                0.5,
+                f64::INFINITY,
+                f64::INFINITY,
+                Some(2.0),
+                Some(f64::INFINITY)
+            )
+        );
+        assert!(back.max.is_nan());
+
+        let old: EnvPoint = serde_json::from_str(
+            r#"{"t":1,"min":1,"lo":2,"median":3,"hi":4,"max":5,"unc_lo":0.5,"unc_hi":6}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            old,
+            EnvPoint::new(1.0, 1.0, 2.0, 3.0, 4.0, 5.0).with_band(Some((0.5, 6.0)))
+        );
+
+        let scalar = DisplayResult::Scalar {
+            result: (1.0, f64::NAN),
+            notices: Vec::new(),
+        };
+        let json = serde_json::to_value(&scalar).unwrap();
+        assert_eq!(json["result"], serde_json::json!([1.0, "NaN"]));
+        let DisplayResult::Scalar { result, .. } = serde_json::from_value(json).unwrap() else {
+            panic!("not a scalar")
+        };
+        assert!(result.1.is_nan());
+    }
+
     fn reduced(
         points: &[(f64, f64)],
         bands: Option<&[Option<(f64, f64)>]>,

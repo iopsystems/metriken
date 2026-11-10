@@ -583,6 +583,15 @@ impl MemoryStore {
             let (name, labels) = extract_name_labels(&histogram.metadata, &histogram.name);
             let config = histogram.value.config();
             let snap = histogram_to_snapshot(&histogram.value);
+            let overflow = histogram.metadata.get(metriken_storage::OVERFLOW_KEY).zip(
+                histogram
+                    .metadata
+                    .get(metriken_storage::OVERFLOW_BOUND_KEY)
+                    .and_then(|b| b.parse::<f64>().ok()),
+            );
+            if let Some((counter, bound)) = overflow {
+                memory.set_histogram_overflow(&name, labels.clone(), ts, counter, bound);
+            }
             memory.upsert_histogram_sample(&name, labels, config, ts, snap);
         }
 

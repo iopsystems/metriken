@@ -293,7 +293,7 @@ fn a_live_v3_converts_to_dendro() {
     for table in catalog.tables(source).unwrap() {
         for (seq, index) in catalog.segment_indexes(source, &table).unwrap() {
             assert!(
-                index.as_deref().is_some_and(|i| i.starts_with(b"MNI1")),
+                index.as_deref().is_some_and(|i| i.starts_with(b"MNI2")),
                 "{table}#{seq}: {index:?}"
             );
             sealed += 1;
