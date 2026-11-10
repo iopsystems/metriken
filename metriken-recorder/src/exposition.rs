@@ -12,7 +12,8 @@
 //!
 //! Everything else follows what `prometheus-parse` 0.2.5 did, so a scrape
 //! with ordinary label values converts exactly as before: `# HELP` text is
-//! kept as written, `# TYPE x histogram` makes `x_bucket` lines the buckets of
+//! kept as written, `# UNIT` (OpenMetrics) is kept by metric name, `# TYPE x
+//! histogram` makes `x_bucket` lines the buckets of
 //! histogram `x` (its `_sum` and `_count` are untyped), a summary's lines
 //! named exactly `x` with a `quantile` label are its quantiles, a trailing
 //! timestamp is ignored, and a line that does not parse is skipped.
@@ -77,6 +78,8 @@ pub(crate) struct Sample {
 pub(crate) struct Scrape {
     /// `# HELP` text by metric name, last seen wins.
     pub docs: HashMap<String, String>,
+    /// OpenMetrics `# UNIT` values by metric (family) name, last seen wins.
+    pub units: HashMap<String, String>,
     pub samples: Vec<Sample>,
     /// Sample lines that were skipped: a malformed name or label block, a
     /// value that is not a number, or a histogram or summary line without a
@@ -90,6 +93,7 @@ pub(crate) struct Scrape {
 impl Scrape {
     pub(crate) fn parse(text: &str) -> Scrape {
         let mut docs = HashMap::new();
+        let mut units = HashMap::new();
         let mut types: HashMap<String, SampleType> = HashMap::new();
         // `x_bucket` -> `x` for each `# TYPE x histogram`.
         let mut aliases: HashMap<String, String> = HashMap::new();
@@ -114,6 +118,9 @@ impl Scrape {
                 match parse_comment(line) {
                     Some(Comment::Help { name, doc }) => {
                         docs.insert(name.to_string(), doc.to_string());
+                    }
+                    Some(Comment::Unit { name, unit }) => {
+                        units.insert(name.to_string(), unit.to_string());
                     }
                     Some(Comment::Type { name, kind }) => {
                         let kind = SampleType::parse(kind);
@@ -202,6 +209,7 @@ impl Scrape {
         samples.extend(grouped);
         Scrape {
             docs,
+            units,
             samples,
             skipped,
             first_skipped,
@@ -212,6 +220,7 @@ impl Scrape {
 enum Comment<'a> {
     Help { name: &'a str, doc: &'a str },
     Type { name: &'a str, kind: &'a str },
+    Unit { name: &'a str, unit: &'a str },
 }
 
 fn is_word(c: char) -> bool {
@@ -231,8 +240,8 @@ fn take_space(s: &str) -> Option<&str> {
     (rest.len() < s.len()).then_some(rest)
 }
 
-/// `# HELP <name> <doc>` or `# TYPE <name> <type>`; any other comment is
-/// `None`.
+/// `# HELP <name> <doc>`, `# TYPE <name> <type>` or `# UNIT <name> <unit>`;
+/// any other comment, and a `# UNIT` with an empty unit, is `None`.
 fn parse_comment(line: &str) -> Option<Comment<'_>> {
     let rest = take_space(line.strip_prefix('#')?)?;
     if let Some(rest) = rest.strip_prefix("HELP") {
@@ -244,6 +253,11 @@ fn parse_comment(line: &str) -> Option<Comment<'_>> {
         let (name, rest) = take_word(take_space(rest)?)?;
         let (kind, _) = take_word(take_space(rest)?)?;
         return Some(Comment::Type { name, kind });
+    }
+    if let Some(rest) = rest.strip_prefix("UNIT") {
+        let (name, rest) = take_word(take_space(rest)?)?;
+        let (unit, _) = take_word(take_space(rest)?)?;
+        return Some(Comment::Unit { name, unit });
     }
     None
 }
@@ -551,6 +565,21 @@ mod tests {
                 ]),
             }]
         );
+    }
+
+    #[test]
+    fn a_unit_line_is_kept_by_name() {
+        let scrape = Scrape::parse(
+            "# TYPE rpc_seconds histogram\n\
+             # UNIT rpc_seconds seconds\n\
+             # UNIT empty\n\
+             rpc_seconds_bucket{le=\"1\"} 1\n",
+        );
+        assert_eq!(
+            scrape.units,
+            HashMap::from([("rpc_seconds".to_string(), "seconds".to_string())])
+        );
+        assert_eq!(scrape.skipped, 0);
     }
 
     #[test]
