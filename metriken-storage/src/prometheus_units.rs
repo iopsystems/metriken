@@ -10,8 +10,9 @@
 
 /// The internal label holding the name an exporter served a series under,
 /// on a series stored under another name ([`normalize`]). Part of the
-/// series' identity, matchable in a selector, and hidden from listings and
-/// legends like every internal label ([`is_internal_label`](crate::is_internal_label)).
+/// series' identity, matchable in a selector, and an internal label
+/// ([`is_internal_label`](crate::is_internal_label)), which consumers leave
+/// out of listings and legends.
 pub const PROMETHEUS_NAME_LABEL: &str = "__prometheus_name__";
 
 /// The suffixes removed before a name's unit token is looked for, and kept
@@ -99,8 +100,8 @@ pub struct Normalized {
     /// The name the series is stored under: the exporter's name, or that
     /// name with its unit token replaced (or, from a `# UNIT` line, added).
     pub name: String,
-    /// The `unit` storage key, or `None` for a `_count` or `_bucket`
-    /// sample, which is a count whatever its metric's unit.
+    /// The `unit` storage key, or `None` for a `_count` sample, which is a
+    /// count whatever its metric's unit.
     pub unit: Option<&'static str>,
     /// What each value is multiplied by: 1 for a count.
     pub factor: f64,
@@ -108,7 +109,9 @@ pub struct Normalized {
 
 /// The stored name, unit and factor of a series an exporter serves as
 /// `name`, with `unit_line` the value of its metric's OpenMetrics `# UNIT`
-/// line, if any. `None` when neither gives a unit in [`TOKENS`].
+/// line, if any. `None` when neither gives a unit in [`TOKENS`], and for a
+/// `_bucket` sample: one that reaches here is not part of a typed histogram,
+/// and its `le` label, in the exporter's unit, would not change with it.
 ///
 /// The token is the last `_`-separated word of `name` after removing one of
 /// [`SUFFIXES`]; a name with no `_` there has none. A `unit_line` in
@@ -116,10 +119,13 @@ pub struct Normalized {
 /// `name` with its token replaced by the unit's stored token; with no token
 /// in the name, the stored token is added before the suffix when the factor
 /// is not 1, so a series whose values are scaled is always renamed, and the
-/// name is kept when it is 1. A `_count` or `_bucket` sample is renamed the
-/// same way and not scaled.
+/// name is kept when it is 1. A `_count` sample is renamed the same way
+/// and not scaled.
 pub fn normalize(name: &str, unit_line: Option<&str>) -> Option<Normalized> {
     let (stem, suffix) = split_suffix(name);
+    if suffix == "_bucket" {
+        return None;
+    }
     let token = stem
         .rsplit_once('_')
         .filter(|(head, _)| !head.is_empty())
@@ -131,7 +137,7 @@ pub fn normalize(name: &str, unit_line: Option<&str>) -> Option<Normalized> {
         None if unit.factor != 1.0 => format!("{stem}_{}", unit.token),
         None => stem.to_string(),
     };
-    let count = matches!(suffix, "_count" | "_bucket");
+    let count = suffix == "_count";
     Some(Normalized {
         name: format!("{stem}{suffix}"),
         unit: (!count).then_some(unit.unit),
@@ -217,10 +223,9 @@ mod tests {
             stored("rpc_ms_count", None),
             Some(("rpc_nanoseconds_count".into(), None, 1.0))
         );
-        assert_eq!(
-            stored("rpc_ms_bucket", None),
-            Some(("rpc_nanoseconds_bucket".into(), None, 1.0))
-        );
+        // A `_bucket` sample's `le` is in the exporter's unit: kept.
+        assert_eq!(stored("rpc_ms_bucket", None), None);
+        assert_eq!(stored("rpc_bucket", Some("seconds")), None);
         assert_eq!(
             stored("cpu_seconds_total", None),
             Some(("cpu_nanoseconds_total".into(), ns, 1e9))
