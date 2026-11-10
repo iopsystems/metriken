@@ -1109,7 +1109,7 @@ fn a_metric_that_first_appears_in_a_later_segment_is_found() {
         let (_, built) = listings_and_readers_built(&counted, &path);
         assert_eq!(built.len(), 2, "finalize={finalize}: {built:?}");
 
-        // A version 1 index, as metriken-storage 0.8.0 wrote, is taken as a
+        // A version 1 index, as metriken-storage 0.9.0 wrote, is taken as a
         // version 2 one: the same listing, with no reader built and no
         // segment fetched.
         let (counted, fetched) = open_counting_with(&path, &pool, Indexes::Version1);
@@ -1218,7 +1218,7 @@ enum Indexes {
     /// A names index of a version this reader does not know (`MNI3`).
     LaterVersion,
     /// The stored indexes relabelled as version 1 (`MNI1`), as
-    /// metriken-storage 0.8.0 and earlier wrote them: read as version 2.
+    /// metriken-storage 0.9.0 and earlier wrote them: read as version 2.
     Version1,
     /// The stored indexes with every segment's but the first removed, as
     /// dendro's compaction leaves merged segments.

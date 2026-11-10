@@ -40,11 +40,11 @@ const FINGERPRINT: &[u8; 4] = b"MNS1";
 ///
 /// Version 2 adds `overflow` and `overflow_bound` to `STORAGE_KEYS`; any
 /// other storage key added before the metriken-storage release that first
-/// writes `MNI2` (0.9.0) joins version 2, and one added after it needs
+/// writes `MNI2` (0.10.0) joins version 2, and one added after it needs
 /// `MNI3`. A version 1 index is still read ([`NAMES_V1`]).
 const NAMES: &[u8; 4] = b"MNI2";
 
-/// Prefix of a version 1 index, written by metriken-storage 0.8.0 and
+/// Prefix of a version 1 index, written by metriken-storage 0.9.0 and
 /// earlier: laid out as version 2, with its columns frame's labels taken
 /// with the storage keys of that release. Its label sets are read with every
 /// key that is a storage key now removed ([`columns`]), which for the keys

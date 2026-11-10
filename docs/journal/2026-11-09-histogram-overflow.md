@@ -123,11 +123,11 @@ the population: a quantile that falls in it reads `+Inf`, with the band
 9. **Readers that do not know the overflow.** rezolus and any other
    reader list `<histogram>_overflow` as one more counter series (with
    `rate()` it reads observations per second above the top bound). An
-   older metriken-query (0.45 and before) reading a new recording ignores
+   older metriken-query (0.46 and before) reading a new recording ignores
    the link and returns the old, low quantile without an error. This is
    accepted: the only way to refuse instead is a segment format bump,
    which would make an older reader refuse the whole recording to avoid
-   one low quantile (D4). An older metriken-storage (0.8.0 and before)
+   one low quantile (D4). An older metriken-storage (0.9.0 and before)
    also shows the histogram's two new keys as labels (D1).
 
 ## Decisions (owner, 2026-11-09)
@@ -140,9 +140,9 @@ All four as recommended.
   series identity, so the same histogram before and after the change, or
   after a change of its top bound, would be two series in every reader.
   `MNI2` is defined so that #379's scale-factor key joins it if it is added
-  before the metriken-storage release that first writes `MNI2` (0.9.0);
+  before the metriken-storage release that first writes `MNI2` (0.10.0);
   a key added after that release needs `MNI3`. Cost, stated: a reader on
-  metriken-storage 0.8.0 or earlier shows the two keys as labels on the
+  metriken-storage 0.9.0 or earlier shows the two keys as labels on the
   histogram.
 - **D2. Non-finite values in a query result's JSON are the strings
   `"+Inf"`, `"-Inf"`, `"NaN"`**, as the Prometheus HTTP API writes them,
@@ -163,7 +163,9 @@ All four as recommended.
   unbounded part.
 - **D4. No segment format bump.** An older reader returns the old, low
   quantile without an error (settled item 9). Versions: metriken-recorder
-  0.10.0, metriken-storage 0.9.0, metriken-query 0.46.0, all breaking. The
+  0.11.0, metriken-storage 0.10.0, metriken-query 0.47.0, all breaking
+  (renumbered from 0.10.0, 0.9.0 and 0.46.0, which the dendro 0.7 release
+  took first). The
   CHANGELOG says that older readers show one extra counter per histogram
   and return the old quantile.
 
