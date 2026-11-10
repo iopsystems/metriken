@@ -42,6 +42,17 @@ Requires metriken-storage 0.11.1.
   out reads as before.
 - **Fixed:** a counter series whose samples step back in time no longer
   panics the per-series rate in a debug build.
+- **Fixed:** the error for an exporter name stored under two names over
+  an archive offered `<name>{source="..."}` whatever the recordings'
+  labels were (#395). It now offers a recording label the recordings
+  holding the candidates carry, with the value of a recording holding the
+  first stored name it gives (`jobs_total{alias="other"}`): the first key,
+  in order, that every such recording carries and whose values no two
+  candidates' recordings share. Internal labels (`__recording__`) are not
+  offered. When no key qualifies, or under `QueryOptions::series_labels`
+  (where a recording-label matcher does not choose recordings), no
+  recording-label matcher is offered. The `__prometheus_name__` form is
+  offered first, as before.
 
 ### metriken-recorder 0.13.0
 

@@ -165,6 +165,19 @@ struct Rec<'a> {
 /// Each recording scraped once a second through its own converter into one
 /// archive, sealing every 5 rows.
 fn record(path: &Path, recs: &[Rec]) {
+    let labelled: Vec<Labelled> = recs
+        .iter()
+        .map(|r| (vec![("source", r.source)], r.text, r.old))
+        .collect();
+    record_labelled(path, &labelled);
+}
+
+/// A recording to write: its labels, the text at each tick, and whether it
+/// is written as before units were normalized.
+type Labelled<'a> = (Vec<(&'a str, &'a str)>, &'a dyn Fn(u64) -> String, bool);
+
+/// [`record`] with each recording's labels given whole.
+fn record_labelled(path: &Path, recs: &[Labelled]) {
     let config = WriterConfig {
         seal: SealPolicy {
             max_rows: 5,
@@ -173,14 +186,17 @@ fn record(path: &Path, recs: &[Rec]) {
         ..WriterConfig::default()
     };
     let mut writer = ArchiveWriter::create(path, config).unwrap();
-    for rec in recs {
-        let labels = BTreeMap::from([("source".to_string(), rec.source.to_string())]);
+    for (labels, text, old) in recs {
+        let labels = labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         let mut source = writer.add_source(labels, BTreeMap::new(), BASE).unwrap();
         let mut converter = PrometheusConverter::new();
         for t in 0..TICKS {
             let ts = BASE + t * S;
-            let mut snapshot = converter.convert(&(rec.text)(t), ts - S / 2, ts);
-            if rec.old {
+            let mut snapshot = converter.convert(&text(t), ts - S / 2, ts);
+            if *old {
                 snapshot = as_before_units(snapshot);
             }
             let staged = source.stage(&snapshot, ts, 0).unwrap();
@@ -970,4 +986,70 @@ fn columns_resolve_a_name_matcher_as_a_name() {
     let bare = reader.columns("lag_ms").unwrap();
     assert!(!bare.is_empty());
     assert_eq!(reader.columns("{__name__=\"lag_ms\"}").unwrap(), bare);
+}
+
+/// The recording-label matcher an ambiguous-name error offers, if any.
+fn offered_matcher(err: &str) -> Option<&str> {
+    let from = err.find("recording-label matcher (")? + "recording-label matcher (".len();
+    err[from..].strip_suffix(')')
+}
+
+/// The error for one name stored under two over an archive offers a
+/// recording-label matcher on a key the recordings carry, whose value picks
+/// the first stored name the error gives, and which resolves the query:
+/// `alias`, the key rezolus records a user's `source=` as, and `source`.
+/// When no key tells the recordings apart (one both carry with one value,
+/// one only the first carries), it offers none.
+#[test]
+fn the_ambiguous_name_error_offers_a_recording_label_the_recordings_carry() {
+    let a = |t: u64| format!("# TYPE x counter\n# UNIT x seconds\nx_total{{job=\"a\"}} {t}\n");
+    let b = |t: u64| format!("# TYPE x counter\n# UNIT x kilobytes\nx_total{{job=\"b\"}} {t}\n");
+    let (lo, hi) = ((BASE / S) as f64, (BASE / S + TICKS - 1) as f64);
+    let escape = "x_nanoseconds_total{__prometheus_name__=\"x_total\"}";
+    type Case<'a> = (
+        &'a str,
+        Vec<(&'a str, &'a str)>,
+        Vec<(&'a str, &'a str)>,
+        Option<&'a str>,
+    );
+    let cases: [Case; 3] = [
+        (
+            "alias",
+            vec![("alias", "first")],
+            vec![("alias", "other")],
+            Some("x_total{alias=\"first\"}"),
+        ),
+        (
+            "source",
+            vec![("source", "a"), ("host", "h")],
+            vec![("source", "b"), ("host", "h")],
+            Some("x_total{source=\"a\"}"),
+        ),
+        (
+            "none",
+            vec![("source", "s"), ("zone", "z")],
+            vec![("source", "s")],
+            None,
+        ),
+    ];
+    for (case, la, lb, want) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.dendro");
+        record_labelled(&path, &[(la, &a, false), (lb, &b, false)]);
+        let reader = open(&path);
+        let err = reader
+            .query_range("rate(x_total[3s])", lo, hi, 1.0)
+            .expect_err(case)
+            .to_string();
+        assert!(err.contains(escape), "{case}: {err}");
+        assert!(
+            err.find("x_nanoseconds_total") < err.find("x_bytes_total"),
+            "{case}: the first stored name is the nanoseconds one: {err}"
+        );
+        assert_eq!(offered_matcher(&err), want, "{case}: {err}");
+        if let Some(matcher) = want {
+            every(&reader, &format!("rate({matcher}[3s])"), 1e9);
+        }
+        every(&reader, &format!("rate({escape}[3s])"), 1e9);
+    }
 }

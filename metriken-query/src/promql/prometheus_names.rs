@@ -78,35 +78,36 @@ pub(crate) fn stored_name(
         .into_iter()
         .filter(|c| held.contains(c) && holds_renamed(source, c, name))
         .collect();
-    one_of(name, found, false)
+    one_of(name, found)
 }
 
 /// The one stored name in `found`, `None` for none, or the error for
-/// several ([`ambiguous`], with `archive` passed on).
-pub(crate) fn one_of(
-    name: &str,
-    mut found: Vec<String>,
-    archive: bool,
-) -> Result<Option<String>, QueryError> {
+/// several ([`ambiguous`], offering no recording-label matcher).
+fn one_of(name: &str, mut found: Vec<String>) -> Result<Option<String>, QueryError> {
     match found.len() {
         0 => Ok(None),
         1 => Ok(found.pop()),
-        _ => Err(ambiguous(name, &found, archive)),
+        _ => Err(ambiguous(name, &found, None)),
     }
 }
 
 /// The error for exporter name `name` stored under each of `stored`. It
 /// names the form that selects one on any source, a stored name with
-/// `__prometheus_name__="<name>"`; with `archive`, also a recording-label
-/// matcher, which selects recordings only over an archive.
-pub(crate) fn ambiguous(name: &str, stored: &[String], archive: bool) -> QueryError {
+/// `__prometheus_name__="<name>"`; with `recording`, a recording label and
+/// a value of it, also that recording-label matcher, which selects
+/// recordings only over an archive.
+pub(crate) fn ambiguous(
+    name: &str,
+    stored: &[String],
+    recording: Option<(&str, &str)>,
+) -> QueryError {
     let first = &stored[0];
-    let recording = if archive {
-        format!(
-            ", or select one recording with a recording-label matcher ({name}{{source=\"...\"}})"
-        )
-    } else {
-        String::new()
+    let recording = match recording {
+        Some((key, value)) => format!(
+            ", or select one recording with a recording-label matcher \
+             ({name}{{{key}={value:?}}})"
+        ),
+        None => String::new(),
     };
     QueryError::EvaluationError(format!(
         "no series this selector reaches is named {name}, and series an exporter served as \
