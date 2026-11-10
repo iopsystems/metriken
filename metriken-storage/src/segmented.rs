@@ -1622,15 +1622,30 @@ fn splice_histogram_streams(
     );
     let mut series: Vec<Labels> = Vec::new();
     let mut local_of_global: HashMap<usize, usize> = HashMap::new();
+    // Per series a segment holds two or more columns of (columns that
+    // differ only by a storage key), a second output index of its labels.
+    // A row of one of them at the time of the series' previous row from
+    // another of its columns is given that index instead of the series',
+    // so the two columns sharing a time stay two indices of one label set,
+    // which a reader can refuse (metriken-query's order check). Rows that
+    // follow one another (a bound that moved mid-segment) keep one index.
+    let mut collision_of_global: HashMap<usize, usize> = HashMap::new();
     let mut parts: Vec<Box<dyn Iterator<Item = crate::histogram_stream::HistogramRow> + Send>> =
         Vec::with_capacity(streams.len());
     for stream in streams {
+        let globals: Vec<Option<usize>> = stream
+            .meta
+            .series
+            .iter()
+            .map(|labels| identity.position(name, labels))
+            .collect();
         let remap: Vec<usize> = stream
             .meta
             .series
             .iter()
-            .map(|labels| match identity.position(name, labels) {
-                Some(global) => *local_of_global.entry(global).or_insert_with(|| {
+            .zip(&globals)
+            .map(|(labels, global)| match global {
+                Some(global) => *local_of_global.entry(*global).or_insert_with(|| {
                     series.push(labels.clone());
                     series.len() - 1
                 }),
@@ -1649,8 +1664,37 @@ fn splice_histogram_streams(
                 }
             })
             .collect();
+        // A series this segment holds under two or more local indices
+        // gets its collision index, for each of them.
+        let mut count: HashMap<usize, usize> = HashMap::new();
+        for global in globals.iter().flatten() {
+            *count.entry(*global).or_insert(0) += 1;
+        }
+        let collision: Vec<Option<usize>> = globals
+            .iter()
+            .enumerate()
+            .map(|(i, global)| {
+                let global = (*global).filter(|g| count[g] > 1)?;
+                Some(*collision_of_global.entry(global).or_insert_with(|| {
+                    series.push(stream.meta.series[i].clone());
+                    series.len() - 1
+                }))
+            })
+            .collect();
+        // Per output index, the time and local index of its last row.
+        let mut last: HashMap<usize, (u64, usize)> = HashMap::new();
         parts.push(Box::new(stream.rows.map(move |mut row| {
-            row.series_idx = remap[row.series_idx];
+            let local = row.series_idx;
+            let out = remap[local];
+            row.series_idx = out;
+            if let Some(alt) = collision[local] {
+                if let Some(&(ts, from)) = last.get(&out) {
+                    if ts == row.timestamp && from != local {
+                        row.series_idx = alt;
+                    }
+                }
+            }
+            last.insert(out, (row.timestamp, local));
             row
         })));
     }

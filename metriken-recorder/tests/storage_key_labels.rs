@@ -486,3 +486,28 @@ fn a_live_store_keeps_each_series_in_time_order() {
         }
     }
 }
+
+/// Two histogram columns of one label set sharing a time in each of two
+/// segments (`a` at ticks 0, 1, 5, 6; `b` at 1, 2, 6, 7; sealed every 5
+/// rows), read across both: the splice keeps each column apart, so the
+/// shared times are refused as they are within one segment.
+#[test]
+fn joined_histogram_columns_across_segments_are_refused() {
+    let text = |t: u64| {
+        sparse(t, &|t| [0, 1, 5, 6].contains(&t), &|t| {
+            [1, 2, 6, 7].contains(&t)
+        })
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let reader = record(&dir.path().join("a.dendro"), scrapes_of(&text, true)).unwrap();
+    for query in ["histogram_quantile(0.5, h)", "histogram_irate(h)"] {
+        let err = match range(&reader, query, false) {
+            Err(e) => e.to_string(),
+            Ok(r) => panic!("{query}: {r:?}"),
+        };
+        assert!(
+            err.contains("h{source=\"e\"}") && err.contains("at or before the one read before it"),
+            "{query}: {err}"
+        );
+    }
+}

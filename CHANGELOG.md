@@ -61,8 +61,11 @@ Requires metriken-storage 0.11.1.
   themselves where the footer check above does not find them (columns that
   share fewer rows than its null counts prove, or that alternate). In a
   histogram stream, rows of two columns of one label set at one time count
-  as stepping back; alternating histogram columns, whose rows are read in
-  time order, are not found. Before, such a read gave a wrong rate, or
+  as stepping back, in a read of one segment or of several (the segmented
+  reader's splice gives such a row its own index of the label set, where
+  it joined every column's rows under one); rows of one index at one time,
+  as a pooling of recordings onto one clock gives, do not. Alternating
+  histogram columns, whose rows are read in time order, are not found. Before, such a read gave a wrong rate, or
   panicked in a debug build.
 - **Fixed:** the error for an exporter name stored under two names over
   an archive offered `<name>{source="..."}` whatever the recordings'

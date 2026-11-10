@@ -166,8 +166,12 @@ impl Iterator for OrderedRows {
         if let Some((ts, idx)) = self.last.insert(series, (row.timestamp, row.series_idx)) {
             // One index at one time twice is a composite's pooling onto
             // another recording's clock (`HistogramStream::merge_on_clock`),
-            // which the readers take; two indices of one label set at one
-            // time are two columns.
+            // or a merge of a process group's sources, which the readers
+            // take; two indices of one label set at one time are two
+            // columns. A segmented reader's splice keeps a segment's two
+            // columns at one time under two indices
+            // (`splice_histogram_streams`), so this sees them across
+            // segments too.
             if row.timestamp < ts || (row.timestamp == ts && row.series_idx != idx) {
                 let labels = self.labels.get(row.series_idx).cloned().unwrap_or_default();
                 self.disorder.record(&self.name, &labels, row.timestamp);
