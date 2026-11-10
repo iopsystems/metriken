@@ -1192,8 +1192,14 @@ impl QueryEngine {
                 Arc::clone(&disorder),
             ))
         };
+        // Filled here, on the engine that lives on, so a reader's engine
+        // lists its names once rather than once per query. An engine with
+        // `names` resolves without them.
         let held = std::sync::OnceLock::new();
-        if let Some(names) = self.held.get() {
+        if self.names.is_none() {
+            let names = self
+                .held
+                .get_or_init(|| prometheus_names::held_names(&*self.source));
             let _ = held.set(names.clone());
         }
         let engine = QueryEngine {

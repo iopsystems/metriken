@@ -286,4 +286,24 @@ mod tests {
         assert_eq!(source.listings.load(Ordering::Relaxed), 1);
         assert!(expr.to_string().contains("b_nanoseconds_total"), "{expr}");
     }
+
+    /// A query fills the engine's names, so an engine that lives for a
+    /// reader's life lists them once, not once per query.
+    #[test]
+    fn a_query_keeps_the_names_for_the_next() {
+        let mut inner = Memory::new(1000);
+        inner.upsert_float_counter_sample("a_total", Labels::default(), 1_000_000_000, 1.0);
+        let engine = QueryEngine::new(Arc::new(inner) as Arc<dyn DataSource>);
+        assert!(engine.held.get().is_none());
+        engine
+            .query_range_opts(
+                "rate(a_total[1s])",
+                1.0,
+                2.0,
+                1.0,
+                &crate::QueryOptions::default(),
+            )
+            .unwrap();
+        assert!(engine.held.get().is_some(), "the names are kept");
+    }
 }
