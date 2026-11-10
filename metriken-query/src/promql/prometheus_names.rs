@@ -34,7 +34,10 @@ use crate::DataSource;
 pub(crate) type NameResolution = HashMap<(String, Labels), String>;
 
 /// Every name `source` holds, of any kind: read once per engine, so a
-/// query lists the source's names once however many selectors it has.
+/// query lists the source's names once however many selectors it has. An
+/// engine lives for one query for `MemoryStore` and archives, and for the
+/// reader's life for `ParquetReader`, `SegmentedParquetReader` and
+/// `UnionMetricsSource`, whose names are fixed at open.
 pub(crate) fn held_names(source: &dyn DataSource) -> HashSet<String> {
     let mut held: HashSet<String> = source.counter_names().into_iter().collect();
     held.extend(source.gauge_names());
@@ -75,25 +78,40 @@ pub(crate) fn stored_name(
         .into_iter()
         .filter(|c| held.contains(c) && holds_renamed(source, c, name))
         .collect();
-    one_of(name, found)
+    one_of(name, found, false)
 }
 
 /// The one stored name in `found`, `None` for none, or the error for
-/// several.
-pub(crate) fn one_of(name: &str, mut found: Vec<String>) -> Result<Option<String>, QueryError> {
+/// several ([`ambiguous`], with `archive` passed on).
+pub(crate) fn one_of(
+    name: &str,
+    mut found: Vec<String>,
+    archive: bool,
+) -> Result<Option<String>, QueryError> {
     match found.len() {
         0 => Ok(None),
         1 => Ok(found.pop()),
-        _ => Err(ambiguous(name, &found)),
+        _ => Err(ambiguous(name, &found, archive)),
     }
 }
 
-/// The error for exporter name `name` stored under each of `stored`.
-pub(crate) fn ambiguous(name: &str, stored: &[String]) -> QueryError {
+/// The error for exporter name `name` stored under each of `stored`. It
+/// names the form that selects one on any source, a stored name with
+/// `__prometheus_name__="<name>"`; with `archive`, also a recording-label
+/// matcher, which selects recordings only over an archive.
+pub(crate) fn ambiguous(name: &str, stored: &[String], archive: bool) -> QueryError {
+    let first = &stored[0];
+    let recording = if archive {
+        format!(
+            ", or select one recording with a recording-label matcher ({name}{{source=\"...\"}})"
+        )
+    } else {
+        String::new()
+    };
     QueryError::EvaluationError(format!(
-        "{name} is held by no series, and series an exporter served as {name} are stored \
-         under {}, in different units; select one recording with a recording-label matcher \
-         ({name}{{source=\"...\"}}), or name one of those metrics",
+        "no series this selector reaches is named {name}, and series an exporter served as \
+         {name} are stored under {}, in different units; name one of them with \
+         {first}{{{PROMETHEUS_NAME_LABEL}=\"{name}\"}}{recording}",
         stored.join(" and ")
     ))
 }

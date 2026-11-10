@@ -697,7 +697,7 @@ fn resolve_names(
                 .into_iter()
                 .filter(|c| reach.iter().any(|t| t.holds_labeled(c, label, name)))
                 .collect();
-            if let Some(stored) = crate::promql::prometheus_names::one_of(name, found)? {
+            if let Some(stored) = crate::promql::prometheus_names::one_of(name, found, true)? {
                 names.insert(key, stored);
             }
         }

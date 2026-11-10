@@ -191,8 +191,8 @@ treatment of the overflow (#388 D3).
    after review: the first build kept only the colliding name, so a
    histogram `lat_seconds` beside a gauge `lat_ms` kept its buckets as
    seconds × 10 while its `_sum` and `_count` were renamed and its `_sum`
-   scaled ×1e9.) a warning is logged once per converter, then at `debug`. A
-   collision that first appears mid-run therefore renames the
+   scaled ×1e9.) A warning is logged once per converter, then at
+   `debug`. A collision that first appears mid-run therefore renames the
    already-renamed series back to its original name from that scrape on:
    one series under two names in one recording, once. Per-scrape
    detection was rejected: a sibling that comes and goes would flip the
@@ -217,7 +217,10 @@ treatment of the overflow (#388 D3).
    a range-dependent rule would change which series a dashboard panel
    shows as it is zoomed. A regex on `__name__` is not evaluated today,
    so it gets no fallback. Two candidates both matching `N` is an error
-   naming both and suggesting a recording-label matcher. (Corrected
+   naming both. It offers the form that selects one on any source, the
+   stored name with `__prometheus_name__="N"`, and over an archive also
+   a recording-label matcher, which selects nothing on the live store or
+   another non-archive source. (Corrected
    after review: the design said this needed two recorder versions with
    different tables; one version is enough, when two endpoints send
    different `# UNIT` lines for a name with no unit token, `x_total` with
@@ -225,7 +228,9 @@ treatment of the overflow (#388 D3).
    first build read the first candidate instead of erroring; the
    reviewer's probe showed `rate(x_total[3s])` returning only one
    endpoint, in nanoseconds, and `x_total{job="b"}` returning nothing.
-   The error is now built, in `Plan` and in the engine.)
+   The error is now built, in `Plan` and in the engine. A second review
+   found its first wording offered only the recording-label matcher;
+   it now offers the `__prometheus_name__` form everywhere.)
 10. **Bits to bytes for counters.** ÷8 is a power of two, so it is exact
     in f64 (outside subnormals); `rate(x_bytes_total)` is bytes/s.
 11. **Recorder upgrade.** Recordings made before keep their names and
@@ -347,10 +352,13 @@ metriken-charts 0.1.3 (fix): its `STORAGE_KEYS` copy
   over the whole source when the engine evaluates. The hand-parsed
   histogram functions resolve in `parse_metric_selector`; `columns`
   resolves too, after `name_selectors`, so `{__name__="x"}` resolves as
-  `x` does. Off an archive, the engine lists the source's names once per
-  query (`QueryEngine::held`) and reads candidates' label sets only for a
-  name it does not hold; before review it listed them for every named
-  selector. A binary operation's result keeps the left operand's
+  `x` does. Off an archive, the engine lists the source's names once
+  (`QueryEngine::held`) and reads candidates' label sets only for a name
+  it does not hold; before review it listed them for every named
+  selector. The list is kept for the engine's life: one query for
+  `MemoryStore` and archives; the reader's life for `ParquetReader`,
+  `SegmentedParquetReader` and `UnionMetricsSource`, whose names are
+  fixed at open. A binary operation's result keeps the left operand's
   `__prometheus_name__` (Prometheus keeps every label but `__name__`);
   matching and `without` ignore it.
 - **Tests:** `metriken-storage/src/prometheus_units.rs` (each token, the
@@ -364,17 +372,20 @@ metriken-charts 0.1.3 (fix): its `STORAGE_KEYS` copy
   `_ratio`, `_bits` and unit-less histogram, a collision in one scrape and
   one mid-run (sticky), a collision that keeps a histogram's whole family,
   an untyped `_bucket` kept as served, an exporter name stored under two
-  names (an error, recorded and live; a recording-label matcher picks
-  one), `columns` of `{__name__="x"}`, the fallback in PromQL and the hand-parsed
-  histogram functions, recorded and live, an older recording beside a
-  newer one (exact preferred, per selector, under a scope, with finite
-  values that tell seconds from nanoseconds), and
+  names (an error, recorded and live; over the archive a
+  recording-label matcher picks one, and on any source the stored name
+  with `__prometheus_name__="x_total"` does, which the error names),
+  `columns` of `{__name__="x"}`, the fallback in PromQL and the
+  hand-parsed histogram functions, recorded and live, an older recording
+  beside a newer one (exact preferred, per selector, under a scope, with
+  finite values that tell seconds from nanoseconds), and
   `__prometheus_name__` ignored by matching and `without`;
   `promql/prometheus_names.rs` (a query of six selectors lists the
-  source's names once); `metriken-charts/tests/labels.test.mjs` (hidden from legends and from
-  the labels that name series). `tests/float_scalars.rs` fixtures were
-  renamed to names without a unit token (`cpu_time_total`), since they
-  test that values are stored as served.
+  source's names once); `metriken-charts/tests/labels.test.mjs` (hidden
+  from legends and from the labels that name series).
+  `tests/float_scalars.rs` fixtures were renamed to names without a unit
+  token (`cpu_time_total`), since they test that values are stored as
+  served.
 
 ## rezolus (other repository; not edited here)
 

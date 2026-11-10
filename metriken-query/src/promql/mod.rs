@@ -687,7 +687,10 @@ pub(crate) struct QueryEngine {
     /// ([`prometheus_names`]).
     names: Option<Arc<prometheus_names::NameResolution>>,
     /// Every name `source` holds, listed on the first selector that needs
-    /// them and kept for the engine's life (one query).
+    /// them and kept for the engine's life: one query for `MemoryStore` and
+    /// archives; the reader's life for `ParquetReader`,
+    /// `SegmentedParquetReader` and `UnionMetricsSource`, whose names are
+    /// fixed at open.
     held: std::sync::OnceLock<std::collections::HashSet<String>>,
 }
 

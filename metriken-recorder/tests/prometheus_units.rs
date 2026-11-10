@@ -872,8 +872,10 @@ fn an_untyped_bucket_is_kept_as_served() {
 
 /// One name stored under two names by two endpoints' `# UNIT` lines
 /// (`x_total` as `x_nanoseconds_total` and as `x_bytes_total`): a selector
-/// reaching both is an error naming both, live and recorded; a
-/// recording-label matcher picks one.
+/// reaching both is an error naming both, live and recorded. Over the
+/// archive a recording-label matcher picks one; on any source, live
+/// included, the stored name with `__prometheus_name__="x_total"` does,
+/// and the error names that form.
 #[test]
 fn an_exporter_name_stored_under_two_names_is_an_error() {
     let a = |t: u64| format!("# TYPE x counter\n# UNIT x seconds\nx_total{{job=\"a\"}} {t}\n");
@@ -943,6 +945,22 @@ fn an_exporter_name_stored_under_two_names_is_an_error() {
         err.contains("x_nanoseconds_total") && err.contains("x_bytes_total"),
         "{err}"
     );
+    // The error offers the form that works live; a recording-label matcher
+    // does not, and is not offered.
+    let escape = "x_nanoseconds_total{__prometheus_name__=\"x_total\"}";
+    assert!(err.contains(escape), "{err}");
+    assert!(!err.contains("recording-label"), "{err}");
+    every(&store, &format!("rate({escape}[3s])"), 1e9);
+    // Over the archive both forms are offered.
+    let err = reader
+        .query_range("rate(x_total[3s])", lo, hi, 1.0)
+        .expect_err("recorded")
+        .to_string();
+    assert!(
+        err.contains(escape) && err.contains("recording-label"),
+        "{err}"
+    );
+    every(&reader, &format!("rate({escape}[3s])"), 1e9);
 }
 
 /// `{__name__="x"}` lists the same columns as `x` for an exporter name.

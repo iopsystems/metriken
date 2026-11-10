@@ -79,7 +79,8 @@ Requires metriken-storage 0.11.0.
   was `MetricNotFound` before can now return series. When series served
   under one name are stored under more than one name in reach (two
   endpoints whose `# UNIT` lines differ), the query is an error naming
-  them; a recording-label matcher selects one.
+  them; over an archive a recording-label matcher selects one, and on any
+  source the stored name with `__prometheus_name__="<name>"` does.
 
 ### metriken-recorder 0.12.0
 
