@@ -930,8 +930,12 @@ export class Chart {
         // Scan each series' data for min/max Y in visible range.
         // When percentile series are pinned, only consider pinned series
         // (legacy spec.data path — multiSeries doesn't carry labels).
+        // A value that is not finite is not drawn on the axis: a +Inf quantile
+        // sits in the OOB band and any other is a gap. With an OOB band, a
+        // value over range.max is drawn in the band, above yAxisMax.
         let yMin = Infinity;
         let yMax = -Infinity;
+        const oobFrom = this._oobAxisMax ? format.range?.max : null;
 
         for (let pairIdx = 0; pairIdx < seriesPairs.length; pairIdx++) {
             if (hasPins && labels) {
@@ -944,7 +948,7 @@ export class Chart {
                 if (tMs < visibleMinMs) continue;
                 if (tMs > visibleMaxMs) break;
                 const y = valueData[i];
-                if (y !== null && y !== undefined && !isNaN(y)) {
+                if (Number.isFinite(y) && !(oobFrom != null && y > oobFrom)) {
                     if (y < yMin) yMin = y;
                     if (y > yMax) yMax = y;
                 }

@@ -1,10 +1,12 @@
 import {
     createAxisLabelFormatter,
+    plainValue,
 } from './util/units.js';
 import {
     insertGapNulls,
     clampToRange,
     seriesGapGeometry,
+    isInfinite,
 } from './util/utils.js';
 import {
     getBaseOption,
@@ -142,6 +144,8 @@ export function configureLineChart(chart) {
             : null;
         const zippedRaw = s.timeData.map((t, i) => {
             if (interp && interp[i]) return [t * 1000, null, null];
+            // ±Infinity is a gap that keeps the value for the tooltip.
+            if (isInfinite(s.valueData[i])) return [t * 1000, null, s.valueData[i]];
             const [v, raw] = clampToRange(s.valueData[i], range);
             const point = [t * 1000, v, raw];
             // A measured point with holes on both sides has no segment to draw.
@@ -268,7 +272,7 @@ export function configureLineChart(chart) {
             ...baseOption.tooltip,
             formatter: getTooltipFormatter(unitSystem ?
                 createAxisLabelFormatter(unitSystem) :
-                val => val, null, chart),
+                plainValue, null, chart),
         },
         // Compare mode: shade the gap between the two overlaid medians (the
         // divergence band) BEHIND the lines, so agreement reads as a thin line
@@ -354,7 +358,7 @@ export function buildInterpolatedSeries(s, range) {
     if (!Array.isArray(flags) || flags.length !== s.timeData.length) return [];
     // Clamp first so the overlay tracks the same clipped values the nominal
     // line draws; the shared builder handles run detection and styling.
-    const values = s.valueData.map((v) => clampToRange(v, range)[0]);
+    const values = s.valueData.map((v) => (isInfinite(v) ? null : clampToRange(v, range)[0]));
     return buildInterpolatedOverlay({
         t: s.timeData,
         values,
@@ -386,7 +390,9 @@ export function buildBandSeries(s, idx, range, interval) {
     for (let i = 0; i < s.timeData.length; i++) {
         const t = s.timeData[i] * 1000;
         const iv = intervals[i];
-        if (!Array.isArray(iv)) {
+        // A band with an infinite end, such as a +Inf quantile's
+        // (bound, +Inf), has no edge to draw.
+        if (!Array.isArray(iv) || isInfinite(iv[0]) || isInfinite(iv[1])) {
             loRaw.push([t, null]);
             deltaRaw.push([t, null]);
             continue;

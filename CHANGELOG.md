@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-charts 0.1.3
+
+- **Fixed:** zooming, or pinning a legend entry on, a percentile chart that
+  holds a +Inf value (metriken-query 0.47 returns +Inf for a quantile past a
+  histogram's highest finite bucket) set the y-axis minimum to -Infinity.
+  ECharts drew that axis as 0 to 1, so every finite point left the chart.
+  The rescale now counts only finite values, and on a chart with an OOB
+  band it skips values over `range.max`, which are drawn in the band. This
+  also stops finite values above `range.max` from widening the zoomed axis
+  below the data.
+- **Fixed:** without a range bound on that side, a line or multi-series
+  chart, a decimated band, an uncertainty band, or a percentile chart
+  without `range.max` given ±Infinity drew its y-axis as 0 to 1 at every
+  zoom; with one, it drew the infinity clamped at the bound. Each now draws
+  ±Infinity as a gap, and an
+  uncertainty band with an infinite end is not drawn at that point. A
+  percentile chart with `range.max` draws +Inf in its OOB band, as before.
+  A quantile heatmap's color scale and `heatmapTriplesMinMax` skip
+  ±Infinity; a +Inf cell takes the top color.
+- **Fixed:** tooltips and axis labels print ±Infinity as `+Inf` and `-Inf`,
+  not `Infinity s` or `Infinity`, with or without a unit system. A line or
+  multi-series tooltip gives an infinite gap's value, and a quantile heatmap
+  delta no longer reads `++Inf (+Infinity%)`. NaN prints as before.
+
 ### metriken-storage 0.10.0
 
 - **Added (breaking):** `HistogramRow` gains `overflow: Option<Overflow>`,

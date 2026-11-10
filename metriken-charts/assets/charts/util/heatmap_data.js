@@ -1,5 +1,5 @@
-// Scan a flat [timeIdx, y, value] triple array for the numeric value
-// bounds. Returns { min: null, max: null } when there are no numeric
+// Scan a flat [timeIdx, y, value] triple array for the finite value
+// bounds. Returns { min: null, max: null } when there are no finite
 // samples.
 const heatmapTriplesMinMax = (triples) => {
     if (!Array.isArray(triples) || triples.length === 0) return { min: null, max: null };
@@ -7,7 +7,7 @@ const heatmapTriplesMinMax = (triples) => {
     let hi = -Infinity;
     for (const t of triples) {
         const v = Array.isArray(t) ? t[2] : null;
-        if (v == null || Number.isNaN(v)) continue;
+        if (!Number.isFinite(v)) continue;
         if (v < lo) lo = v;
         if (v > hi) hi = v;
     }

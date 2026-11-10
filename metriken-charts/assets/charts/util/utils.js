@@ -60,6 +60,15 @@ export function seriesGapGeometry(timeSec, intervalSec) {
 }
 
 /**
+ * Whether `v` is +Infinity or -Infinity. A chart draws such a value as a gap,
+ * except a percentile chart, which draws +Inf in its OOB band. ECharts given
+ * one in a series sets the y-axis extent to [0, 1].
+ * @param {*} v
+ * @returns {boolean}
+ */
+export const isInfinite = (v) => v === Infinity || v === -Infinity;
+
+/**
  * Clamp a value to range bounds.
  * @param {number} v - the raw value
  * @param {{ min?: number, max?: number }} [range] - optional range bounds

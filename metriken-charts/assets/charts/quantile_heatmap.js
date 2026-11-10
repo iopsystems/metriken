@@ -4,7 +4,7 @@
 // (low value → green, high value → red).
 
 import { formatDateTime } from './util/utils.js';
-import { createAxisLabelFormatter } from './util/units.js';
+import { createAxisLabelFormatter, plainValue } from './util/units.js';
 import {
     getBaseOption,
     applyNoData,
@@ -90,7 +90,9 @@ export function configureQuantileHeatmap(chart) {
     // here so the cell loop and color logic can branch consistently.
     const isDiff = !!chart.spec.diffMatrices;
 
-    // Color scale spans the non-null, positive value range across all cells.
+    // Color scale spans the finite, positive value range across all cells. A
+    // +Inf cell (a quantile past the highest finite bucket) takes the top
+    // color through normalize's clamp.
     let colorMin = Infinity;
     let colorMax = -Infinity;
     for (let s = 1; s <= seriesCount; s++) {
@@ -99,7 +101,7 @@ export function configureQuantileHeatmap(chart) {
             const v = col[t];
             // Diff data is signed; only the positive log path needs the
             // v > 0 filter (log10 is undefined at and below zero).
-            if (v != null && !Number.isNaN(v) && (isDiff || v > 0)) {
+            if (Number.isFinite(v) && (isDiff || v > 0)) {
                 if (v < colorMin) colorMin = v;
                 if (v > colorMax) colorMax = v;
             }
@@ -239,10 +241,13 @@ export function configureQuantileHeatmap(chart) {
 
     const valueFmt = unitSystem
         ? createAxisLabelFormatter(unitSystem)
-        : (v) => String(v);
+        : (v) => String(plainValue(v));
     // For tooltip HTML: an unknown `unit_system` is returned verbatim as the
     // unit, so it is escaped. The color-legend ticks (textContent) keep valueFmt.
     const tipFmt = (v) => escapeHtml(valueFmt(v));
+    // A delta with its sign: `+` before a finite value at or above 0, since
+    // `+Inf` and `-Inf` carry their own.
+    const signedFmt = (v) => `${v >= 0 && Number.isFinite(v) ? '+' : ''}${tipFmt(v)}`;
 
     const customXFormatterForTooltip = chart.spec.xAxisFormatter;
 
@@ -275,7 +280,7 @@ export function configureQuantileHeatmap(chart) {
             const experimentLabel = diffCaptureLabels?.experiment || 'experiment';
             const deltaStr = (v == null || Number.isNaN(v))
                 ? '—'
-                : `${v >= 0 ? '+' : ''}${tipFmt(v)}`;
+                : signedFmt(v);
             return `<div style="${FONTS.cssSans}">
                 <div style="${FONTS.cssMono} font-size: ${FONTS.tooltipTimestamp.fontSize}px; color: ${COLORS.fgSecondary}; margin-bottom: 8px;">
                     ${formattedTime}
@@ -322,8 +327,11 @@ export function configureQuantileHeatmap(chart) {
             let deltaStr = '—';
             if (baseV != null && !Number.isNaN(baseV) && expV != null && !Number.isNaN(expV)) {
                 const d = expV - baseV;
-                const pct = baseV !== 0 ? `(${d >= 0 ? '+' : ''}${(d / baseV * 100).toFixed(1)}%)` : '';
-                deltaStr = `${d >= 0 ? '+' : ''}${tipFmt(d)} ${pct}`.trim();
+                const ratio = d / baseV * 100;
+                const pct = baseV !== 0 && Number.isFinite(ratio)
+                    ? `(${d >= 0 ? '+' : ''}${ratio.toFixed(1)}%)`
+                    : '';
+                deltaStr = `${signedFmt(d)} ${pct}`.trim();
             }
             return `<div style="${FONTS.cssSans}">
                 <div style="${FONTS.cssMono} font-size: ${FONTS.tooltipTimestamp.fontSize}px; color: ${COLORS.fgSecondary}; margin-bottom: 8px;">

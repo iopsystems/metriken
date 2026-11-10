@@ -1,5 +1,6 @@
 import {
     createAxisLabelFormatter,
+    infinityLabel,
 } from './util/units.js';
 import { formatDateTime } from './util/utils.js';
 import { COLORS, CHART_PALETTE } from './util/colormap.js';
@@ -130,7 +131,10 @@ export function getTooltipFormatter(valueFormatter, pinnedSet, chart, style) {
                             valColor = faded ? COLORS.fgMuted : COLORS.fg;
                             marker = p.marker;
                             displayValue = fmt(p.value[1]);
-                            if (isClamped) {
+                            if (isClamped && p.value[1] == null) {
+                                // A gap that keeps its value: ±Infinity.
+                                displayValue = fmt(p.value[2]);
+                            } else if (isClamped) {
                                 displayValue += ` <span style="color: ${COLORS.fgMuted};">(raw: ${fmt(p.value[2])})</span>`;
                             }
                         }
@@ -314,6 +318,8 @@ export function getBaseYAxisOption(logScale, unitSystem, format = {}) {
             formatter: unitSystem ?
                 createAxisLabelFormatter(unitSystem) :
                 function (value) {
+                    const inf = infinityLabel(value);
+                    if (inf) return inf;
                     if (logScale && Math.abs(value) >= 1000) {
                         return value.toExponential(0);
                     }

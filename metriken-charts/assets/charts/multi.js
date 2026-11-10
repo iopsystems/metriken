@@ -1,9 +1,11 @@
 import {
     createAxisLabelFormatter,
+    plainValue,
 } from './util/units.js';
 import {
     insertGapNulls,
     clampToRange,
+    isInfinite,
 } from './util/utils.js';
 import {
     getBaseOption,
@@ -115,6 +117,8 @@ export function configureMultiSeriesChart(chart) {
         const color = cgroupColors[i - 1];
 
         let zippedData = timeData.map((t, j) => {
+            // ±Infinity is a gap that keeps the value for the tooltip.
+            if (isInfinite(data[i][j])) return [t * 1000, null, data[i][j]];
             const [v, raw] = clampToRange(data[i][j], range);
             return [t * 1000, v, raw];
         });
@@ -197,6 +201,11 @@ export function configureMultiSeriesChart(chart) {
             const out = new Float64Array(arr.length);
             for (let i = 0; i < arr.length; i++) {
                 let v = arr[i];
+                // ±Infinity is left for buildBoxplotSeries to draw as a gap.
+                if (isInfinite(v)) {
+                    out[i] = v;
+                    continue;
+                }
                 if (range.max != null && v > range.max) v = range.max;
                 else if (range.min != null && v < range.min) v = range.min;
                 out[i] = v;
@@ -231,7 +240,7 @@ export function configureMultiSeriesChart(chart) {
             ...baseOption.tooltip,
             formatter: getTooltipFormatter(unitSystem ?
                 createAxisLabelFormatter(unitSystem) :
-                val => val, null, chart),
+                plainValue, null, chart),
         },
         // Bands first so they sit behind the lines (z also enforces this).
         series: [...bandSeries, ...series],
