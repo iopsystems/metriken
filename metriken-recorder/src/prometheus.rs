@@ -39,8 +39,10 @@ use tracing::{debug, warn};
 /// carries the exporter's name in the internal label
 /// [`PROMETHEUS_NAME_LABEL`]. When two exporter names would be stored
 /// under one name (`rpc_seconds` and `rpc_ms`, or `rpc_seconds` beside an
-/// `rpc_nanoseconds` the exporter serves), each is stored under its own
-/// name, unscaled, from that scrape on for the life of the converter.
+/// `rpc_nanoseconds` the exporter serves), each one's whole family (the
+/// name with its `_bucket`, `_sum`, `_count` and `_total` series) is
+/// stored under its own names, unscaled, from that scrape on for the life
+/// of the converter, so a histogram's buckets and `_sum` stay in one unit.
 ///
 /// Maintains a stable mapping from (metric_name, labels) to numeric IDs across
 /// scrapes within a recording session, ensuring consistent column identity.
@@ -62,9 +64,10 @@ pub struct PrometheusConverter {
     /// a sample of the same name and labels. Logged at `warn` once per
     /// converter, later at `debug`.
     overflow_collision_warned: bool,
-    /// Exporter names stored under their own name, unscaled, because their
-    /// normalized name collided with another's in some scrape. Never
-    /// emptied, so a series is renamed back at most once.
+    /// Families (exporter names without a `_bucket`, `_sum`, `_count` or
+    /// `_total` suffix) stored under their own names, unscaled, because a
+    /// member's normalized name collided with another's in some scrape.
+    /// Never emptied, so a series is renamed back at most once.
     keep_original: HashSet<String>,
     /// A unit collision has been logged at `warn`; later ones at `debug`.
     unit_collision_warned: bool,
@@ -171,9 +174,15 @@ impl PrometheusConverter {
         }
     }
 
+    /// Whether exporter name `name`'s family is kept as served.
+    fn kept(&self, name: &str) -> bool {
+        self.keep_original.contains(split_suffix(name).0)
+    }
+
     /// Each exporter name of `scrape` and how it is stored: `None` for a
-    /// name kept as served (no unit, or in `keep_original`). Names that
-    /// collide in this scrape join `keep_original` first.
+    /// name kept as served (no unit, or its family in `keep_original`). The
+    /// families of names that collide in this scrape join `keep_original`
+    /// first.
     fn plan(&mut self, scrape: &Scrape) -> HashMap<String, Option<Normalized>> {
         let mut plan: HashMap<String, Option<Normalized>> = HashMap::new();
         for sample in &scrape.samples {
@@ -188,7 +197,7 @@ impl PrometheusConverter {
         let mut as_served: HashSet<&str> = HashSet::new();
         for (name, normalized) in &plan {
             match normalized {
-                Some(n) if n.name != *name && !self.keep_original.contains(name) => {
+                Some(n) if n.name != *name && !self.kept(name) => {
                     renamed
                         .entry(n.name.as_str())
                         .or_default()
@@ -215,10 +224,11 @@ impl PrometheusConverter {
         for (stored, names) in collisions {
             let shown: Vec<&str> = names.iter().map(String::as_str).collect();
             self.log_unit_collision(&stored, &shown);
-            self.keep_original.extend(names);
+            self.keep_original
+                .extend(names.iter().map(|n| split_suffix(n).0.to_string()));
         }
         for (name, normalized) in plan.iter_mut() {
-            if self.keep_original.contains(name) {
+            if self.kept(name) {
                 *normalized = None;
             }
         }
@@ -258,7 +268,7 @@ impl PrometheusConverter {
             // Under the exporter's name and, when renamed, the stored one.
             let stored = match plan.get(name) {
                 Some(normalized) => normalized.as_ref().map(|n| n.name.clone()),
-                None if self.keep_original.contains(name) => None,
+                None if self.kept(name) => None,
                 None => normalize(name, unit_line(&scrape.units, name)).map(|n| n.name),
             };
             for name in std::iter::once(name.clone()).chain(stored) {
