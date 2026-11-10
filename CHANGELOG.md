@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this crate forward it, and `Memory::mark_duplicated` records a series a
   snapshot gave twice. The listings are unchanged and show such a series
   once.
+- **Changed:** `Memory`'s `upsert_*_sample` methods keep each series in
+  time order: a sample at the series' last time replaces that sample, and
+  one before it is dropped and counted (`Memory::dropped_samples`, warned
+  once). They appended either before. `Memory::histogram_last_timestamp`
+  is added.
 
 ### metriken-query 0.48.1
 
@@ -42,6 +47,12 @@ Requires metriken-storage 0.11.1.
   differ only by a label named like a storage key gives this error where
   its queries returned such results; a selector that leaves those series
   out reads as before.
+- **Fixed:** `MemoryStore::ingest_snapshot` keeps each series in time
+  order, as `Memory`'s upserts now do: a snapshot ingested twice at one
+  systemtime replaces the first's values, and one from a wall clock that
+  stepped back is dropped until the clock passes the series' last sample,
+  its histogram overflow link included. Without it, the order check below
+  refused every query over such a point.
 - **Fixed:** a query reading a series whose samples step back in time (a
   sample at or before the one before it) is an `EvaluationError` naming the
   metric and the label set, for every evaluator: `rate` and `irate` on both

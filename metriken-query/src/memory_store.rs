@@ -533,7 +533,10 @@ impl MetricsSource for MemoryStore {
 #[cfg(feature = "ingest")]
 impl MemoryStore {
     /// Ingest a single snapshot into the store, at the timestamp the snapshot
-    /// carries. Every metric in one snapshot shares that timestamp, so they
+    /// carries. Each series stays in time order: a value at a series' last
+    /// time replaces that value (a snapshot ingested twice), and one before
+    /// it is dropped (a wall clock that stepped back; see
+    /// `Memory::dropped_samples`). Every metric in one snapshot shares that timestamp, so they
     /// align by construction; this used to additionally round it to the
     /// store's nominal interval, which moved readings the producer had already
     /// timed exactly.
@@ -605,10 +608,15 @@ impl MemoryStore {
                     .get(metriken_storage::OVERFLOW_BOUND_KEY)
                     .and_then(|b| b.parse::<f64>().ok()),
             );
+            memory.upsert_histogram_sample(&name, labels.clone(), config, ts, snap);
+            // A row the store dropped (its time before the series' last)
+            // gets no link, which would otherwise name an overflow for a
+            // row the series does not have.
             if let Some((counter, bound)) = overflow {
-                memory.set_histogram_overflow(&name, labels.clone(), ts, counter, bound);
+                if memory.histogram_last_timestamp(&name, &labels) == Some(ts) {
+                    memory.set_histogram_overflow(&name, labels, ts, counter, bound);
+                }
             }
-            memory.upsert_histogram_sample(&name, labels, config, ts, snap);
         }
 
         for histogram in snapshot.gauge_histograms() {
@@ -818,6 +826,66 @@ mod ingest_tests {
             "storage keys must not survive as labels: {:?}",
             labels[0]
         );
+    }
+
+    /// A histogram row the store drops (its time before the series' last)
+    /// does not replace the link of the row already at that time.
+    #[test]
+    fn a_dropped_histogram_row_leaves_the_kept_rows_link() {
+        let store = crate::MemoryStore::builder()
+            .sampling_interval_ms(1000)
+            .build();
+        let snap = |secs: u64, bound: &str| {
+            let metadata: HashMap<String, String> = [
+                ("metric", "lat"),
+                ("grouping_power", "7"),
+                ("max_value_power", "64"),
+                (metriken_storage::OVERFLOW_KEY, "lat_overflow"),
+                (metriken_storage::OVERFLOW_BOUND_KEY, bound),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+            let mut h = ::histogram::Histogram::new(7, 64).unwrap();
+            h.increment(1_000).unwrap();
+            metriken_model::Snapshot::V2(metriken_model::SnapshotV2 {
+                systemtime: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+                duration: Duration::from_secs(0),
+                metadata: HashMap::new(),
+                counters: vec![metriken_model::Counter::new(
+                    "lat_overflow".to_string(),
+                    secs,
+                    [("metric".to_string(), "lat_overflow".to_string())].into(),
+                )],
+                gauges: vec![],
+                histograms: vec![metriken_model::Histogram::new(
+                    "lat".to_string(),
+                    h,
+                    metadata,
+                )],
+                gauge_histograms: Vec::new(),
+            })
+        };
+        store.ingest_snapshot(snap(1000, "100"));
+        store.ingest_snapshot(snap(1001, "100"));
+        // A clock stepped back to 1000 s: dropped, with its link.
+        store.ingest_snapshot(snap(1000, "999"));
+        let memory = store.state.memory.read().unwrap();
+        // The histogram row and its overflow counter's sample.
+        assert_eq!(memory.dropped_samples(), 2);
+        let stream = crate::DataSource::histogram_stream(
+            &*memory,
+            "lat",
+            &crate::labels::Labels::default(),
+            0,
+            u64::MAX,
+        )
+        .unwrap();
+        let bounds: Vec<(u64, Option<f64>)> = stream
+            .rows
+            .map(|r| (r.timestamp / 1_000_000_000, r.overflow.map(|o| o.bound)))
+            .collect();
+        assert_eq!(bounds, [(1000, Some(100.0)), (1001, Some(100.0))]);
     }
 
     #[test]

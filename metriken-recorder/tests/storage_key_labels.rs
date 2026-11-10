@@ -408,3 +408,81 @@ fn a_joined_series_the_footer_check_misses_is_refused_where_it_steps_back() {
         }
     }
 }
+
+/// `text`'s scrapes ingested into a live store, each at the systemtime
+/// `at(t)` gives, `times` times over.
+fn live_at(at: &dyn Fn(u64) -> u64, times: usize) -> metriken_query::MemoryStore {
+    let store = metriken_query::MemoryStore::builder()
+        .sampling_interval_ms(1000)
+        .build();
+    for (t, (_, snapshot)) in scrapes(false).into_iter().enumerate() {
+        let mut snapshot = snapshot;
+        let Snapshot::V3(v3) = &mut snapshot else {
+            panic!("a scrape is a V3 snapshot")
+        };
+        v3.systemtime = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(at(t as u64));
+        for _ in 0..times {
+            store.ingest_snapshot(snapshot.clone());
+        }
+    }
+    store
+}
+
+/// A matrix result's series, labels sorted, in label order.
+#[allow(clippy::type_complexity)]
+fn series_of(result: QueryResult) -> Vec<(Vec<(String, String)>, Vec<(f64, f64)>)> {
+    let QueryResult::Matrix { result, .. } = result else {
+        panic!("not a matrix: {result:?}")
+    };
+    let mut out: Vec<_> = result
+        .into_iter()
+        .map(|m| {
+            let mut labels: Vec<(String, String)> = m.metric.into_iter().collect();
+            labels.sort();
+            (labels, m.values)
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// The live store keeps each series in time order at ingest: a snapshot
+/// ingested twice at one systemtime replaces the first's values, and one
+/// from a wall clock stepped back 3 s is dropped until the clock passes
+/// the last sample. Every query reads, as before the order check.
+#[test]
+fn a_live_store_keeps_each_series_in_time_order() {
+    let once = live_at(&|t| BASE + t * S, 1);
+    let twice = live_at(&|t| BASE + t * S, 2);
+    let stepped = live_at(
+        &|t| {
+            if t < 6 {
+                BASE + t * S
+            } else {
+                BASE + (t - 3) * S
+            }
+        },
+        1,
+    );
+    let queries = [
+        "rate(x_total[3s])",
+        "irate(x_total[3s])",
+        "g",
+        "avg_over_time(g[3s])",
+        "deriv(g[3s])",
+        "histogram_quantile(0.5, h)",
+        "histogram_irate(h)",
+        "rate(h_overflow[3s])",
+    ];
+    for query in queries {
+        for per_series in [false, true] {
+            let want = range(&once, query, per_series).unwrap_or_else(|e| panic!("{query}: {e}"));
+            let got =
+                range(&twice, query, per_series).unwrap_or_else(|e| panic!("twice {query}: {e}"));
+            assert_eq!(series_of(got), series_of(want), "twice {query}");
+            if let Err(e) = range(&stepped, query, per_series) {
+                panic!("stepped back {query}: {e}");
+            }
+        }
+    }
+}
