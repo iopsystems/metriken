@@ -194,15 +194,19 @@ fn merge_streams(streams: Vec<HistogramStream>, clock: Option<usize>) -> Option<
     }
     let config = common_config(streams.iter().map(|s| s.meta.config))?;
 
-    // Build unified series list; record per-stream remapping tables. Every
-    // index of a label set, in every stream, is one series: a stream lists
-    // one index per column (a plain parquet file, a live store), and two
-    // columns of one series that follow one another (a bound that moved)
-    // read as one. A row at the time of its stream's previous row of that
-    // label set from another index (two columns sharing a time, which the
-    // segmented reader's splice keeps under two indices as well) goes to a
-    // second index of the labels instead, decided on the stream's own times
-    // before any re-stamping, so a reader can refuse the series.
+    // Build unified series list; record per-stream remapping tables. (A
+    // single stream returned above passes through unchanged, its indices
+    // included.) Every index of a label set, in every stream, is one
+    // series: a stream lists one index per column (a plain parquet file, a
+    // live store), and two columns of one series that follow one another (a
+    // bound that moved) read as one. A row at the time of its stream's
+    // previous row of that label set from another index (two columns
+    // sharing a time, which the segmented reader's splice keeps under two
+    // indices as well) goes to a second index of the labels instead,
+    // decided on the stream's own times before any re-stamping, so a reader
+    // can refuse the series. The series list then holds a second entry of
+    // those labels, which may have no rows. Two rows of one index at one
+    // time (a merged stream's pooling) stay on that index.
     let mut global_series: Vec<Labels> = Vec::new();
     let mut index: std::collections::HashMap<Labels, usize> = std::collections::HashMap::new();
     let mut collision_of: std::collections::HashMap<usize, usize> =
@@ -541,6 +545,36 @@ mod tests {
         let indices: std::collections::BTreeSet<usize> =
             pooled(&split).iter().map(|r| r.1).collect();
         assert_eq!(indices.len(), 1, "{:?}", pooled(&split));
+    }
+
+    /// A merge of a merged stream: `a` (a bound that moved, two indices of
+    /// `S` over 1000 to 1002 and 1003 to 1005) merged with `b` (one column
+    /// of `S` over 1000 to 1005) pools two rows of one index at each time,
+    /// as a `MultiParquetSource` of the two does, and merging that with `c`
+    /// (a `RecordingsSource` over both) keeps them on one index: two rows of
+    /// one index at one time are pooling, not two columns.
+    #[test]
+    fn a_merged_streams_pooled_rows_stay_on_one_index() {
+        let a = || {
+            two_columns(&[
+                (1000, 0),
+                (1001, 0),
+                (1002, 0),
+                (1003, 1),
+                (1004, 1),
+                (1005, 1),
+            ])
+        };
+        let b = || stream((1000..=1005).map(|t| (t, t)).collect(), "S", (4, 16));
+        let c = || stream(vec![(1000, 1), (1005, 5)], "c", (4, 16));
+        let inner = HistogramStream::merge(vec![a(), b()]).unwrap();
+        let nested = rows_of_s(HistogramStream::merge(vec![inner, c()]).unwrap());
+        let flat = rows_of_s(HistogramStream::merge(vec![a(), b(), c()]).unwrap());
+        let indices: std::collections::BTreeSet<usize> = nested.iter().map(|r| r.1).collect();
+        assert_eq!(indices.len(), 1, "{nested:?}");
+        assert_eq!(nested.len(), 12, "{nested:?}");
+        let times = |rows: &[(u64, usize)]| rows.iter().map(|r| r.0).collect::<Vec<_>>();
+        assert_eq!(times(&nested), times(&flat));
     }
 
     /// Two columns of one label set with rows at one time keep two indices

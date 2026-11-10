@@ -27,12 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counted (`Memory::replaced_samples`), and one before it is dropped and
   counted (`Memory::dropped_samples`, warned once). Before, they appended
   in both cases. `Memory::histogram_last_timestamp` is added.
-- **Changed:** `HistogramStream::merge` and `merge_on_clock` put a
-  stream's row of a label set at the time of that stream's previous row
-  of it from another index (two columns of one series sharing a time) on
-  a second index of those labels, decided before re-stamping, so a merged
-  stream's rows of two indices of one label set at one time stay on two
-  indices. Every other row of a label set is on one index, as before.
+- **Changed:** in a merge of two or more streams,
+  `HistogramStream::merge` and `merge_on_clock` put a stream's row of a
+  label set at the time of that stream's previous row of it from another
+  index (two columns of one series sharing a time) on a second index of
+  those labels, decided before re-stamping, so the merged stream's rows of
+  two indices of one label set at one time stay on two indices. Every
+  other row of a label set is on one index, as before; the series list
+  holds a second entry of those labels, which may have no rows. A single
+  stream passes through unchanged, its indices included.
 
 ### metriken-query 0.48.1
 
@@ -74,9 +77,9 @@ Requires metriken-storage 0.11.1.
   labels, and a long table's relabelling keeps a column's second index of
   one label set apart, where each joined them under one index); rows of
   one index at one time, as a pooling of recordings onto one clock gives,
-  do not. Alternating
-  histogram columns, whose rows are read in time order, are not found.
-  Before, such a read gave a wrong rate, or panicked in a debug build.
+  do not. Alternating histogram columns, whose rows are read in time
+  order, are not found. Before, such a read gave a wrong rate, or
+  panicked in a debug build.
 - **Fixed:** the error for an exporter name stored under two names over
   an archive offered `<name>{source="..."}` whatever the recordings'
   labels were (#395). It now offers a recording label the recordings
