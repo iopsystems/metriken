@@ -686,6 +686,9 @@ pub(crate) struct QueryEngine {
     /// archive's `Plan`); `None` to resolve over the whole of `source`
     /// ([`prometheus_names`]).
     names: Option<Arc<prometheus_names::NameResolution>>,
+    /// Every name `source` holds, listed on the first selector that needs
+    /// them and kept for the engine's life (one query).
+    held: std::sync::OnceLock<std::collections::HashSet<String>>,
 }
 
 /// Try to parse an optional stride (in seconds) from the trailing argument.
@@ -1050,6 +1053,7 @@ impl QueryEngine {
             source,
             groups: None,
             names: None,
+            held: std::sync::OnceLock::new(),
         }
     }
 
@@ -1064,17 +1068,22 @@ impl QueryEngine {
 
     /// The stored name a selector of `name` with `filter` reads instead,
     /// if any ([`prometheus_names`]).
-    fn stored_name(&self, name: &str, filter: &Labels) -> Option<String> {
+    fn stored_name(&self, name: &str, filter: &Labels) -> Result<Option<String>, QueryError> {
         match &self.names {
-            Some(names) => names.get(&(name.to_string(), filter.clone())).cloned(),
-            None => prometheus_names::stored_name(&*self.source, name),
+            Some(names) => Ok(names.get(&(name.to_string(), filter.clone())).cloned()),
+            None => {
+                let held = self
+                    .held
+                    .get_or_init(|| prometheus_names::held_names(&*self.source));
+                prometheus_names::stored_name(&*self.source, held, name)
+            }
         }
     }
 
     /// `expr`'s selectors pointed at stored names where they name a series
     /// by its exporter name.
-    pub(crate) fn resolve_names(&self, expr: &mut Expr) {
-        prometheus_names::resolve_selectors(expr, &|name, filter| self.stored_name(name, filter));
+    pub(crate) fn resolve_names(&self, expr: &mut Expr) -> Result<(), QueryError> {
+        prometheus_names::resolve_selectors(expr, &|name, filter| self.stored_name(name, filter))
     }
 
     /// An engine over `source`, some of whose recordings form the process
@@ -1088,6 +1097,7 @@ impl QueryEngine {
             source,
             groups: Some(Arc::new(groups)),
             names: None,
+            held: std::sync::OnceLock::new(),
         }
     }
 
@@ -1219,7 +1229,7 @@ impl QueryEngine {
     /// series by its exporter name.
     fn parse_metric_selector(&self, selector: &str) -> Result<(String, Labels), QueryError> {
         let (name, filter) = self.parse_metric_selector_as_written(selector)?;
-        Ok(match self.stored_name(&name, &filter) {
+        Ok(match self.stored_name(&name, &filter)? {
             Some(stored) => (stored, prometheus_names::renamed_filter(filter, &name)),
             None => (name, filter),
         })
@@ -1779,7 +1789,7 @@ impl QueryEngine {
         match parser::parse(query_str) {
             Ok(mut parsed) => {
                 name_selectors(&mut parsed);
-                self.resolve_names(&mut parsed);
+                self.resolve_names(&mut parsed)?;
                 expr(&parsed)
             }
             Err(err) => {

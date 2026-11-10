@@ -625,6 +625,42 @@ fn an_older_recording_with_exporter_names_beside_a_newer_one() {
     assert_eq!(labels["source"], "new");
     every(&reader, "rate(rpc_nanoseconds_sum[3s])", 0.02e9);
 
+    // Finite values tell the units apart: a summary quantile in ms in the
+    // older recording, in ns in the newer one; and the older histogram's
+    // own name (its buckets were ×1e9 before this change too) beside the
+    // newer through `{source="new"}`.
+    let (labels, _) = one(&reader, "q_ms{quantile=\"0.99\"}");
+    assert_eq!(labels["source"], "old");
+    every(&reader, "q_ms{quantile=\"0.99\"}", 7.0);
+    reads_stored(
+        &reader,
+        "q_ms{quantile=\"0.99\", source=\"new\"}",
+        7e6,
+        "q_nanoseconds",
+        "q_ms",
+    );
+    let (labels, median) = one(&reader, "histogram_quantile(0.5, rpc_seconds)");
+    assert_eq!(
+        labels.get("__name__").map(String::as_str),
+        Some("rpc_seconds")
+    );
+    assert!(
+        median.iter().all(|v| (*v / 1e6 - 1.0).abs() < 0.01),
+        "{median:?}"
+    );
+    let (labels, median) = one(
+        &reader,
+        "histogram_quantile(0.5, rpc_seconds{source=\"new\"})",
+    );
+    assert_eq!(
+        labels.get("__name__").map(String::as_str),
+        Some("rpc_nanoseconds")
+    );
+    assert!(
+        median.iter().all(|v| (*v / 1e6 - 1.0).abs() < 0.01),
+        "{median:?}"
+    );
+
     // Per selector: `{source="new"}` reaches only the newer recording.
     reads_stored(
         &reader,
@@ -769,4 +805,151 @@ fn a_description_is_kept_under_both_names() {
         map.get("rpc_nanoseconds").map(String::as_str),
         Some("Latency.")
     );
+}
+
+/// A histogram whose name collides with another family's (`lat_seconds`
+/// beside a gauge `lat_ms`, both `lat_nanoseconds`): the whole family is
+/// kept as served, its `_sum` and `_count` with its buckets, so the
+/// buckets and `_sum` stay in one unit.
+#[test]
+fn a_collision_keeps_the_whole_family() {
+    let text = |t: u64| {
+        format!(
+            "# TYPE lat_seconds histogram\n\
+             lat_seconds_bucket{{le=\"0.1\"}} {t}\n\
+             lat_seconds_bucket{{le=\"+Inf\"}} {t}\n\
+             lat_seconds_sum {}\n\
+             lat_seconds_count {t}\n\
+             # TYPE lat_ms gauge\n\
+             lat_ms 3\n",
+            0.05 * t as f64
+        )
+    };
+    let meta = converted(&text(1));
+    let mut names: Vec<&String> = meta.keys().collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "lat_ms",
+            "lat_seconds",
+            "lat_seconds_count",
+            "lat_seconds_overflow",
+            "lat_seconds_sum"
+        ]
+    );
+    for (name, metas) in &meta {
+        for m in metas {
+            assert!(!m.contains_key(PROMETHEUS_NAME_LABEL), "{name}: {m:?}");
+            assert!(!m.contains_key("unit"), "{name}: {m:?}");
+        }
+    }
+    let v = values(&text(1));
+    assert_eq!(v[&("lat_seconds_sum".to_string(), None)], 0.05);
+    // The buckets are seconds × the generic scale, recorded.
+    assert_eq!(meta["lat_seconds"][0][SCALE_KEY], "10");
+    let (_dir, reader) = recorded(&text);
+    every(&reader, "rate(lat_seconds_sum[3s])", 0.05);
+}
+
+/// An untyped `_bucket` sample (no `# TYPE ... histogram`) is kept as
+/// served: its `le` label is in the exporter's unit, which a rename would
+/// not change.
+#[test]
+fn an_untyped_bucket_is_kept_as_served() {
+    let meta = converted("foo_seconds_bucket{le=\"0.1\"} 3\n");
+    let m = &meta["foo_seconds_bucket"][0];
+    assert_eq!(m["le"], "0.1");
+    assert!(
+        !m.contains_key(PROMETHEUS_NAME_LABEL) && !m.contains_key("unit"),
+        "{m:?}"
+    );
+    assert_eq!(
+        values("foo_seconds_bucket{le=\"0.1\"} 3\n")[&("foo_seconds_bucket".into(), None)],
+        3.0
+    );
+}
+
+/// One name stored under two names by two endpoints' `# UNIT` lines
+/// (`x_total` as `x_nanoseconds_total` and as `x_bytes_total`): a selector
+/// reaching both is an error naming both, live and recorded; a
+/// recording-label matcher picks one.
+#[test]
+fn an_exporter_name_stored_under_two_names_is_an_error() {
+    let a = |t: u64| format!("# TYPE x counter\n# UNIT x seconds\nx_total{{job=\"a\"}} {t}\n");
+    let b = |t: u64| format!("# TYPE x counter\n# UNIT x kilobytes\nx_total{{job=\"b\"}} {t}\n");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    record(
+        &path,
+        &[
+            Rec {
+                source: "a",
+                text: &a,
+                old: false,
+            },
+            Rec {
+                source: "b",
+                text: &b,
+                old: false,
+            },
+        ],
+    );
+    let reader = open(&path);
+    let (lo, hi) = ((BASE / S) as f64, (BASE / S + TICKS - 1) as f64);
+    for q in ["rate(x_total[3s])", "rate(x_total{job=\"b\"}[3s])"] {
+        let err = reader.query_range(q, lo, hi, 1.0).expect_err(q).to_string();
+        assert!(
+            err.contains("x_nanoseconds_total") && err.contains("x_bytes_total"),
+            "{q}: {err}"
+        );
+    }
+    reads_stored(
+        &reader,
+        "rate(x_total{source=\"b\"}[3s])",
+        1000.0,
+        "x_bytes_total",
+        "x_total",
+    );
+    reads_stored(
+        &reader,
+        "rate(x_total{source=\"a\"}[3s])",
+        1e9,
+        "x_nanoseconds_total",
+        "x_total",
+    );
+
+    // Live: one store over both endpoints.
+    let store = metriken_query::MemoryStore::builder()
+        .sampling_interval_ms(1000)
+        .build();
+    let (mut ca, mut cb) = (PrometheusConverter::new(), PrometheusConverter::new());
+    for t in 0..TICKS {
+        let ts = BASE + t * S;
+        for (c, text) in [(&mut ca, a(t)), (&mut cb, b(t))] {
+            let mut snapshot = c.convert(&text, ts - S / 2, ts);
+            let Snapshot::V3(v3) = &mut snapshot else {
+                panic!("a scrape is a V3 snapshot")
+            };
+            v3.systemtime = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(ts);
+            store.ingest_snapshot(snapshot);
+        }
+    }
+    let err = store
+        .query_range("rate(x_total[3s])", lo, hi, 1.0)
+        .expect_err("live")
+        .to_string();
+    assert!(
+        err.contains("x_nanoseconds_total") && err.contains("x_bytes_total"),
+        "{err}"
+    );
+}
+
+/// `{__name__="x"}` lists the same columns as `x` for an exporter name.
+#[test]
+fn columns_resolve_a_name_matcher_as_a_name() {
+    let (_dir, reader) = recorded(&scrape);
+    let bare = reader.columns("lag_ms").unwrap();
+    assert!(!bare.is_empty());
+    assert_eq!(reader.columns("{__name__=\"lag_ms\"}").unwrap(), bare);
 }

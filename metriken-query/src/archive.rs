@@ -655,9 +655,10 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
 /// series by its exporter name (`promql::prometheus_names`), decided per
 /// selector over the tables it reaches: those in `scope` whose recording's
 /// labels its filter can match. A selector reads its own name when one of
-/// those tables holds it, and otherwise the first candidate stored name
-/// one of them holds with a series whose `__prometheus_name__` is that
-/// name. Only tables holding the name or a candidate are consulted.
+/// those tables holds it, and otherwise the candidate stored name one of
+/// them holds with a series whose `__prometheus_name__` is that name; an
+/// error when more than one candidate does. Only tables holding the name or
+/// a candidate are consulted.
 fn resolve_names(
     reader: &ArchiveReader,
     scope: Option<&crate::Scope>,
@@ -692,10 +693,11 @@ fn resolve_names(
                 continue;
             }
             let label = metriken_storage::PROMETHEUS_NAME_LABEL;
-            if let Some(stored) = candidates
+            let found: Vec<String> = candidates
                 .into_iter()
-                .find(|c| reach.iter().any(|t| t.holds_labeled(c, label, name)))
-            {
+                .filter(|c| reach.iter().any(|t| t.holds_labeled(c, label, name)))
+                .collect();
+            if let Some(stored) = crate::promql::prometheus_names::one_of(name, found)? {
                 names.insert(key, stored);
             }
         }

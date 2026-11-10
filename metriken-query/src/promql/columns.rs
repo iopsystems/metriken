@@ -29,7 +29,9 @@ impl QueryEngine {
     /// no series. Returns `QueryError::ParseError` on syntax error.
     pub fn columns(&self, query: &str) -> Result<HashSet<String>, QueryError> {
         let mut expr = parse_selector_expr(query)?;
-        self.resolve_names(&mut expr);
+        // `{__name__="x"}` resolves as `x` does.
+        super::name_selectors(&mut expr);
+        self.resolve_names(&mut expr)?;
         let col_map = self.source.column_map();
         let mut out = HashSet::new();
         walk(&col_map, &expr, &mut out);
