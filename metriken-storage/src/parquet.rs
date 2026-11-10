@@ -341,6 +341,10 @@ impl DataSource for MultiParquetSource {
         self.injected_labels(|pf| pf.gauge_histogram_labels(name))
     }
 
+    fn duplicated_series(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.injected_labels(|pf| pf.duplicated_series(name))
+    }
+
     fn column_map(
         &self,
     ) -> std::collections::HashMap<String, std::collections::HashMap<Labels, String>> {
@@ -860,6 +864,8 @@ pub struct ParquetSource {
     /// depends only on `meta`, which never changes after construction, so
     /// there is nothing to invalidate.
     columns: OnceLock<Vec<ColDesc>>,
+    /// [`ParquetSource::duplicated`], computed on first use from `meta`.
+    duplicated: OnceLock<Vec<(String, Labels)>>,
     /// The `timestamp` and `duration` column positions, resolved once.
     ///
     /// `Schema::index_of` scans the fields by name and, when the name is
@@ -1042,6 +1048,10 @@ impl DataSource for FileSource {
     ) -> Vec<std::collections::BTreeMap<String, String>> {
         self.0
             .labels_of(name, |k| matches!(k, ColKind::GaugeHistogram { .. }))
+    }
+
+    fn duplicated_series(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.0.duplicated_of(name)
     }
 
     fn file_metadata(&self) -> std::collections::HashMap<String, String> {
@@ -1429,6 +1439,89 @@ impl ParquetSource {
         sets.dedup();
         sets
     }
+
+    /// The label sets of metric `name` in [`duplicated`](Self::duplicated).
+    fn duplicated_of(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        let mut sets: Vec<std::collections::BTreeMap<String, String>> = self
+            .duplicated()
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, labels)| labels.inner.clone())
+            .collect();
+        sets.sort();
+        sets.dedup();
+        sets
+    }
+
+    /// Each `(name, labels)` that more than one column of one kind carries
+    /// (a counter or gauge column counting with its float twin, as a
+    /// listing counts it) where those columns hold values in one row
+    /// ([`DataSource::duplicated_series`]).
+    ///
+    /// Two such columns are legitimate when no row holds both: a series
+    /// whose histogram bound or value type changed in the file is two
+    /// columns, one before the change and one after. What a row holds is
+    /// read from the footer's null counts, so the overlap found is the one
+    /// those prove: in some row group, the rows the columns hold add up to
+    /// more than the row group's rows. Columns that hold values in fewer
+    /// rows than that, but share some, are not found; a chunk without a
+    /// null count counts as holding none.
+    pub(crate) fn duplicated(&self) -> &[(String, Labels)] {
+        self.duplicated.get_or_init(|| {
+            let class = |k: &ColKind| match k {
+                ColKind::Counter | ColKind::FloatCounter => 0u8,
+                ColKind::Gauge | ColKind::FloatGauge => 1,
+                ColKind::Histogram { .. } => 2,
+                ColKind::GaugeHistogram { .. } => 3,
+            };
+            let mut by_series: HashMap<(u8, &str, &Labels), Vec<usize>> = HashMap::new();
+            for col in self.columns() {
+                by_series
+                    .entry((class(&col.kind), &col.name, &col.labels))
+                    .or_default()
+                    .push(col.col_idx);
+            }
+            let leaves = self.first_leaves();
+            let mut out: Vec<(String, Labels)> = Vec::new();
+            for ((_, name, labels), mut cols) in by_series {
+                // A long segment lists a column once per occupant.
+                cols.sort_unstable();
+                cols.dedup();
+                if cols.len() < 2 {
+                    continue;
+                }
+                let leaves: Vec<Option<usize>> = cols
+                    .iter()
+                    .map(|&c| leaves.get(c).copied().flatten())
+                    .collect();
+                if self.rows_overlap(&leaves) {
+                    out.push((name.to_string(), labels.clone()));
+                }
+            }
+            out
+        })
+    }
+
+    /// Whether, in some row group, the rows parquet leaves `leaves` are
+    /// shown to hold a cell in add up to more than its rows: a lower bound
+    /// on each, its rows less its null count (a list column's null count
+    /// is at least its null rows), and none for a chunk without a null
+    /// count or a column without a leaf.
+    fn rows_overlap(&self, leaves: &[Option<usize>]) -> bool {
+        let meta = self.meta.metadata();
+        (0..meta.num_row_groups()).any(|rg| {
+            let rg = meta.row_group(rg);
+            let held: i64 = leaves
+                .iter()
+                .map(|leaf| {
+                    leaf.and_then(|leaf| rg.column(leaf).statistics())
+                        .and_then(|s| s.null_count_opt())
+                        .map_or(0, |nulls| (rg.num_rows() - nulls as i64).max(0))
+                })
+                .sum();
+            held > rg.num_rows()
+        })
+    }
 }
 
 impl ParquetSource {
@@ -1444,6 +1537,7 @@ impl ParquetSource {
             sampling_interval_ms,
             pool: None,
             columns: OnceLock::new(),
+            duplicated: OnceLock::new(),
             fixed_cols: OnceLock::new(),
             occupant_col: OnceLock::new(),
             page_meta: OnceLock::new(),
@@ -1461,6 +1555,7 @@ impl ParquetSource {
             sampling_interval_ms,
             pool: None,
             columns: OnceLock::new(),
+            duplicated: OnceLock::new(),
             fixed_cols: OnceLock::new(),
             occupant_col: OnceLock::new(),
             page_meta: OnceLock::new(),
@@ -1478,6 +1573,7 @@ impl ParquetSource {
             sampling_interval_ms,
             pool: None,
             columns: OnceLock::new(),
+            duplicated: OnceLock::new(),
             fixed_cols: OnceLock::new(),
             occupant_col: OnceLock::new(),
             page_meta: OnceLock::new(),
@@ -1496,6 +1592,7 @@ impl ParquetSource {
             sampling_interval_ms,
             pool: Some(pool),
             columns: OnceLock::new(),
+            duplicated: OnceLock::new(),
             fixed_cols: OnceLock::new(),
             occupant_col: OnceLock::new(),
             page_meta: OnceLock::new(),
@@ -1526,6 +1623,7 @@ impl ParquetSource {
             sampling_interval_ms,
             pool: Some(pool),
             columns: OnceLock::new(),
+            duplicated: OnceLock::new(),
             fixed_cols: OnceLock::new(),
             occupant_col: OnceLock::new(),
             page_meta: OnceLock::new(),
@@ -1546,6 +1644,7 @@ impl ParquetSource {
             sampling_interval_ms,
             pool: Some(pool),
             columns: OnceLock::new(),
+            duplicated: OnceLock::new(),
             fixed_cols: OnceLock::new(),
             occupant_col: OnceLock::new(),
             page_meta: OnceLock::new(),
@@ -4251,6 +4350,102 @@ mod holds_values_tests {
         let refs = src.counter_column_refs();
         assert_eq!(refs.len(), 1, "one counter column");
         refs[0].position.holds_values
+    }
+
+    /// `duplicated_series("c")` of a file holding two counter columns of
+    /// `c` that differ only by `unit` (a storage key), written as `a` and
+    /// `b` (four rows) in row groups of `rows_per_group`, with or without
+    /// statistics.
+    fn duplicated(
+        a: [Option<u64>; 4],
+        b: [Option<u64>; 4],
+        rows_per_group: usize,
+        stats: bool,
+    ) -> Vec<std::collections::BTreeMap<String, String>> {
+        use crate::DataSource;
+        let field = |column: &str, unit: &str| {
+            let meta: HashMap<String, String> = [
+                ("metric".to_string(), "c".to_string()),
+                ("metric_type".to_string(), "counter".to_string()),
+                ("unit".to_string(), unit.to_string()),
+                ("cpu".to_string(), "0".to_string()),
+            ]
+            .into();
+            Field::new(column, DataType::UInt64, true).with_metadata(meta)
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::UInt64, false),
+            field("0", "a"),
+            field("1", "b"),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(UInt64Array::from(vec![1u64, 2, 3, 4])) as ArrayRef,
+                Arc::new(UInt64Array::from(a.to_vec())) as ArrayRef,
+                Arc::new(UInt64Array::from(b.to_vec())) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rows_per_group))
+            .set_statistics_enabled(if stats {
+                EnabledStatistics::Chunk
+            } else {
+                EnabledStatistics::None
+            })
+            .build();
+        let mut buf = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let src = MultiParquetSource::open_bytes_with_pool(buf, BufferPool::new(1 << 20)).unwrap();
+        src.duplicated_series("c")
+    }
+
+    /// Two columns of one label set are a duplicate when the null counts
+    /// show them holding values in one row: not when one follows the other
+    /// (a series whose value type or bound changed), and not for an overlap
+    /// the counts do not prove, or without statistics.
+    #[test]
+    fn columns_of_one_label_set_are_duplicated_where_their_rows_overlap() {
+        let cpu = vec![std::collections::BTreeMap::from([(
+            "cpu".to_string(),
+            "0".to_string(),
+        )])];
+        let full = [Some(1), Some(2), Some(3), Some(4)];
+        assert_eq!(duplicated(full, full, 4, true), cpu, "both in every row");
+        assert_eq!(
+            duplicated(
+                [Some(1), Some(2), Some(3), None],
+                [None, None, Some(3), Some(4)],
+                4,
+                true
+            ),
+            cpu,
+            "five values in four rows"
+        );
+        let before = [Some(1), Some(2), None, None];
+        let after = [None, None, Some(3), Some(4)];
+        assert!(
+            duplicated(before, after, 4, true).is_empty(),
+            "one after the other"
+        );
+        assert!(
+            duplicated(before, after, 2, true).is_empty(),
+            "in two row groups"
+        );
+        assert!(
+            duplicated(
+                [Some(1), Some(2), None, None],
+                [None, Some(2), None, None],
+                4,
+                true
+            )
+            .is_empty(),
+            "an overlap the counts do not prove"
+        );
+        assert!(duplicated(full, full, 4, false).is_empty(), "no statistics");
     }
 
     /// A parquet column's labels follow the clash rule in the column listing

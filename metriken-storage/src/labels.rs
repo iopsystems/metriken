@@ -26,6 +26,12 @@ use regex::Regex;
 /// version as well (`names.rs`), unless the version it joins has not been
 /// released yet.
 ///
+/// An exporter label whose key is in this list is not a label either.
+/// metriken-recorder 0.13.0 and later store one as `exported_<key>`;
+/// before, two series that differed only by one were stored as two columns
+/// with one label set, which a reader reports through
+/// [`DataSource::duplicated_series`](crate::DataSource::duplicated_series).
+///
 /// A slice rather than an array so that adding a key is not a change to a
 /// public type.
 pub const STORAGE_KEYS: &[&str] = &[

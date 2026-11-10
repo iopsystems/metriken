@@ -625,6 +625,10 @@ impl DataSource for LabeledSource {
         self.relabel_listing(self.inner.gauge_histogram_labels(name))
     }
 
+    fn duplicated_series(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.relabel_listing(self.inner.duplicated_series(name))
+    }
+
     fn file_metadata(&self) -> HashMap<String, String> {
         self.inner.file_metadata()
     }

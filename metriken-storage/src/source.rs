@@ -225,6 +225,25 @@ pub trait DataSource: Send + Sync {
         let _ = name;
         Vec::new()
     }
+    /// The label sets, as this source presents them, of metric `name`'s
+    /// series that more than one column of one kind (counters, gauges,
+    /// histograms, gauge histograms) carries within one parquet file or
+    /// segment. A read joins such columns into one series, interleaving
+    /// their samples, so metriken-query refuses a selector matching one.
+    ///
+    /// Two columns of a file get one label set when they differed only by
+    /// a [storage key](crate::STORAGE_KEYS), which `Labels::from_metadata`
+    /// removes: metriken-recorder 0.12.0 and earlier stored an exporter
+    /// label named `unit`, `scale` or another storage key under that key.
+    /// The `*_labels` listings show such a series once, as before.
+    ///
+    /// Empty by default. A source wrapping others forwards this, adding
+    /// the labels it adds to their series, or the duplicates are not
+    /// refused.
+    fn duplicated_series(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        let _ = name;
+        Vec::new()
+    }
     /// Key-value metadata from the file footer. Default returns empty.
     fn file_metadata(&self) -> std::collections::HashMap<String, String> {
         std::collections::HashMap::new()

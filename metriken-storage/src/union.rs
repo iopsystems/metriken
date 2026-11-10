@@ -361,6 +361,25 @@ impl DataSource for UnionSource {
         }
     }
 
+    /// From each owner answering `name` for some kind, once per owner.
+    fn duplicated_series(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        let mut owners: Vec<usize> = [
+            &self.counter_index,
+            &self.gauge_index,
+            &self.histogram_index,
+            &self.gauge_histogram_index,
+        ]
+        .into_iter()
+        .filter_map(|index| index.get(name).copied())
+        .collect();
+        owners.sort_unstable();
+        owners.dedup();
+        owners
+            .into_iter()
+            .flat_map(|i| self.owners[i].duplicated_series(name))
+            .collect()
+    }
+
     fn file_metadata(&self) -> HashMap<String, String> {
         let mut out = HashMap::new();
         for c in &self.children {

@@ -1050,6 +1050,37 @@ pub(crate) fn extract_filter_labels(matchers: &[Matcher]) -> Labels {
     filter_labels
 }
 
+/// An error when `filter` matches a series of metric `name` that more than
+/// one column of one kind holds within one table of `source`, or that one
+/// snapshot gave a live store twice
+/// ([`DataSource::duplicated_series`]): a read would join their samples
+/// into one series, which no rate, gauge or histogram read gives a correct
+/// answer for. It names the metric and the series' label set.
+pub(crate) fn refuse_duplicated(
+    source: &dyn DataSource,
+    name: &str,
+    filter: &Labels,
+) -> Result<(), QueryError> {
+    let duplicated = source.duplicated_series(name);
+    let Some(labels) = duplicated
+        .into_iter()
+        .find(|set| Labels::from(set.clone()).matches(filter))
+    else {
+        return Ok(());
+    };
+    let shown: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v:?}")).collect();
+    Err(QueryError::EvaluationError(format!(
+        "the series {name}{{{}}} is two or more stored series with one label set (columns \
+         of one table, or values of one snapshot), and reading them as one series \
+         interleaves their samples. They differ only by a key that is not a label ({}); \
+         metriken-recorder 0.12.0 and earlier stored an exporter label with one of those \
+         names under that key. Select other series of {name} with a label matcher; \
+         metriken-recorder 0.13.0 and later store such a label as exported_<key>",
+        shown.join(", "),
+        metriken_storage::STORAGE_KEYS.join(", "),
+    )))
+}
+
 impl QueryEngine {
     pub(crate) fn new(source: Arc<dyn DataSource>) -> Self {
         Self {
@@ -1083,10 +1114,27 @@ impl QueryEngine {
         }
     }
 
+    /// [`stored_name`](Self::stored_name), refusing the selector when the
+    /// series it reads include one that two columns of one table hold
+    /// ([`refuse_duplicated`]).
+    fn selector_name(&self, name: &str, filter: &Labels) -> Result<Option<String>, QueryError> {
+        let stored = self.stored_name(name, filter)?;
+        match &stored {
+            Some(stored) => refuse_duplicated(
+                &*self.source,
+                stored,
+                &prometheus_names::renamed_filter(filter.clone(), name),
+            )?,
+            None => refuse_duplicated(&*self.source, name, filter)?,
+        }
+        Ok(stored)
+    }
+
     /// `expr`'s selectors pointed at stored names where they name a series
-    /// by its exporter name.
+    /// by its exporter name, and an error for a selector matching a
+    /// series two columns of one table hold.
     pub(crate) fn resolve_names(&self, expr: &mut Expr) -> Result<(), QueryError> {
-        prometheus_names::resolve_selectors(expr, &|name, filter| self.stored_name(name, filter))
+        prometheus_names::resolve_selectors(expr, &|name, filter| self.selector_name(name, filter))
     }
 
     /// An engine over `source`, some of whose recordings form the process
@@ -1232,7 +1280,7 @@ impl QueryEngine {
     /// series by its exporter name.
     fn parse_metric_selector(&self, selector: &str) -> Result<(String, Labels), QueryError> {
         let (name, filter) = self.parse_metric_selector_as_written(selector)?;
-        Ok(match self.stored_name(&name, &filter)? {
+        Ok(match self.selector_name(&name, &filter)? {
             Some(stored) => (stored, prometheus_names::renamed_filter(filter, &name)),
             None => (name, filter),
         })

@@ -287,6 +287,32 @@ pub(crate) struct SegmentColumns {
 }
 
 impl SegmentColumns {
+    /// The `(name, labels)` that more than one column of one kind carries,
+    /// once each: a counter column counts with a float counter column, a
+    /// gauge with a float gauge, as a listing counts them. Whether those
+    /// columns overlap in rows is not known from the lists.
+    pub(crate) fn duplicated(&self) -> Vec<(String, Labels)> {
+        let kinds: [&[&Vec<(String, Labels)>]; 4] = [
+            &[&self.counters, &self.float_counters],
+            &[&self.gauges, &self.float_gauges],
+            &[&self.histograms],
+            &[&self.gauge_histograms],
+        ];
+        let mut out: Vec<(String, Labels)> = Vec::new();
+        for lists in kinds {
+            let mut seen: std::collections::HashSet<(&str, &Labels)> =
+                std::collections::HashSet::new();
+            for (name, labels) in lists.iter().flat_map(|l| l.iter()) {
+                if !seen.insert((name, labels))
+                    && !out.iter().any(|(n, l)| n == name && l == labels)
+                {
+                    out.push((name.clone(), labels.clone()));
+                }
+            }
+        }
+        out
+    }
+
     /// `seg`'s columns, in its schema order. An error for a segment
     /// holding one histogram under two configs, which the segmented reader
     /// refuses.
@@ -497,6 +523,10 @@ struct OpenState {
     opened: usize,
     /// Whether a column named an occupant the relabel did not describe.
     unresolved: bool,
+    /// name -> the label sets, as presented, that more than one column of
+    /// one kind carries within one segment (see
+    /// [`DataSource::duplicated_series`]), sorted and deduplicated.
+    duplicated: HashMap<String, Vec<BTreeMap<String, String>>>,
 }
 
 impl OpenState {
@@ -512,6 +542,20 @@ impl OpenState {
         let columns = SegmentColumns::of(seg).map_err(|e| format!("segment {idx}: {e}"))?;
         self.listing
             .fold(idx, &columns, relabel, memo, &mut unresolved);
+        // A label set two columns carry is a duplicate where the segment's
+        // statistics show the columns hold values in one row; a series
+        // whose bound or value type changed mid-segment is two columns
+        // that do not (see `ParquetSource::duplicated`).
+        for (name, labels) in columns.duplicated() {
+            if !seg.duplicated_series(&name).contains(&labels.inner) {
+                continue;
+            }
+            let sets = memo.presents(relabel, &name, &labels, &mut unresolved);
+            let held = self.duplicated.entry(name).or_default();
+            held.extend(sets.of(&labels).iter().map(|l| l.inner.clone()));
+            held.sort();
+            held.dedup();
+        }
         // Where each counter series' samples are, by segment: the
         // column, located once here so a stream can read it back
         // without a schema scan. A relabelled column feeds every series
@@ -1960,6 +2004,10 @@ impl DataSource for SegmentedSource {
 
     fn gauge_histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.state.listing.histogram_labels(HistKind::Gauge, name)
+    }
+
+    fn duplicated_series(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.state.duplicated.get(name).cloned().unwrap_or_default()
     }
 
     fn file_metadata(&self) -> HashMap<String, String> {

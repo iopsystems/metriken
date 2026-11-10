@@ -43,6 +43,9 @@ pub struct Memory {
     /// knows its rows, and a series-by-series union would not recover a row
     /// that every series skipped.
     sample_timestamps: Option<Vec<u64>>,
+    /// name -> the label sets [`mark_duplicated`](Self::mark_duplicated)
+    /// was given, sorted and deduplicated.
+    duplicated: HashMap<String, Vec<BTreeMap<String, String>>>,
 }
 
 impl Memory {
@@ -55,6 +58,18 @@ impl Memory {
             histogram_overflows: HashMap::new(),
             interval_ms,
             sample_timestamps: None,
+            duplicated: HashMap::new(),
+        }
+    }
+
+    /// Record that two values of one kind of metric `name` with `labels`
+    /// arrived in one snapshot, so their samples are joined into one series
+    /// ([`DataSource::duplicated_series`]). metriken-query's
+    /// `MemoryStore::ingest_snapshot` calls it.
+    pub fn mark_duplicated(&mut self, name: &str, labels: &Labels) {
+        let held = self.duplicated.entry(name.to_string()).or_default();
+        if let Err(at) = held.binary_search(&labels.inner) {
+            held.insert(at, labels.inner.clone());
         }
     }
 
@@ -564,6 +579,10 @@ impl DataSource for Memory {
             .get(name)
             .map(|series| series.iter().map(|h| h.labels.inner.clone()).collect())
             .unwrap_or_default()
+    }
+
+    fn duplicated_series(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.duplicated.get(name).cloned().unwrap_or_default()
     }
 
     fn time_range(&self) -> Option<(u64, u64)> {

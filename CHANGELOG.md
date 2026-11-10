@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-storage 0.11.1
+
+- **Added:** `DataSource::duplicated_series`: the label sets of a metric's
+  series that more than one column of one kind holds within one parquet
+  file or segment, where the footer's null counts show the columns holding
+  values in one row, which a read joins into one series. Such columns
+  differ only by a storage key: metriken-recorder 0.12.0 and earlier
+  stored an exporter label named `unit`, `scale` or another key in
+  `STORAGE_KEYS` under that key (#394). Columns that follow one another,
+  as a series whose value type or histogram bound changed mid-segment
+  does, are not reported; nor are overlapping columns whose values the
+  null counts do not prove overlap. The default is empty; the sources in
+  this crate forward it, and `Memory::mark_duplicated` records a series a
+  snapshot gave twice. The listings are unchanged and show such a series
+  once.
+
+### metriken-query 0.48.1
+
+Requires metriken-storage 0.11.1.
+
+- **Fixed:** a selector matching a series that two columns of one table
+  hold (`DataSource::duplicated_series`), or that one snapshot gave a
+  `MemoryStore` twice, is an `EvaluationError` naming the metric and the
+  label set, in PromQL (both rate paths, gauges, `histogram_quantile`)
+  and in `histogram_quantiles`, `histogram_heatmap`, `histogram_irate`,
+  `histogram_mean`, `histogram_count`, `histogram_sum` and `columns`.
+  Before, `rate` or `irate` of such a counter panicked with `attempt to
+  subtract with overflow` in a debug build, and a gauge or histogram read
+  their samples as one series (#394). An archive recorded through
+  metriken-recorder 0.12.0 or earlier from an exporter whose series
+  differ only by a label named like a storage key gives this error where
+  its queries returned such results; a selector that leaves those series
+  out reads as before.
+- **Fixed:** a counter series whose samples step back in time no longer
+  panics the per-series rate in a debug build.
+
+### metriken-recorder 0.13.0
+
+- **Changed (breaking):** an exporter label whose key is a storage key
+  (`metriken_storage::STORAGE_KEYS`: `metric`, `metric_type`, `unit`,
+  `grouping_power`, `max_value_power`, `overflow`, `overflow_bound`,
+  `scale`) is stored as `exported_<key>`, and as
+  `exported_exported_<key>` (and so on) when the series also carries
+  `exported_<key>`, which keeps its value; this is Prometheus's rule for
+  an exposed label that collides with a target label. Such a label was
+  dropped by every reader before, so two series that differed only by it
+  were one series to a query, and `rate` over them panicked in a debug
+  build (#394); they are now two series, each with the label. A series
+  with such a label carries `exported_<key>` where it carried no label,
+  so a query matching the old label set exactly no longer matches it. An
+  exporter label `metric` no longer replaces the series' name. The rule
+  applies to counters, gauges, untyped samples, histograms and their
+  overflow series, and summaries' quantiles.
+
 ### metriken-charts 0.1.4
 
 - **Fixed:** `STORAGE_KEYS` (`util/labels.js`) adds `overflow`,

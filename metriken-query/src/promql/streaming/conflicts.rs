@@ -569,6 +569,9 @@ impl DataSource for Recorded {
     fn gauge_histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.inner.gauge_histogram_labels(name)
     }
+    fn duplicated_series(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.inner.duplicated_series(name)
+    }
     fn file_metadata(&self) -> HashMap<String, String> {
         self.inner.file_metadata()
     }

@@ -1481,6 +1481,9 @@ impl DataSource for Tap {
     fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.inner.histogram_labels(name)
     }
+    fn duplicated_series(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.inner.duplicated_series(name)
+    }
     fn file_metadata(&self) -> HashMap<String, String> {
         self.inner.file_metadata()
     }
@@ -1769,6 +1772,9 @@ impl DataSource for GroupSource {
     }
     fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.listing(|s| s.histogram_labels(name))
+    }
+    fn duplicated_series(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.listing(|s| s.duplicated_series(name))
     }
     fn file_metadata(&self) -> HashMap<String, String> {
         self.sources[0].file_metadata()

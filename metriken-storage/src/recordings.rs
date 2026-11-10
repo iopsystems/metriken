@@ -308,6 +308,10 @@ impl DataSource for RecordingsSource {
         self.listing(|c| c.gauge_histogram_labels(name))
     }
 
+    fn duplicated_series(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.listing(|c| c.duplicated_series(name))
+    }
+
     fn recording_label_keys(&self) -> Vec<String> {
         self.names(|c| c.recording_label_keys())
     }

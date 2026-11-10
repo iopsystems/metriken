@@ -1,0 +1,279 @@
+//! Exporter labels whose key is a storage key (`unit`, `scale`, …), from
+//! exposition text through `PrometheusConverter::convert` and
+//! `SourceRecorder::stage` into an archive, read back by `ArchiveReader` and
+//! queried through metriken-query, and ingested into a live `MemoryStore`
+//! (#394).
+//!
+//! The converter stores such a label as `exported_<key>`, so two series
+//! that differ only by it stay two series. A recording made before that,
+//! whose two columns of one metric have one label set once storage keys are
+//! removed, is refused by a selector matching that label set, on both rate
+//! paths and for gauges and histograms, rather than read as one series.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
+
+use dendro::seal::SealPolicy;
+use metriken_model::Snapshot;
+use metriken_query::{MatrixSample, MetricsSource, QueryOptions, QueryResult};
+use metriken_recorder::PrometheusConverter;
+use metriken_storage::{ArchiveReader, ArchiveWriter, BufferPool, DendroCatalog, WriterConfig};
+
+const S: u64 = 1_000_000_000;
+const BASE: u64 = 1_700_000_000 * S;
+const TICKS: u64 = 12;
+
+/// What the exporter serves at tick `t`: a counter and a gauge whose two
+/// series differ only by `unit`, a histogram whose two differ only by
+/// `scale`, and a counter series that differs from them by `job` as well.
+fn text(t: u64) -> String {
+    format!(
+        "\
+# TYPE x_total counter
+x_total{{unit=\"a\"}} {t}
+x_total{{unit=\"b\"}} {t2}
+x_total{{unit=\"c\",job=\"j\"}} {t3}
+# TYPE g gauge
+g{{unit=\"a\"}} 1
+g{{unit=\"b\"}} 2
+# TYPE h histogram
+h_bucket{{scale=\"a\",le=\"1\"}} {t}
+h_bucket{{scale=\"a\",le=\"+Inf\"}} {t}
+h_bucket{{scale=\"b\",le=\"10\"}} {t2}
+h_bucket{{scale=\"b\",le=\"+Inf\"}} {t2}
+",
+        t2 = 2 * t,
+        t3 = 3 * t
+    )
+}
+
+/// The snapshot as metriken-recorder 0.12.0 wrote it: each `exported_<key>`
+/// back under `<key>`.
+fn as_before(mut snapshot: Snapshot) -> Snapshot {
+    let Snapshot::V3(v3) = &mut snapshot else {
+        panic!("a scrape is a V3 snapshot")
+    };
+    for group in &mut v3.groups {
+        let schema = Arc::make_mut(group.schema.as_mut().unwrap());
+        for list in [
+            &mut schema.float_counters,
+            &mut schema.float_gauges,
+            &mut schema.histograms,
+        ] {
+            for d in list.iter_mut() {
+                for key in ["unit", "scale"] {
+                    if let Some(v) = d.metadata.remove(&format!("exported_{key}")) {
+                        d.metadata.insert(key.to_string(), v);
+                    }
+                }
+            }
+        }
+        group.schema_hash = schema.hash();
+    }
+    snapshot
+}
+
+/// The scrapes, once a second, as written today or (`old`) as before.
+fn scrapes(old: bool) -> Vec<(u64, Snapshot)> {
+    let mut converter = PrometheusConverter::new();
+    (0..TICKS)
+        .map(|t| {
+            let ts = BASE + t * S;
+            let snapshot = converter.convert(&text(t), ts - S / 2, ts);
+            (ts, if old { as_before(snapshot) } else { snapshot })
+        })
+        .collect()
+}
+
+/// The scrapes recorded into one archive as source `source="e"`, sealing
+/// every 5 rows, and opened.
+fn recorded(path: &Path, old: bool) -> ArchiveReader {
+    let config = WriterConfig {
+        seal: SealPolicy {
+            max_rows: 5,
+            ..SealPolicy::default()
+        },
+        ..WriterConfig::default()
+    };
+    let mut writer = ArchiveWriter::create(path, config).unwrap();
+    let labels = BTreeMap::from([("source".to_string(), "e".to_string())]);
+    let mut source = writer.add_source(labels, BTreeMap::new(), BASE).unwrap();
+    for (ts, snapshot) in scrapes(old) {
+        let staged = source.stage(&snapshot, ts, 0).unwrap();
+        writer.commit(vec![staged]).unwrap();
+        source.maybe_seal().unwrap();
+        source.sync().unwrap();
+    }
+    source.finalize((BASE + (TICKS - 1) * S, 0)).unwrap();
+    writer.join().unwrap();
+    let recordings = ArchiveReader::from_catalog(
+        Box::new(DendroCatalog::open(path).unwrap()),
+        None,
+        BufferPool::new(64 << 20),
+        None,
+    )
+    .unwrap();
+    ArchiveReader::flatten(recordings.into_iter().map(|(_, r)| r).collect(), None)
+}
+
+/// The scrapes ingested into a live store.
+fn live(old: bool) -> metriken_query::MemoryStore {
+    let store = metriken_query::MemoryStore::builder()
+        .sampling_interval_ms(1000)
+        .build();
+    for (ts, mut snapshot) in scrapes(old) {
+        let Snapshot::V3(v3) = &mut snapshot else {
+            panic!("a scrape is a V3 snapshot")
+        };
+        v3.systemtime = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(ts);
+        store.ingest_snapshot(snapshot);
+    }
+    store
+}
+
+fn range(
+    source: &dyn MetricsSource,
+    query: &str,
+    per_series: bool,
+) -> Result<QueryResult, metriken_query::QueryError> {
+    let (lo, hi) = ((BASE / S) as f64, (BASE / S + TICKS - 1) as f64);
+    let opts = QueryOptions::default().with_per_series_rates(per_series);
+    source.query_range_opts(query, lo, hi, 1.0, &opts)
+}
+
+fn matrix(source: &dyn MetricsSource, query: &str, per_series: bool) -> Vec<MatrixSample> {
+    match range(source, query, per_series) {
+        Ok(QueryResult::Matrix { result, .. }) => result,
+        other => panic!("{query}: {other:?}"),
+    }
+}
+
+/// Each series of `query` by its `exported_unit`, with its values.
+fn by_exported_unit(
+    source: &dyn MetricsSource,
+    query: &str,
+    per_series: bool,
+) -> BTreeMap<String, Vec<f64>> {
+    matrix(source, query, per_series)
+        .into_iter()
+        .map(|m| {
+            let key = m.metric.get("exported_unit").cloned().unwrap_or_default();
+            (key, m.values.into_iter().map(|(_, v)| v).collect())
+        })
+        .collect()
+}
+
+/// `rate(x_total[3s])`, the reproduction in #394: two series, each with
+/// its own rate, on both rate paths, recorded and live; and a matcher on
+/// `exported_unit` selects one.
+#[test]
+fn series_differing_by_a_storage_key_label_rate_apart() {
+    let dir = tempfile::tempdir().unwrap();
+    let reader = recorded(&dir.path().join("a.dendro"), false);
+    let store = live(false);
+    for source in [&reader as &dyn MetricsSource, &store] {
+        for per_series in [false, true] {
+            let rates = by_exported_unit(source, "rate(x_total[3s])", per_series);
+            assert_eq!(
+                rates.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["a", "b", "c"],
+                "per_series={per_series}: {rates:?}"
+            );
+            for (unit, want) in [("a", 1.0), ("b", 2.0), ("c", 3.0)] {
+                let values = &rates[unit];
+                assert!(!values.is_empty(), "{unit}: no points");
+                assert!(
+                    values.iter().all(|v| (v - want).abs() < 1e-9),
+                    "per_series={per_series} {unit}: {values:?}"
+                );
+            }
+            let b = by_exported_unit(source, "rate(x_total{exported_unit=\"b\"}[3s])", per_series);
+            assert_eq!(b.keys().collect::<Vec<_>>(), ["b"], "{b:?}");
+        }
+        let gauges = by_exported_unit(source, "g", false);
+        assert_eq!(gauges["a"].iter().copied().fold(0.0, f64::max), 1.0);
+        assert_eq!(gauges["b"].iter().copied().fold(f64::MAX, f64::min), 2.0);
+    }
+}
+
+/// The queries over the old recording's joined series, each of which is
+/// refused, naming the metric and the label set.
+const REFUSED: &[(&str, &str)] = &[
+    ("rate(x_total[3s])", "x_total"),
+    ("irate(x_total[3s])", "x_total"),
+    ("sum(rate(x_total[3s]))", "x_total"),
+    ("g", "g"),
+    ("avg_over_time(g[3s])", "g"),
+    ("histogram_quantile(0.5, h)", "h"),
+    ("histogram_quantiles([0.5], h, 3)", "h"),
+    ("histogram_heatmap(h)", "h"),
+    ("histogram_irate(h)", "h"),
+    ("histogram_mean(h)", "h"),
+    ("histogram_count(h)", "h"),
+    ("histogram_sum(h)", "h"),
+    ("rate(h_overflow[3s])", "h_overflow"),
+];
+
+/// An archive written the old way holds two columns of `x_total`, `g`, `h`
+/// and `h_overflow` whose label sets are equal once `unit` and `scale` are
+/// removed. A selector matching that label set is an error on both rate
+/// paths, for counters, gauges and histograms, rather than a panic or one
+/// series of interleaved samples; a selector that does not match it reads
+/// as before.
+#[test]
+fn an_archive_written_before_the_rename_refuses_the_joined_series() {
+    let dir = tempfile::tempdir().unwrap();
+    let reader = recorded(&dir.path().join("a.dendro"), true);
+    for per_series in [false, true] {
+        for (query, name) in REFUSED {
+            let err = range(&reader, query, per_series)
+                .expect_err(query)
+                .to_string();
+            let series = format!("{name}{{source=\"e\"}}");
+            assert!(
+                err.contains(&series) && err.contains("two or more stored series"),
+                "per_series={per_series} {query}: {err}"
+            );
+        }
+        let job = matrix(&reader, "rate(x_total{job=\"j\"}[3s])", per_series);
+        assert_eq!(job.len(), 1, "{job:?}");
+        assert!(job[0].values.iter().all(|(_, v)| (v - 3.0).abs() < 1e-9));
+    }
+    // `columns`, which a caller can ask before a query, refuses it too.
+    let err = reader.columns("rate(x_total[3s])").expect_err("columns");
+    assert!(err.to_string().contains("x_total{source=\"e\"}"), "{err}");
+    assert!(reader.columns("rate(x_total{job=\"j\"}[3s])").is_ok());
+    // The listing shows the joined series once, as before.
+    let mut listed = reader.counter_labels("x_total");
+    listed.sort();
+    let set = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    assert_eq!(
+        listed,
+        vec![
+            set(&[("job", "j"), ("source", "e")]),
+            set(&[("source", "e")])
+        ]
+    );
+}
+
+/// The live store refuses the same series when one snapshot holds two
+/// values of one series, as a converter before the rename produced.
+#[test]
+fn a_live_store_refuses_a_series_given_twice_in_one_snapshot() {
+    let store = live(true);
+    for (query, name) in REFUSED {
+        let err = range(&store, query, false).expect_err(query).to_string();
+        assert!(
+            err.contains(&format!("{name}{{}}")) && err.contains("two or more stored series"),
+            "{query}: {err}"
+        );
+    }
+    let job = matrix(&store, "rate(x_total{job=\"j\"}[3s])", false);
+    assert_eq!(job.len(), 1, "{job:?}");
+}
