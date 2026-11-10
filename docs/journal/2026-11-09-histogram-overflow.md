@@ -177,38 +177,39 @@ All four as recommended.
   converter logs at `warn` once per converter (one endpoint), then at
   `debug`. The highest finite bucket is the one with the
   highest bound, whatever the line order.
-- **Storage**: `OVERFLOW_KEY` and `OVERFLOW_BOUND_KEY` (`labels.rs`) are in
-  `STORAGE_KEYS`, and in the writer's list of keys that describe a column
-  rather than an occupant (`writer.rs`). `HistogramRow` gains
+- **Storage**: `OVERFLOW_KEY` and `OVERFLOW_BOUND_KEY` (`labels.rs`) are
+  in `STORAGE_KEYS`, and in the writer's list of keys that describe a
+  column rather than an occupant (`writer.rs`). `HistogramRow` gains
   `overflow: Option<Overflow>` (`histogram_stream.rs`); merge, re-stamping
   and rebucketing move rows whole, so they carry it unchanged. The parquet
   reader (`ParquetHistogramCursor`) reads each counting histogram's
   overflow counter, the counter column of the named metric with the same
   labels (so, in a long segment, the same occupant), from the same row
-  group pages, and attaches its value to the histogram row of the same row.
-  One series can have several histogram columns in a segment (its bound,
-  and so its column metadata, changed within it); they name the same
-  counter, which is read once and goes to each column's rows with that
-  column's bound.
-  `Memory` (the live path) records the link and bound per histogram row
-  from that row's ingested metadata (`set_histogram_overflow`, keyed by
-  timestamp) and attaches the counter's sample at the row's timestamp, so
-  a link that goes away (a collision that starts) or a bound that moves
-  applies from that row on, as in a recording. The names index is written as `MNI2`; an
-  `MNI1` index is still read, and its columns frame's label sets lose any
-  key that is a storage key now, which is what a read of the segment's
-  footer gives.
-- **Query**: a series' overflow delta between rows is
-  `round(curr) − round(prev)`, so fractional counts add up over rows, and
-  0 when either row has none or the count went down (`overflow_delta`).
-  It is pooled per tick, or shared among stride
-  windows in proportion to overlap as the bucket deltas are
-  (`Splitter::row_with_overflow`). A window's band uses the lowest bound
-  among the series whose overflow it holds. The overflow ranks above every
-  finite bucket, so when pooled series have different bounds, an overflow
-  observation of the series with the lower bound can be smaller than
-  another series' highest buckets, and a finite quantile in those buckets
-  can read high. The process-group combine
+  group pages, and attaches its value to the histogram row of the same
+  row. One series can have several histogram columns in a segment (its
+  bound, and so its column metadata, changed within it); they name the
+  same counter, which is read once and goes to each column's rows with
+  that column's bound. `Memory` (the live path) records the link and bound
+  per histogram row from that row's ingested metadata
+  (`set_histogram_overflow`, keyed by timestamp) and attaches the
+  counter's sample at the row's timestamp, so a link that goes away (a
+  collision that starts) or a bound that moves applies from that row on,
+  as in a recording. A read indexes each overflow counter's series by
+  labels once, so it visits each counter series once rather than once per
+  histogram row; each series' rows share one allocation of the counter's
+  name. The names index is written as `MNI2`; an `MNI1` index is still
+  read, and its columns frame's label sets lose any key that is a storage
+  key now, which is what a read of the segment's footer gives.
+- **Query**: a series' overflow delta between rows is `round(curr) −
+  round(prev)`, so fractional counts add up over rows, and 0 when either
+  row has none or the count went down (`overflow_delta`). It is pooled per
+  tick, or shared among stride windows in proportion to overlap as the
+  bucket deltas are (`Splitter::row_with_overflow`). A window's band uses
+  the lowest bound among the series whose overflow it holds. The overflow
+  ranks above every finite bucket, so when pooled series have different
+  bounds, an overflow observation of the series with the lower bound can
+  be smaller than another series' highest buckets, and a finite quantile
+  in those buckets can read high. The process-group combine
   (`per_source.rs`, `Combined`) sums the overflow deltas of the pairs it
   takes as it sums bucket deltas. `apply_quantiles_with_overflow` applies
   the rank rule (settled item 4). JSON: `promql/json_f64.rs`.
@@ -235,4 +236,9 @@ All four as recommended.
    through `json_f64`. Second round: the live store's link per row, not
    per series (tested live against the recording with a collision that
    starts mid-run and a bound that moves); a stride and a combine across a
-   bound move keep each row's bound.
+   bound move keep each row's bound. Third round: a live read indexes each
+   overflow counter's series once rather than searching them per row
+   (`histogram_stream` with 1000 series of 600 rows, release build, one
+   run each: 2.64 s before, 112 ms after, 61 ms with no links), guarded
+   by a count of counter series visited; the counter name is an
+   `Arc<str>` shared by a series' rows.

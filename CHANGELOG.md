@@ -20,7 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-stamping and rebucketing carry it unchanged.
   `Memory::set_histogram_overflow` names a histogram series' overflow
   counter and bound for one row (its timestamp) in the in-memory source,
-  as a recorded row's column does; a row it does not name has none.
+  as a recorded row's column does; a row it does not name has none. Two
+  rows of one series at the same timestamp share one link, the last set.
 - **Changed (breaking):** `STORAGE_KEYS` adds `overflow` and
   `overflow_bound` (`OVERFLOW_KEY`, `OVERFLOW_BOUND_KEY`), so neither is a
   label. A reader on metriken-storage 0.9.0 or earlier shows them as two
