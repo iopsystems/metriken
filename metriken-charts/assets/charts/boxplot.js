@@ -1,5 +1,5 @@
 import { visibleLabels } from './util/labels.js';
-import { insertGapNulls } from './util/utils.js';
+import { insertGapNulls, isInfinite } from './util/utils.js';
 
 // Render a decoded display-mode boxplot series (see display.js
 // `decodeDisplayBinary`) as echarts series: a robust median line, plus two
@@ -12,10 +12,14 @@ import { insertGapNulls } from './util/utils.js';
 // whose `areaStyle` fills the gap. No `sampling` — the data is already
 // decimated server-side, so every point should render.
 
+// ±Infinity is drawn as a gap (null); NaN is left as it is, which ECharts also
+// draws as a gap.
+const drawable = (v) => (isInfinite(v) ? null : v);
+
 const zipMs = (t, col) => {
     const n = t.length;
     const out = new Array(n);
-    for (let i = 0; i < n; i++) out[i] = [t[i] * 1000, col[i]]; // s -> ms
+    for (let i = 0; i < n; i++) out[i] = [t[i] * 1000, drawable(col[i])]; // s -> ms
     return out;
 };
 
@@ -85,7 +89,7 @@ export function buildInterpolatedOverlay({ t, values, flags, name, color, z = 3 
 const zipDiffMs = (t, base, top) => {
     const n = t.length;
     const out = new Array(n);
-    for (let i = 0; i < n; i++) out[i] = [t[i] * 1000, top[i] - base[i]];
+    for (let i = 0; i < n; i++) out[i] = [t[i] * 1000, drawable(top[i] - base[i])];
     return out;
 };
 
@@ -329,8 +333,8 @@ export function buildDivergenceBand(band, opts = {}) {
     const baseData = new Array(n);
     const fillData = new Array(n);
     for (let i = 0; i < n; i++) {
-        const lo = band.lower[i];
-        const hi = band.upper[i];
+        const lo = drawable(band.lower[i]);
+        const hi = drawable(band.upper[i]);
         const gap = (lo == null || hi == null) ? null : hi - lo;
         baseData[i] = [band.t[i] * 1000, lo == null ? null : lo];
         fillData[i] = [band.t[i] * 1000, gap];

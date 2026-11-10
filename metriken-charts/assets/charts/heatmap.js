@@ -1,5 +1,6 @@
 import {
-    createAxisLabelFormatter
+    createAxisLabelFormatter,
+    infinityLabel,
 } from './util/units.js';
 import {
     formatDateTime,
@@ -173,7 +174,7 @@ export function configureHeatmap(chart) {
         // Escaped: an unknown `unit_system` is returned verbatim as the unit.
         const unitFmt = unitSystem
             ? createAxisLabelFormatter(unitSystem)
-            : (v) => v.toFixed(6);
+            : (v) => infinityLabel(v) ?? v.toFixed(6);
         const fmt = (v) => escapeHtml(unitFmt(v));
 
         // Diff heatmap: pull baseline + experiment absolute values from

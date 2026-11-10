@@ -219,6 +219,24 @@ const UNIT_SYSTEMS = {
 };
 
 /**
+ * `+Inf` or `-Inf` for ±Infinity, as PromQL writes them, and null for any
+ * other value. A histogram quantile past the highest finite bucket is +Inf.
+ */
+function infinityLabel(value) {
+    if (value === Infinity) return '+Inf';
+    if (value === -Infinity) return '-Inf';
+    return null;
+}
+
+/**
+ * A value shown with no unit system: `+Inf` or `-Inf` for ±Infinity, any
+ * other value unchanged.
+ */
+function plainValue(value) {
+    return infinityLabel(value) ?? value;
+}
+
+/**
  * Format a value with the appropriate unit scaling
  * 
  * @param {number} value - The value to format
@@ -230,6 +248,8 @@ function formatWithUnit(value, unitSystem, precision = 2) {
     if (value === null || value === undefined || isNaN(value)) {
         return { value: '0', unit: UNIT_SYSTEMS[unitSystem]?.base || '' };
     }
+    const inf = infinityLabel(value);
+    if (inf) return { value: inf, unit: '' };
 
     const absValue = Math.abs(value);
 
@@ -281,6 +301,8 @@ function createAxisLabelFormatter(unitSystem, precision = 2) {
 
 export {
     UNIT_SYSTEMS,
+    infinityLabel,
+    plainValue,
     formatWithUnit,
     createAxisLabelFormatter,
 };

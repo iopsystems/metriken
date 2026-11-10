@@ -1,9 +1,11 @@
 import {
     createAxisLabelFormatter,
+    plainValue,
 } from './util/units.js';
 import {
     insertGapNulls,
     clampToRange,
+    isInfinite,
 } from './util/utils.js';
 import {
     getBaseOption,
@@ -163,7 +165,7 @@ function renderPercentileBands(chart) {
         tooltip: {
             ...baseOption.tooltip,
             formatter: getTooltipFormatter(
-                unitSystem ? createAxisLabelFormatter(unitSystem) : (val) => val,
+                unitSystem ? createAxisLabelFormatter(unitSystem) : plainValue,
                 null,
                 chart,
             ),
@@ -297,7 +299,11 @@ export function configureScatterChart(chart) {
 
         for (let j = 0; j < timeData.length; j++) {
             const rawInput = percentileValues[j];
-            if (rawInput !== undefined && !isNaN(rawInput)) {
+            // +Inf (a quantile past the highest finite bucket) is drawn in the
+            // OOB band, so it needs range.max; any other ±Infinity is a gap.
+            const drawable = !isInfinite(rawInput)
+                || (rawInput === Infinity && range?.max != null);
+            if (rawInput !== undefined && !isNaN(rawInput) && drawable) {
                 const [v, raw] = clampToRange(rawInput, range);
                 const isClamped = raw != null;
                 if (isClamped) {
@@ -426,7 +432,7 @@ export function configureScatterChart(chart) {
             ...baseOption.tooltip,
             formatter: getTooltipFormatter(unitSystem ?
                 createAxisLabelFormatter(unitSystem) :
-                val => val, chart.pinnedSet, chart, 'scatter'),
+                plainValue, chart.pinnedSet, chart, 'scatter'),
         },
         // Bands appended (not prepended) so the pin logic's index-based series
         // updates still line up with the line/dot series; z:1 keeps bands behind.
