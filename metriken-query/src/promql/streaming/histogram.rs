@@ -631,13 +631,14 @@ pub(super) fn delta_walk(
     }
 }
 
-/// The observations a series' overflow gained from `prev` to `curr`,
-/// rounded to whole observations: 0 when either row has none, or when the
-/// count went down (a reset, which the buckets' `delta_walk` also reads as
-/// no change).
+/// The observations a series' overflow gained from `prev` to `curr`: the
+/// difference of the two counts rounded to whole observations, so a count
+/// that moves by fractions still adds up over rows. 0 when either row has
+/// none, or when the count went down (a reset, which the buckets'
+/// `delta_walk` also reads as no change).
 pub(super) fn overflow_delta(prev: Option<Overflow>, curr: Option<Overflow>) -> u64 {
     match (prev, curr) {
-        (Some(p), Some(c)) if c.count > p.count => (c.count - p.count).round() as u64,
+        (Some(p), Some(c)) => (c.count.round() - p.count.round()).max(0.0) as u64,
         _ => 0,
     }
 }
@@ -1362,6 +1363,12 @@ pub(super) fn apply_quantiles(
 /// `(bound, +Inf)`. A rank within them is the bucket holding it, reported
 /// as [`apply_quantiles`] reports one. With no overflow this is
 /// [`apply_quantiles`].
+///
+/// The overflow ranks above every bucket. When the pooled series have
+/// different highest finite bounds, the bound is the lowest of them, and an
+/// overflow observation of the series with the lower bound can be smaller
+/// than another series' highest buckets: a quantile that falls in those
+/// buckets can then read higher than the population's.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_quantiles_with_overflow(
     config: Config,
@@ -1484,6 +1491,23 @@ mod accum_tests {
     /// order. Buckets present in only one snapshot, growing, shrinking (a
     /// reset) and unchanged are all covered by the pseudo-random cases, and
     /// several pairs per flush put touched buckets out of order.
+    /// The overflow's delta is between the counts rounded to whole
+    /// observations, so fractional counts that each move less than half an
+    /// observation still add up; a decrease or a missing side is 0.
+    #[test]
+    fn an_overflow_delta_rounds_the_counts_not_the_difference() {
+        let o = |count: f64| Some(Overflow { count, bound: 1.0 });
+        let counts = [0.4, 0.8, 1.2, 1.6, 2.0];
+        let total: u64 = counts
+            .windows(2)
+            .map(|w| overflow_delta(o(w[0]), o(w[1])))
+            .sum();
+        assert_eq!(total, 2);
+        assert_eq!(overflow_delta(o(3.0), o(1.0)), 0);
+        assert_eq!(overflow_delta(None, o(5.0)), 0);
+        assert_eq!(overflow_delta(o(5.0), None), 0);
+    }
+
     #[test]
     fn the_delta_walk_matches_per_bucket_subtraction() {
         let config = histogram::Config::new(4, 10).unwrap();

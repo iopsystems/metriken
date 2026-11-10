@@ -13,7 +13,7 @@ so those observations are absent from the stored histogram and a high
 quantile reads low with nothing in the result saying so. After this change
 the recording keeps the overflow, and `histogram_quantile` counts it in
 the population: a quantile that falls in it reads `+Inf`, with the band
-`[top finite bound, +Inf)`.
+`(top finite bound, +Inf)`.
 
 ## Today
 
@@ -147,7 +147,8 @@ All four as recommended.
 - **D2. Non-finite values in a query result's JSON are the strings
   `"+Inf"`, `"-Inf"`, `"NaN"`**, as the Prometheus HTTP API writes them,
   and either form is read. This covers `Sample::value` and `interval`,
-  `MatrixSample::values`, `intervals` and `bands`, and a scalar result.
+  `MatrixSample::values`, `intervals` and `bands`, a scalar result, and
+  the display types (`EnvPoint`'s numbers, `DisplayResult::Scalar`).
   Finite values encode as before. A NaN result, `null` before, is now
   `"NaN"`. Rejected: keeping the derived encoding (`null`, which
   `MatrixSample`'s `Deserialize` refuses), and reporting the top bound as
@@ -171,9 +172,10 @@ All four as recommended.
 - **Recorder** (`metriken-recorder/src/prometheus.rs`): `convert_histogram`
   returns the overflow and writes the two keys; `convert` writes the
   overflow counters after every sample is read, so a scrape's own sample
-  of the same name and labels, of any scalar kind, is known first. On such
-  a collision the histogram loses both keys and the converter logs once at
-  `warn`, then at `debug`. The highest finite bucket is the one with the
+  of the same name and labels, of any kind (a histogram included), is
+  known first. On such a collision the histogram loses both keys and the
+  converter logs at `warn` once per converter (one endpoint), then at
+  `debug`. The highest finite bucket is the one with the
   highest bound, whatever the line order.
 - **Storage**: `OVERFLOW_KEY` and `OVERFLOW_BOUND_KEY` (`labels.rs`) are in
   `STORAGE_KEYS`, and in the writer's list of keys that describe a column
@@ -184,6 +186,10 @@ All four as recommended.
   overflow counter, the counter column of the named metric with the same
   labels (so, in a long segment, the same occupant), from the same row
   group pages, and attaches its value to the histogram row of the same row.
+  One series can have several histogram columns in a segment (its bound,
+  and so its column metadata, changed within it); they name the same
+  counter, which is read once and goes to each column's rows with that
+  column's bound.
   `Memory` (the live path) records the link from the ingested metadata
   (`set_histogram_overflow`) and attaches the counter's sample at the
   histogram row's timestamp. The names index is written as `MNI2`; an
@@ -191,11 +197,16 @@ All four as recommended.
   key that is a storage key now, which is what a read of the segment's
   footer gives.
 - **Query**: a series' overflow delta between rows is
-  `round(curr − prev)`, 0 when either row has none or the count went down
-  (`overflow_delta`). It is pooled per tick, or shared among stride
+  `round(curr) − round(prev)`, so fractional counts add up over rows, and
+  0 when either row has none or the count went down (`overflow_delta`).
+  It is pooled per tick, or shared among stride
   windows in proportion to overlap as the bucket deltas are
   (`Splitter::row_with_overflow`). A window's band uses the lowest bound
-  among the series whose overflow it holds. The process-group combine
+  among the series whose overflow it holds. The overflow ranks above every
+  finite bucket, so when pooled series have different bounds, an overflow
+  observation of the series with the lower bound can be smaller than
+  another series' highest buckets, and a finite quantile in those buckets
+  can read high. The process-group combine
   (`per_source.rs`, `Combined`) sums the overflow deltas of the pairs it
   takes as it sums bucket deltas. `apply_quantiles_with_overflow` applies
   the rank rule (settled item 4). JSON: `promql/json_f64.rs`.
@@ -213,4 +224,10 @@ All four as recommended.
    (`metriken-recorder/tests/histogram_overflow.rs`): the issue's scrape; a
    stride window; two series pooled; an older recording alone, pooled with
    a newer one, and as the earlier half of one process; the name
-   collision; the live `MemoryStore`; the JSON of a `+Inf` result.
+   collision, with a scalar and with a histogram; the live `MemoryStore`;
+   the JSON of a `+Inf` result; a bound that moves inside a segment, wide
+   and long; two pooled series with different bounds.
+5. Review fixes (2026-11-09): one counter read for every histogram column
+   of its series in a segment; a histogram counted in the name collision;
+   fractional overflow counts rounded before differencing; display JSON
+   through `json_f64`.

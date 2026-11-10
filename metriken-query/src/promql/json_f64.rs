@@ -7,7 +7,8 @@
 //! read.
 //!
 //! Used through `#[serde(with = ...)]` on the result types' value, interval
-//! and band fields; one module per field shape.
+//! and band fields, and on the display types' numbers
+//! ([`crate::display`]); one module per field shape.
 
 use serde::de::{self, Deserializer, Visitor};
 use serde::ser::Serializer;
@@ -68,6 +69,32 @@ impl<'de> Deserialize<'de> for Num {
 }
 
 type Pair = (Num, Num);
+
+/// `f64`: one number of a display point.
+pub(crate) mod num {
+    use super::*;
+
+    pub(crate) fn serialize<S: Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+        Num(*v).serialize(s)
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+        Num::deserialize(d).map(|n| n.0)
+    }
+}
+
+/// `Option<f64>`: a display point's uncertainty edge.
+pub(crate) mod opt_num {
+    use super::*;
+
+    pub(crate) fn serialize<S: Serializer>(v: &Option<f64>, s: S) -> Result<S::Ok, S::Error> {
+        v.map(Num).serialize(s)
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+        Ok(Option::<Num>::deserialize(d)?.map(|n| n.0))
+    }
+}
 
 /// A series' bands, as the result types hold them.
 type Bands = Option<Vec<Option<(f64, f64)>>>;

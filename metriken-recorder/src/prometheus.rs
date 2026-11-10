@@ -172,10 +172,10 @@ impl PrometheusConverter {
         let mut counters = Vec::new();
         let mut gauges = Vec::new();
         let mut histograms = Vec::new();
-        // Every scalar sample's (name, labels), which an overflow series must
-        // not take; and each histogram's overflow, written after the loop
+        // Every sample's (name, labels), histograms' included, which an
+        // overflow series must not take; and each histogram's overflow, written after the loop
         // once those are all known.
-        let mut scalars: HashSet<MetricKey> = HashSet::new();
+        let mut taken: HashSet<MetricKey> = HashSet::new();
         // (histogram name, labels, overflow, position in `histograms`)
         let mut overflows: Vec<(MetricKey, f64, usize)> = Vec::new();
 
@@ -186,12 +186,10 @@ impl PrometheusConverter {
         for sample in scrape.samples {
             // Sorted by name, which `MetricKey` relies on.
             let labels = sample.labels;
-            if !matches!(sample.value, Value::Histogram(_)) {
-                scalars.insert(MetricKey {
-                    name: sample.metric.clone(),
-                    labels: labels.clone(),
-                });
-            }
+            taken.insert(MetricKey {
+                name: sample.metric.clone(),
+                labels: labels.clone(),
+            });
 
             match sample.value {
                 Value::Counter(v) => {
@@ -278,7 +276,7 @@ impl PrometheusConverter {
                 name: overflow_name(&histogram.name),
                 labels: histogram.labels,
             };
-            if scalars.contains(&key) {
+            if taken.contains(&key) {
                 // The exporter's own series of that name is kept; this
                 // histogram reads as one without an overflow series.
                 let metadata = &mut histograms[h].metadata;

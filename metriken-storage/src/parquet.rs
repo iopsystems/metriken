@@ -1675,19 +1675,30 @@ impl ParquetSource {
 
         // Each counting histogram's overflow series: the counter its column
         // names, with the same labels (and so, in a long segment, the same
-        // occupant), read from the same rows.
+        // occupant), read from the same rows. Several histogram columns of
+        // one series (its bound changed within the segment) name one
+        // counter, which is read once and goes to each of them.
         let mut overflow_descs: Vec<ColDesc> = Vec::new();
-        let mut overflow_of: Vec<(usize, f64)> = Vec::new();
+        let mut overflow_of: Vec<Vec<(usize, f64)>> = Vec::new();
         if kind == HistKind::Counting {
             for (si, h) in col_descs.iter().enumerate() {
                 let Some((overflow_name, bound)) = &h.overflow else {
                     continue;
                 };
-                if let Some(c) = self.columns().iter().find(|c| {
+                let Some(c) = self.columns().iter().find(|c| {
                     c.kind.is_counter() && &c.name == overflow_name && c.labels == h.labels
-                }) {
-                    overflow_descs.push(c.clone());
-                    overflow_of.push((si, *bound));
+                }) else {
+                    continue;
+                };
+                match overflow_descs
+                    .iter()
+                    .position(|d| d.col_idx == c.col_idx && d.occupant == c.occupant)
+                {
+                    Some(i) => overflow_of[i].push((si, *bound)),
+                    None => {
+                        overflow_descs.push(c.clone());
+                        overflow_of.push(vec![(si, *bound)]);
+                    }
                 }
             }
         }
@@ -3359,9 +3370,10 @@ struct ParquetHistogramCursor {
     /// The overflow counters' columns, their series indexing
     /// `overflow_of`.
     overflow_groups: Vec<ReadGroup>,
-    /// Per overflow counter: the histogram series it belongs to, and that
-    /// histogram's highest finite bound.
-    overflow_of: Vec<(usize, f64)>,
+    /// Per overflow counter: the histogram series it belongs to, each with
+    /// that histogram column's highest finite bound. One series' columns
+    /// can be several (one per bound), each read at its own rows.
+    overflow_of: Vec<Vec<(usize, f64)>>,
     /// In a long segment, the occupants this stream reads, for pruning.
     wanted: Vec<u64>,
     /// Overlapping row group indices remaining to process.
@@ -3473,8 +3485,9 @@ impl ParquetHistogramCursor {
                 let (Some(count), Some(i)) = (values.as_f64(row), g.series(occupants, row)) else {
                     continue;
                 };
-                let (si, bound) = self.overflow_of[i];
-                out.insert((row, si), Overflow { count, bound });
+                for &(si, bound) in &self.overflow_of[i] {
+                    out.insert((row, si), Overflow { count, bound });
+                }
             }
         }
         out

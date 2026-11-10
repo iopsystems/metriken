@@ -11,7 +11,7 @@ use crate::labels::{Labels, MatchOp};
 use crate::{DataSource, QueryOptions};
 
 mod columns;
-mod json_f64;
+pub(crate) mod json_f64;
 pub use columns::{referenced_metrics, selector_filter};
 #[cfg(feature = "archive")]
 pub(crate) use columns::{repeated_matcher, selectors};

@@ -74,6 +74,46 @@ fn colliding(t: u64) -> String {
     )
 }
 
+/// [`one_series`] and a histogram of the overflow series' name and labels.
+fn colliding_histogram(t: u64) -> String {
+    format!(
+        "{}# TYPE lat_overflow histogram\n\
+lat_overflow_bucket{{le=\"1\"}} {t}\n\
+lat_overflow_bucket{{le=\"+Inf\"}} {t}\n",
+        one_series(t)
+    )
+}
+
+/// [`lat`] with `labels`, whose highest finite bound moves from 10 to 20
+/// at tick 8 (a bucket `le=20` holding nothing more than `le=10`): the
+/// histogram's column changes (its `overflow_bound` does), its overflow
+/// series does not.
+fn moving_top(labels: &'static str) -> impl Fn(u64) -> String {
+    move |t| {
+        let mut text = format!("# TYPE lat histogram\n{}", lat(t, labels));
+        if t >= 8 {
+            text.push_str(&format!("lat_bucket{{{labels}le=\"20\"}} {}\n", 9 * t));
+        }
+        text
+    }
+}
+
+/// Two series with different highest finite bounds, both with an
+/// overflow: `op="a"` 5 at or below 1, 4 in `(1, 5]` and 1 above 5 a tick;
+/// `op="b"` as [`one_series`] (above 10).
+fn two_bounds(t: u64) -> String {
+    format!(
+        "# TYPE lat histogram\n\
+lat_bucket{{op=\"a\",le=\"1\"}} {a}\n\
+lat_bucket{{op=\"a\",le=\"5\"}} {b}\n\
+lat_bucket{{op=\"a\",le=\"+Inf\"}} {c}\n{}",
+        lat(t, "op=\"b\","),
+        a = 5 * t,
+        b = 9 * t,
+        c = 10 * t,
+    )
+}
+
 // ─── Writing ────────────────────────────────────────────────────────────────
 
 /// What the converter wrote before the overflow existed: the snapshot
@@ -475,4 +515,79 @@ fn the_live_store_counts_the_overflow() {
             assert_eq!((*v, *b), want, "old={old}: {result:?}");
         }
     }
+}
+
+/// A segment holding two columns of one histogram series (its highest
+/// finite bound moved from 10 to 20 at tick 8, inside the segment of ticks
+/// 5 to 9), both naming one overflow counter: every tick counts the
+/// overflow, wide and long.
+#[test]
+fn a_bound_that_moves_inside_a_segment_keeps_the_overflow() {
+    for labels in ["", "id=\"/a\","] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.dendro");
+        let text = moving_top(labels);
+        simple(&path, &text, false);
+        let reader = open(&path);
+        let got = matrix(&reader, "histogram_quantile(0.95, lat)");
+        let values: Vec<f64> = got
+            .iter()
+            .flat_map(|m| m.values.iter().map(|(_, v)| *v))
+            .collect();
+        assert!(values.len() >= TICKS as usize - 2, "{labels}: {got:?}");
+        assert!(
+            values.iter().all(|v| *v == f64::INFINITY),
+            "{labels}: {got:?}"
+        );
+        for m in &got {
+            for (lo, hi) in m.intervals.as_ref().unwrap() {
+                assert!(
+                    (*lo == 10.0 || *lo == 20.0) && *hi == f64::INFINITY,
+                    "{labels}: {got:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A scrape with its own histogram named `lat_overflow` keeps it, and
+/// `lat` has no overflow series.
+#[test]
+fn a_scrape_with_a_histogram_of_the_overflow_name_keeps_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    simple(&path, &colliding_histogram, false);
+    let reader = open(&path);
+    assert!(!reader.counter_names().contains(&"lat_overflow".to_string()));
+    all(&reader, "histogram_quantile(0.95, lat)", TEN.0, TEN.1);
+    all(
+        &reader,
+        "histogram_quantile(0.5, lat_overflow)",
+        ONE.0,
+        ONE.1,
+    );
+}
+
+/// Two series above different bounds pool into one population (18 finite
+/// observations and 2 above a bound a tick), and a quantile in the
+/// overflow is above the lower of the bounds.
+#[test]
+fn pooled_series_with_different_bounds_take_the_lowest() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    simple(&path, &two_bounds, false);
+    let reader = open(&path);
+    // ceil(0.95 · 20) = 19 > 18.
+    all(
+        &reader,
+        "histogram_quantile(0.95, lat)",
+        f64::INFINITY,
+        (5.0, f64::INFINITY),
+    );
+    all(
+        &reader,
+        "histogram_quantile(0.95, lat{op=\"b\"})",
+        OVER.0,
+        OVER.1,
+    );
 }

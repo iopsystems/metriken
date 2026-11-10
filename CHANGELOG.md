@@ -13,17 +13,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the series' observations above its highest finite bound at that row
   (`Overflow { count, bound }`, cumulative), so a struct literal of it
   must add the field. The parquet reader fills it when a counting
-  histogram column names an overflow counter (`OVERFLOW_KEY`) with the
-  same labels in the same rows; merging, re-stamping and rebucketing carry
-  it unchanged. `Memory::set_histogram_overflow` names a histogram
-  series' overflow counter for the in-memory source.
+  histogram column names an overflow counter (`OVERFLOW_KEY`) and holds
+  its highest finite bound (`OVERFLOW_BOUND_KEY`, an `f64`; a column
+  without both, or whose bound does not parse, has no overflow), and that
+  counter has a value with the same labels in the same row; merging,
+  re-stamping and rebucketing carry it unchanged.
+  `Memory::set_histogram_overflow` names a histogram series' overflow
+  counter for the in-memory source.
 - **Changed (breaking):** `STORAGE_KEYS` adds `overflow` and
   `overflow_bound` (`OVERFLOW_KEY`, `OVERFLOW_BOUND_KEY`), so neither is a
   label. A reader on metriken-storage 0.9.0 or earlier shows them as two
-  labels on a histogram recorded with them. Sealed segments' names
-  indexes are written as version 2 (`MNI2`), which 0.8.0 and earlier do
-  not take (they read such a segment's footer instead); a version 1 index
-  is still read, its label sets without the two keys.
+  labels on a histogram recorded with them. This applies to every column:
+  an exporter label named `overflow` or `overflow_bound` is no longer a
+  label on any series, in recordings made before this release too, and
+  series that differed only by such a label now have the same labels.
+  Sealed segments' names indexes are written as version 2 (`MNI2`), which
+  0.9.0 and earlier do not take (they read such a segment's footer
+  instead); a version 1 index is still read, its label sets without the
+  two keys.
 
 ### metriken-query 0.47.0
 
@@ -42,8 +49,10 @@ Requires metriken-storage 0.10.0.
   returns the quantile over the finite buckets only, which is lower than
   this one's, without an error.
 - **Changed (breaking):** in a query result's JSON (`Sample`,
-  `MatrixSample`, a scalar `QueryResult`), a non-finite value, interval or
-  band end is the string `"+Inf"`, `"-Inf"` or `"NaN"`, as the Prometheus
+  `MatrixSample`, a scalar `QueryResult`) and a display result's
+  (`EnvPoint`'s `min`, `lo`, `median`, `hi`, `max`, `unc_lo` and `unc_hi`,
+  and `DisplayResult::Scalar`), a non-finite value, interval or band end
+  is the string `"+Inf"`, `"-Inf"` or `"NaN"`, as the Prometheus
   HTTP API writes it, where it was `null`; deserialization reads numbers
   and these strings. Finite values are numbers as before.
 - **Added:** `MemoryStore::ingest_snapshot` takes a histogram's overflow
@@ -62,8 +71,9 @@ Requires metriken-storage 0.10.0.
   0.47.0 counts it in `histogram_quantile`. A reader that does not know it
   lists one more counter per histogram, and returns the quantile over the
   finite buckets, as before. A scrape that has its own sample of that name
-  and labels keeps it, and that histogram gets no overflow series (logged
-  once). A histogram without a `+Inf` bucket gets none either.
+  and labels, a histogram's included, keeps it, and that histogram gets no
+  overflow series (warned once per endpoint, then logged at debug). A
+  histogram without a `+Inf` bucket gets none either.
 
 ### metriken-exposition 0.27.0
 
