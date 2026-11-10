@@ -1,8 +1,8 @@
 # Prometheus units: detect a unit in the name, normalize, and keep the original name
 
-**Status:** OPEN. Design written; three owner decisions (D1–D3, below)
-are pending, so nothing is built. Branch `feat/prometheus-units`, from
-main 7a515dc.
+**Status:** OPEN. Design 2026-11-09, owner decisions the same day (D1a,
+D2a, D3a, below). Built on branch `feat/prometheus-units` (see "As
+built"); not merged, not released.
 Issue #379. Builds on #384 (float scalars,
 `2026-11-06-float-scalars.md`) and #388 (histogram overflow,
 `2026-11-09-histogram-overflow.md`).
@@ -58,9 +58,9 @@ treatment of the overflow (#388 D3).
   Prometheus converter never writes it.
 - **Names index.** `names.rs:39-45`: a storage key added after the
   metriken-storage release that first writes `MNI2` (0.10.0) needs
-  `MNI3`. 0.10.0 is in release PR #389, open; this change targets
-  0.11.0, so it takes `MNI3`. (If #389 were abandoned and this landed
-  first, the key would join `MNI2` instead.) A reader that does not know
+  `MNI3`. 0.10.0 was in release PR #389, open when this was designed and
+  merged (7b99961) before this change was rebased onto main; this change
+  targets 0.11.0 and takes `MNI3`. A reader that does not know
   an `MNI` version reads the segment's footer (`names.rs:36-38`).
 - **Internal labels.** `Labels::from_metadata` (`labels.rs:106`) turns
   every non-storage key into a label, in both loaders (parquet
@@ -208,22 +208,30 @@ treatment of the overflow (#388 D3).
    a range-dependent rule would change which series a dashboard panel
    shows as it is zoomed. A regex on `__name__` is not evaluated today,
    so it gets no fallback. Two candidates both matching `N` (possible
-   only across recorder versions with different tables) is an error
-   naming both.
+   only across recorder versions with different tables) was designed as
+   an error; as built, the first candidate in `fallback_candidates`'
+   order is read (the name's own token replaced comes first), since the
+   order is fixed and an error would refuse a query a reader can
+   narrow.
 10. **Bits to bytes for counters.** ÷8 is a power of two, so it is exact
     in f64 (outside subnormals); `rate(x_bytes_total)` is bytes/s.
 11. **Recorder upgrade.** Recordings made before keep their names and
     values; nothing rewrites them. A recording made after has the new
     names. How a query sees an archive holding both depends on D1 and D2.
 
-## Decisions needed (owner)
+## Decisions (owner, 2026-11-09)
+
+D1a, D2a and D3a, as recommended. Release #389 (storage 0.10.0 with
+`MNI2`, query 0.47.0, recorder 0.11.0) lands before this, so `scale` takes
+`MNI3` and the CHANGELOG blocks are storage 0.11.0, query 0.48.0 and
+recorder 0.12.0. The options as they were put:
 
 ### D1. What a fallback query returns
 
 A query by an exporter name (`histogram_quantile(0.99, x_seconds)`,
 `rate(x_seconds_sum[1m])`) is answered from series stored in nanoseconds.
 
-- **D1a (recommended): the stored series as stored.** Values in the
+- **D1a (recommended, chosen): the stored series as stored.** Values in the
   normalized unit; the result's `__name__` is the stored name
   (`x_nanoseconds`), with `__prometheus_name__="x_seconds"` among its
   labels, so the unit is visible in the result. Cost: a dashboard or KPI
@@ -247,7 +255,7 @@ A query by an exporter name (`histogram_quantile(0.99, x_seconds)`,
 
 ### D2. Over which recordings "matches no series" is decided
 
-- **D2a (recommended): per selector, over the recordings that selector
+- **D2a (recommended, chosen): per selector, over the recordings that selector
   reaches** after the scope and the recording-label routing `Plan`
   already does per selector. `x_seconds{source="new"}` falls back when
   the new recording lacks the name even if an older recording in the
@@ -269,7 +277,7 @@ A query by an exporter name (`histogram_quantile(0.99, x_seconds)`,
 A histogram with no unit token whose smallest bound is below 1 is stored
 ×10^k today, unrecorded. This change records `scale`.
 
-- **D3a (recommended): record only.** Quantiles read as today (×10^k), a
+- **D3a (recommended, chosen): record only.** Quantiles read as today (×10^k), a
   reader that wants exporter units divides by `scale`. Old and new
   recordings of one endpoint pool consistently.
 - **D3b: metriken-query divides histogram function outputs by `scale`.**
@@ -279,7 +287,7 @@ A histogram with no unit token whose smallest bound is below 1 is stored
   factor through pooling and the process-group combine, as the overflow
   bound needed in #388.
 
-## Versions (proposed)
+## Versions
 
 - metriken-storage 0.11.0, breaking: `STORAGE_KEYS` gains `scale`, which
   changes which keys are labels in every recording (as `overflow` did in
@@ -288,10 +296,62 @@ A histogram with no unit token whose smallest bound is below 1 is stored
 - metriken-query 0.48.0, breaking: requires metriken-storage 0.11.0,
   whose types (`DataSource`, `Labels`) are in its public API. The
   fallback itself only answers queries that were `MetricNotFound` or
-  "references no metric" before; under D3b, quantile values change.
+  "references no metric" before (D3a: no quantile changes).
 - metriken-recorder 0.12.0, breaking: series names, values (`_sum`,
   scalars in non-normalized units, bits) and labels change for a
   Prometheus endpoint.
+
+metriken-charts 0.1.3 (fix): its `STORAGE_KEYS` copy
+(`assets/charts/util/labels.js`) had not taken `overflow` and
+`overflow_bound` from #388; it takes them and `scale`.
+
+## As built
+
+- **Storage** (`metriken-storage`): `prometheus_units.rs` holds the token
+  table, `normalize` and `fallback_candidates`, and
+  `PROMETHEUS_NAME_LABEL`; `SCALE_KEY` is in `STORAGE_KEYS` and the
+  writer's column keys; the names index is `MNI3`, and `MNI1` and `MNI2`
+  are read with their label sets stripped of today's storage keys
+  (`Frame::older`). `SamplerReader::holds_labeled` answers "does this
+  table hold `C` with a series whose `__prometheus_name__` is `N`" from
+  the names index where it can.
+- **Recorder** (`metriken-recorder`): `exposition.rs` keeps `# UNIT`
+  (`Scrape::units`); `PrometheusConverter::plan` normalizes each exporter
+  name of a scrape, finds collisions and adds them to `keep_original`;
+  `convert` writes the stored name, the label, `unit`, and values ×
+  factor; `convert_histogram` takes the factor, applies the generic scale
+  to the scaled bounds and writes `scale` when it is not 1. A kept
+  original is stored with factor 1, so a kept `_seconds` histogram's
+  bounds are seconds × the generic scale (recorded), not ×1e9 as before
+  this change. HELP text is kept under the stored name too.
+- **Query** (`metriken-query`): `promql/prometheus_names.rs`. Over an
+  archive, `Plan::new` resolves each selector (`resolve_names` in
+  `archive.rs`) over the tables in its scope whose recording labels its
+  filter can match, routes on the resolved names, and hands the
+  resolution to the engine (`QueryEngine::with_names`), which rewrites
+  the selectors it evaluates by (name, filter). Any other source resolves
+  over the whole source when the engine evaluates. The hand-parsed
+  histogram functions resolve in `parse_metric_selector`; `columns`
+  resolves too. A binary operation's result keeps the left operand's
+  `__prometheus_name__` (Prometheus keeps every label but `__name__`);
+  matching and `without` ignore it.
+- **Tests:** `metriken-storage/src/prometheus_units.rs` (each token, the
+  suffixes, `# UNIT` precedence, candidates); `names.rs` and
+  `tests/writer.rs` (`MNI1` and `MNI2` read as `MNI3`);
+  `metriken-recorder/tests/prometheus_units.rs` through exposition text →
+  `PrometheusConverter` → `ArchiveWriter` → archive → PromQL and the live
+  `MemoryStore`: every token class, `# UNIT` over the name, `_sum`,
+  `_count`, `_total`, a histogram's buckets, `_sum`, overflow and bound in
+  nanoseconds, a summary, bits as a byte rate, the generic scale on a
+  `_ratio`, `_bits` and unit-less histogram, a collision in one scrape and
+  one mid-run (sticky), the fallback in PromQL and the hand-parsed
+  histogram functions, recorded and live, an older recording beside a
+  newer one (exact preferred, per selector, under a scope), and
+  `__prometheus_name__` ignored by matching and `without`;
+  `metriken-charts/tests/labels.test.mjs` (hidden from legends and from
+  the labels that name series). `tests/float_scalars.rs` fixtures were
+  renamed to names without a unit token (`cpu_time_total`), since they
+  test that values are stored as served.
 
 ## rezolus (other repository; not edited here)
 
