@@ -32,7 +32,9 @@ Requires metriken-storage 0.11.1.
   `MemoryStore` twice, is an `EvaluationError` naming the metric and the
   label set, in PromQL (both rate paths, gauges, `histogram_quantile`)
   and in `histogram_quantiles`, `histogram_heatmap`, `histogram_irate`,
-  `histogram_mean`, `histogram_count`, `histogram_sum` and `columns`.
+  `histogram_mean`, `histogram_count`, `histogram_sum` and `columns`, a
+  selector with `or` matchers included (checked against its matchers
+  outside the `or` branches, which are what its read applies).
   Before, `rate` or `irate` of such a counter panicked with `attempt to
   subtract with overflow` in a debug build, and a gauge or histogram read
   their samples as one series (#394). An archive recorded through

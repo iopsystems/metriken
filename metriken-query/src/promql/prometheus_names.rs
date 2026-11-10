@@ -130,46 +130,61 @@ pub(crate) fn renamed_filter(mut filter: Labels, original: &str) -> Labels {
 /// filter to the stored name it reads, if any.
 pub(crate) type Resolve<'a> = dyn Fn(&str, &Labels) -> Result<Option<String>, QueryError> + 'a;
 
+/// The check [`resolve_selectors`] runs on a selector it does not resolve
+/// (one with `or` matchers): its name and the filter a read applies.
+pub(crate) type Check<'a> = dyn Fn(&str, &Labels) -> Result<(), QueryError> + 'a;
+
 /// Point each named selector of `expr` that `resolve` resolves at the
 /// stored name, adding the `__prometheus_name__` matcher. `resolve` takes
-/// the selector's name and filter. A selector with `or` matchers is left
-/// as it is. The first error `resolve` returns is returned.
-pub(crate) fn resolve_selectors(expr: &mut Expr, resolve: &Resolve) -> Result<(), QueryError> {
+/// the selector's name and filter. A selector with `or` matchers is not
+/// resolved; `check` is run on its name and the filter its read applies,
+/// which is its matchers outside the `or` branches (the readers do not
+/// apply the branches). The first error either returns is returned.
+pub(crate) fn resolve_selectors(
+    expr: &mut Expr,
+    resolve: &Resolve,
+    check: &Check,
+) -> Result<(), QueryError> {
+    let each = |e: &mut Expr| resolve_selectors(e, resolve, check);
     match expr {
         Expr::Aggregate(agg) => {
-            resolve_selectors(&mut agg.expr, resolve)?;
+            each(&mut agg.expr)?;
             if let Some(param) = agg.param.as_mut() {
-                resolve_selectors(param, resolve)?;
+                each(param)?;
             }
             Ok(())
         }
-        Expr::Unary(u) => resolve_selectors(&mut u.expr, resolve),
+        Expr::Unary(u) => each(&mut u.expr),
         Expr::Binary(b) => {
-            resolve_selectors(&mut b.lhs, resolve)?;
-            resolve_selectors(&mut b.rhs, resolve)
+            each(&mut b.lhs)?;
+            each(&mut b.rhs)
         }
-        Expr::Paren(p) => resolve_selectors(&mut p.expr, resolve),
+        Expr::Paren(p) => each(&mut p.expr),
         Expr::Call(call) => {
             for arg in call.args.args.iter_mut() {
-                resolve_selectors(arg, resolve)?;
+                each(arg)?;
             }
             Ok(())
         }
-        Expr::VectorSelector(sel) => resolve_selector(sel, resolve),
-        Expr::MatrixSelector(sel) => resolve_selector(&mut sel.vs, resolve),
-        Expr::Subquery(s) => resolve_selectors(&mut s.expr, resolve),
+        Expr::VectorSelector(sel) => resolve_selector(sel, resolve, check),
+        Expr::MatrixSelector(sel) => resolve_selector(&mut sel.vs, resolve, check),
+        Expr::Subquery(s) => each(&mut s.expr),
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => Ok(()),
     }
 }
 
-fn resolve_selector(sel: &mut parser::VectorSelector, resolve: &Resolve) -> Result<(), QueryError> {
-    if !sel.matchers.or_matchers.is_empty() {
-        return Ok(());
-    }
+fn resolve_selector(
+    sel: &mut parser::VectorSelector,
+    resolve: &Resolve,
+    check: &Check,
+) -> Result<(), QueryError> {
     let Some(name) = sel.name.clone() else {
         return Ok(());
     };
     let filter = extract_filter_labels(&sel.matchers.matchers);
+    if !sel.matchers.or_matchers.is_empty() {
+        return check(&name, &filter);
+    }
     let Some(stored) = resolve(&name, &filter)? else {
         return Ok(());
     };

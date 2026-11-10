@@ -220,6 +220,7 @@ const REFUSED: &[(&str, &str)] = &[
     ("rate(x_total[3s])", "x_total"),
     ("irate(x_total[3s])", "x_total"),
     ("sum(rate(x_total[3s]))", "x_total"),
+    ("rate(x_total{job=\"j\" or job=\"\"}[3s])", "x_total"),
     ("g", "g"),
     ("avg_over_time(g[3s])", "g"),
     ("histogram_quantile(0.5, h)", "h"),

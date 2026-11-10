@@ -1134,7 +1134,11 @@ impl QueryEngine {
     /// by its exporter name, and an error for a selector matching a
     /// series two columns of one table hold.
     pub(crate) fn resolve_names(&self, expr: &mut Expr) -> Result<(), QueryError> {
-        prometheus_names::resolve_selectors(expr, &|name, filter| self.selector_name(name, filter))
+        prometheus_names::resolve_selectors(
+            expr,
+            &|name, filter| self.selector_name(name, filter),
+            &|name, filter| refuse_duplicated(&*self.source, name, filter),
+        )
     }
 
     /// An engine over `source`, some of whose recordings form the process
