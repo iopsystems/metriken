@@ -78,8 +78,9 @@ impl Memory {
     }
 
     /// Samples the `upsert_*` methods put in place of their series' last
-    /// sample because they were at its time (a snapshot given twice). Not
-    /// warned of: the value replaced is of the same time.
+    /// sample because they were at its time (a snapshot given twice, or a
+    /// second value of one series in one snapshot). Not warned of: the value
+    /// replaced is of the same time.
     pub fn replaced_samples(&self) -> u64 {
         self.replaced
     }
@@ -120,8 +121,8 @@ impl Memory {
     }
 
     /// Record that two values of one kind of metric `name` with `labels`
-    /// arrived in one snapshot, so their samples are joined into one series
-    /// ([`DataSource::duplicated_series`]). metriken-query's
+    /// arrived in one snapshot, so the second replaced the first in its
+    /// series ([`DataSource::duplicated_series`]). metriken-query's
     /// `MemoryStore::ingest_snapshot` calls it.
     pub fn mark_duplicated(&mut self, name: &str, labels: &Labels) {
         let held = self.duplicated.entry(name.to_string()).or_default();

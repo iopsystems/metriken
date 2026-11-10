@@ -194,46 +194,80 @@ fn merge_streams(streams: Vec<HistogramStream>, clock: Option<usize>) -> Option<
     }
     let config = common_config(streams.iter().map(|s| s.meta.config))?;
 
-    // Build unified series list; record per-stream remapping tables. A
-    // series is keyed by its labels and how many earlier indices of the
-    // stream carry them: a stream's first index of a label set is one
-    // series across streams, and a second index of it (two columns of one
-    // segment with one label set, which a segmented reader's splice also
-    // keeps apart) stays its own, so a reader can see the two columns'
-    // rows at one time.
+    // Build unified series list; record per-stream remapping tables. Every
+    // index of a label set, in every stream, is one series: a stream lists
+    // one index per column (a plain parquet file, a live store), and two
+    // columns of one series that follow one another (a bound that moved)
+    // read as one. A row at the time of its stream's previous row of that
+    // label set from another index (two columns sharing a time, which the
+    // segmented reader's splice keeps under two indices as well) goes to a
+    // second index of the labels instead, decided on the stream's own times
+    // before any re-stamping, so a reader can refuse the series.
     let mut global_series: Vec<Labels> = Vec::new();
-    let mut index: std::collections::HashMap<(Labels, usize), usize> =
+    let mut index: std::collections::HashMap<Labels, usize> = std::collections::HashMap::new();
+    let mut collision_of: std::collections::HashMap<usize, usize> =
         std::collections::HashMap::new();
-    // remap[stream_idx][local_series_idx] = global_series_idx
+    // remap[stream_idx][local_series_idx] = global_series_idx, and the
+    // collision index of a local index whose labels the stream lists twice.
     let mut remap: Vec<Vec<usize>> = Vec::with_capacity(streams.len());
+    let mut collide: Vec<Vec<Option<usize>>> = Vec::with_capacity(streams.len());
     for stream in &streams {
-        let mut local_remap = Vec::with_capacity(stream.meta.series.len());
-        let mut earlier: std::collections::HashMap<&Labels, usize> =
-            std::collections::HashMap::new();
-        for labels in &stream.meta.series {
-            let k = earlier.entry(labels).or_insert(0);
-            let key = (labels.clone(), *k);
-            *k += 1;
-            let global_idx = *index.entry(key).or_insert_with(|| {
-                global_series.push(labels.clone());
-                global_series.len() - 1
-            });
-            local_remap.push(global_idx);
+        let local_remap: Vec<usize> = stream
+            .meta
+            .series
+            .iter()
+            .map(|labels| {
+                *index.entry(labels.clone()).or_insert_with(|| {
+                    global_series.push(labels.clone());
+                    global_series.len() - 1
+                })
+            })
+            .collect();
+        let mut count: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for g in &local_remap {
+            *count.entry(*g).or_insert(0) += 1;
         }
+        let local_collide: Vec<Option<usize>> = local_remap
+            .iter()
+            .map(|g| {
+                (count[g] > 1).then(|| {
+                    *collision_of.entry(*g).or_insert_with(|| {
+                        global_series.push(global_series[*g].clone());
+                        global_series.len() - 1
+                    })
+                })
+            })
+            .collect();
         remap.push(local_remap);
+        collide.push(local_collide);
     }
 
     // Wrap each stream's iterator to remap series_idx to the global index
-    // and its buckets to the common configuration.
+    // (or its collision index) and its buckets to the common configuration.
     let mut iters: Vec<Box<dyn Iterator<Item = HistogramRow> + Send>> = streams
         .into_iter()
         .enumerate()
         .map(|(si, stream)| {
             let local_remap = remap[si].clone();
+            let collision = collide[si].clone();
             let from = stream.meta.config;
+            // Per global index, the time and local index of the stream's
+            // last row of it.
+            let mut last: std::collections::HashMap<usize, (u64, usize)> =
+                std::collections::HashMap::new();
             let remapped: Box<dyn Iterator<Item = HistogramRow> + Send> =
                 Box::new(stream.rows.map(move |mut row| {
-                    row.series_idx = local_remap[row.series_idx];
+                    let local = row.series_idx;
+                    let global = local_remap[local];
+                    row.series_idx = global;
+                    if let Some(alt) = collision[local] {
+                        if let Some(&(ts, from_local)) = last.get(&global) {
+                            if ts == row.timestamp && from_local != local {
+                                row.series_idx = alt;
+                            }
+                        }
+                    }
+                    last.insert(global, (row.timestamp, local));
                     if from != config {
                         row.snapshot = rebucket(row.snapshot, &from, &config);
                     }
@@ -444,6 +478,82 @@ mod tests {
                 overflow: None,
             })),
         }
+    }
+
+    /// One label set `S` under two indices, as a plain parquet file or a
+    /// live store lists two columns of one series: `a`'s rows then `b`'s,
+    /// each `(time, local index)`.
+    fn two_columns(rows: &[(u64, usize)]) -> HistogramStream {
+        let mut s = stream(Vec::new(), "S", (4, 16));
+        s.meta.series.push(Labels::from([("source", "S")]));
+        let rows: Vec<HistogramRow> = rows
+            .iter()
+            .map(|&(t, series_idx)| HistogramRow {
+                series_idx,
+                timestamp: t,
+                resumes: false,
+                snapshot: HistogramSnapshot {
+                    index: vec![1],
+                    count: vec![t],
+                },
+                overflow: None,
+            })
+            .collect();
+        s.rows = Box::new(rows.into_iter());
+        s
+    }
+
+    /// The `(time, index)` of every row of label set `S` in `merged`.
+    fn rows_of_s(merged: HistogramStream) -> Vec<(u64, usize)> {
+        let s = Labels::from([("source", "S")]);
+        let series = merged.meta.series.clone();
+        merged
+            .rows
+            .filter(|r| series[r.series_idx] == s)
+            .map(|r| (r.timestamp, r.series_idx))
+            .collect()
+    }
+
+    /// Two columns of one label set that follow one another (a bound that
+    /// moved) merge onto one index, as the same rows under one index do,
+    /// beside a second stream of those labels and pooled onto a clock as a
+    /// stream other than the clock.
+    #[test]
+    fn columns_that_follow_one_another_merge_onto_one_index() {
+        let split = [(5, 0), (12, 0), (15, 1), (20, 1)];
+        let joined = [(5, 0), (12, 0), (15, 0), (20, 0)];
+        let other = || stream(vec![(30, 30), (40, 40)], "S", (4, 16));
+        let merged = |rows: &[(u64, usize)]| {
+            rows_of_s(HistogramStream::merge(vec![two_columns(rows), other()]).unwrap())
+        };
+        assert_eq!(merged(&split), merged(&joined));
+        let indices: std::collections::BTreeSet<usize> =
+            merged(&split).iter().map(|r| r.1).collect();
+        assert_eq!(indices.len(), 1, "{:?}", merged(&split));
+
+        // Re-stamped onto a clock at 10 and 20: 12 and 15 both take 20, as
+        // one index at one time, which is pooling.
+        let clock = || stream(vec![(10, 10), (20, 20)], "slow", (4, 16));
+        let pooled = |rows: &[(u64, usize)]| {
+            rows_of_s(HistogramStream::merge_on_clock(vec![clock(), two_columns(rows)], 0).unwrap())
+        };
+        assert_eq!(pooled(&split), pooled(&joined));
+        let indices: std::collections::BTreeSet<usize> =
+            pooled(&split).iter().map(|r| r.1).collect();
+        assert_eq!(indices.len(), 1, "{:?}", pooled(&split));
+    }
+
+    /// Two columns of one label set with rows at one time keep two indices
+    /// through a merge, so a reader can refuse the series; rows of one
+    /// column alone keep one.
+    #[test]
+    fn columns_sharing_a_time_merge_onto_two_indices() {
+        let shared = [(5, 0), (10, 0), (10, 1), (15, 1)];
+        let other = stream(vec![(30, 30)], "S", (4, 16));
+        let rows = rows_of_s(HistogramStream::merge(vec![two_columns(&shared), other]).unwrap());
+        let at_10: Vec<usize> = rows.iter().filter(|r| r.0 == 10).map(|r| r.1).collect();
+        assert_eq!(at_10.len(), 2, "{rows:?}");
+        assert_ne!(at_10[0], at_10[1], "{rows:?}");
     }
 
     /// A clock of two series has two rows at each time; the second is the

@@ -333,7 +333,8 @@ impl MemoryStore {
     }
 
     /// Samples ingest put in place of their series' last sample because they
-    /// were at its time (a snapshot ingested twice).
+    /// were at its time (a snapshot given twice, or a second value of one
+    /// series in one snapshot).
     pub fn replaced_samples(&self) -> u64 {
         self.state.memory.read().unwrap().replaced_samples()
     }
