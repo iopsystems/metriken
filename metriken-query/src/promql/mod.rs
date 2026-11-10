@@ -1181,6 +1181,30 @@ impl QueryEngine {
         }
     }
 
+    /// This engine with every source it reads wrapped to check that each
+    /// series' samples are in time order ([`streaming::order`]), for one
+    /// query, and the query's [`Disorder`](streaming::order::Disorder).
+    fn ordered(&self) -> (QueryEngine, Arc<streaming::order::Disorder>) {
+        let disorder = Arc::new(streaming::order::Disorder::default());
+        let wrap = |source: &Arc<dyn DataSource>| -> Arc<dyn DataSource> {
+            Arc::new(streaming::order::Ordered::new(
+                Arc::clone(source),
+                Arc::clone(&disorder),
+            ))
+        };
+        let held = std::sync::OnceLock::new();
+        if let Some(names) = self.held.get() {
+            let _ = held.set(names.clone());
+        }
+        let engine = QueryEngine {
+            source: wrap(&self.source),
+            groups: self.groups.as_ref().map(|g| Arc::new(g.wrapped(&wrap))),
+            names: self.names.clone(),
+            held,
+        };
+        (engine, disorder)
+    }
+
     /// The conflicts in the rows the engine read of its process groups'
     /// sources since the last call (S4): one notice per series and pair of
     /// sources, whichever leaves read the rows.
@@ -1772,7 +1796,14 @@ impl QueryEngine {
         opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
         refuse_archive_options(opts)?;
-        self.evaluate_range(query_str, start, end, step, opts)
+        let (ordered, disorder) = self.ordered();
+        let result = ordered.evaluate_range(query_str, start, end, step, opts);
+        // A series read out of order is refused whatever the evaluation
+        // made of it: its evaluator may have failed on it too.
+        match disorder.take() {
+            Some(error) => Err(error),
+            None => result,
+        }
     }
 
     /// [`query_range_opts`](Self::query_range_opts) in display form; see
@@ -1788,6 +1819,21 @@ impl QueryEngine {
         opts: &QueryOptions,
     ) -> Result<crate::DisplayResult, QueryError> {
         refuse_archive_options(opts)?;
+        let (ordered, disorder) = self.ordered();
+        let result = ordered.display_range(query_str, (start, end, step), display, opts);
+        match disorder.take() {
+            Some(error) => Err(error),
+            None => result,
+        }
+    }
+
+    fn display_range(
+        &self,
+        query_str: &str,
+        (start, end, step): (f64, f64, f64),
+        display: &crate::DisplayOptions,
+        opts: &QueryOptions,
+    ) -> Result<crate::DisplayResult, QueryError> {
         self.evaluate_range_as(
             query_str,
             (start, end, step),

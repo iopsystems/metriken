@@ -357,11 +357,9 @@ impl<'a> CounterGridRate<'a> {
         self.prev_value = Some(sample.value);
         if let Some(last) = self.last_ts {
             if self.spacings.len() < SPACING_PROBE - 1 {
-                // Saturating: two columns joined as one series can step
-                // back in time where the query did not refuse them
-                // (`refuse_duplicated` finds only the overlap the footer's
-                // null counts prove).
-                self.spacings.push(sample.ts.saturating_sub(last));
+                // In time order: a query's sources end a series at a sample
+                // that is not, and refuse the query (`order::Ordered`).
+                self.spacings.push(sample.ts - last);
             }
         }
         self.first_ts.get_or_insert(sample.ts);

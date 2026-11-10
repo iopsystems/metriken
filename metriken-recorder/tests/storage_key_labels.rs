@@ -330,3 +330,78 @@ fn a_sample_whose_series_the_scrape_already_has_is_dropped() {
         }
     }
 }
+
+/// Two series that differ only by `unit` (and a histogram pair only by
+/// `scale`), recorded the old way, at the ticks `a` and `b` hold, beside a
+/// counter served every tick.
+fn sparse(t: u64, a: &dyn Fn(u64) -> bool, b: &dyn Fn(u64) -> bool) -> String {
+    let mut text = format!(
+        "# TYPE other_total counter\nother_total {t}\n# TYPE x_total counter\n# TYPE g gauge\n# TYPE h histogram\n"
+    );
+    for (unit, held, scale) in [("a", a, 1), ("b", b, 10)] {
+        if held(t) {
+            text.push_str(&format!(
+                "x_total{{unit=\"{unit}\"}} {}\ng{{unit=\"{unit}\"}} {}\nh_bucket{{scale=\"{unit}\",le=\"1\"}} {}\nh_bucket{{scale=\"{unit}\",le=\"+Inf\"}} {}\n",
+                scale * t,
+                scale * t,
+                scale * t,
+                scale * t,
+            ));
+        }
+    }
+    text
+}
+
+/// The queries over a joined series whose columns the footer check does
+/// not refuse, each an error naming the series.
+const OUT_OF_ORDER: &[(&str, &str)] = &[
+    ("rate(x_total[3s])", "x_total"),
+    ("irate(x_total[3s])", "x_total"),
+    ("g", "g"),
+    ("avg_over_time(g[3s])", "g"),
+    ("deriv(g[3s])", "g"),
+    ("histogram_quantile(0.5, h)", "h"),
+    ("histogram_irate(h)", "h"),
+];
+
+/// Columns of one label set whose shared rows the footer's null counts do
+/// not prove (`unit="a"` at ticks 0 and 1, `unit="b"` at 1 and 2: four
+/// values in a five-row segment), and columns that share no row but
+/// alternate (`a` at even ticks, `b` at odd): read as one series, their
+/// samples step back in time, which every evaluator refuses on both rate
+/// paths. A histogram's alternating columns are not caught: its rows are
+/// read in time order across columns, so they never step back. A series
+/// read alone still reads.
+#[test]
+fn a_joined_series_the_footer_check_misses_is_refused_where_it_steps_back() {
+    let partial = |t: u64| sparse(t, &|t| t <= 1, &|t| (1..=2).contains(&t));
+    let alternating = |t: u64| sparse(t, &|t| t % 2 == 0, &|t| t % 2 == 1);
+    for (case, text) in [
+        ("partial", &partial as &dyn Fn(u64) -> String),
+        ("alternating", &alternating),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let reader = record(&dir.path().join("a.dendro"), scrapes_of(text, true)).unwrap();
+        for per_series in [false, true] {
+            for (query, name) in OUT_OF_ORDER {
+                // A histogram stream's rows are in time order whatever
+                // column they come from, so alternating columns of `h`
+                // never step back: not caught.
+                if case == "alternating" && *name == "h" {
+                    continue;
+                }
+                let err = match range(&reader, query, per_series) {
+                    Err(e) => e.to_string(),
+                    Ok(r) => panic!("{case} per_series={per_series} {query}: {r:?}"),
+                };
+                assert!(
+                    err.contains(&format!("{name}{{source=\"e\"}}"))
+                        && err.contains("Two columns can hold one label set"),
+                    "{case} per_series={per_series} {query}: {err}"
+                );
+            }
+            let other = matrix(&reader, "rate(other_total[3s])", per_series);
+            assert_eq!(other.len(), 1, "{case}: {other:?}");
+        }
+    }
+}

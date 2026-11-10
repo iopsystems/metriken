@@ -42,8 +42,17 @@ Requires metriken-storage 0.11.1.
   differ only by a label named like a storage key gives this error where
   its queries returned such results; a selector that leaves those series
   out reads as before.
-- **Fixed:** a counter series whose samples step back in time no longer
-  panics the per-series rate in a debug build.
+- **Fixed:** a query reading a series whose samples step back in time (a
+  sample at or before the one before it) is an `EvaluationError` naming the
+  metric and the label set, for every evaluator: `rate` and `irate` on both
+  paths, `deriv`, `*_over_time`, a gauge read, and a histogram's deltas.
+  This is how two columns of one label set read as one series show
+  themselves where the footer check above does not find them (columns that
+  share fewer rows than its null counts prove, or that alternate). In a
+  histogram stream, rows of two columns of one label set at one time count
+  as stepping back; alternating histogram columns, whose rows are read in
+  time order, are not found. Before, such a read gave a wrong rate, or
+  panicked in a debug build.
 - **Fixed:** the error for an exporter name stored under two names over
   an archive offered `<name>{source="..."}` whatever the recordings'
   labels were (#395). It now offers a recording label the recordings
