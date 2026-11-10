@@ -49,6 +49,9 @@ pub struct Memory {
     /// Samples the `upsert_*` methods dropped for a time before their
     /// series' last ([`dropped_samples`](Self::dropped_samples)).
     dropped: u64,
+    /// Samples the `upsert_*` methods put in place of their series' last,
+    /// at its time ([`replaced_samples`](Self::replaced_samples)).
+    replaced: u64,
 }
 
 impl Memory {
@@ -63,14 +66,22 @@ impl Memory {
             sample_timestamps: None,
             duplicated: HashMap::new(),
             dropped: 0,
+            replaced: 0,
         }
     }
 
     /// Samples the `upsert_*` methods dropped because their time was before
-    /// their series' last sample (a wall clock that stepped back). A sample
-    /// at the series' last time replaces that sample instead.
+    /// their series' last sample (a wall clock that stepped back). The
+    /// first is warned of.
     pub fn dropped_samples(&self) -> u64 {
         self.dropped
+    }
+
+    /// Samples the `upsert_*` methods put in place of their series' last
+    /// sample because they were at its time (a snapshot given twice). Not
+    /// warned of: the value replaced is of the same time.
+    pub fn replaced_samples(&self) -> u64 {
+        self.replaced
     }
 
     /// The time of histogram `name`'s last row with `labels`, if it has one.
@@ -100,7 +111,10 @@ impl Memory {
                 self.dropped += 1;
                 Place::Drop
             }
-            Some(last) if ts == last => Place::Replace,
+            Some(last) if ts == last => {
+                self.replaced += 1;
+                Place::Replace
+            }
             _ => Place::Append,
         }
     }
@@ -252,8 +266,11 @@ impl Memory {
             .push(histogram);
     }
 
-    /// Append a counter sample. If a series with matching (name, labels)
-    /// exists, the sample is appended to it; otherwise a new series is created.
+    /// Add a counter sample to the series with (name, labels), creating it
+    /// if absent.
+    /// A sample at the series' last time replaces that sample, counted in
+    /// [`replaced_samples`](Self::replaced_samples); one before it is
+    /// dropped and counted ([`dropped_samples`](Self::dropped_samples)).
     #[cfg(feature = "ingest")]
     pub fn upsert_counter_sample(&mut self, name: &str, labels: Labels, ts: u64, value: u64) {
         let at = self
@@ -278,8 +295,11 @@ impl Memory {
         }
     }
 
-    /// Append a gauge sample. If a series with matching (name, labels)
-    /// exists, the sample is appended to it; otherwise a new series is created.
+    /// Add a gauge sample to the series with (name, labels), creating it if
+    /// absent.
+    /// A sample at the series' last time replaces that sample, counted in
+    /// [`replaced_samples`](Self::replaced_samples); one before it is
+    /// dropped and counted ([`dropped_samples`](Self::dropped_samples)).
     #[cfg(feature = "ingest")]
     pub fn upsert_gauge_sample(&mut self, name: &str, labels: Labels, ts: u64, value: i64) {
         let at = self
@@ -304,11 +324,15 @@ impl Memory {
         }
     }
 
-    /// Append a float counter sample, as
-    /// [`upsert_counter_sample`](Self::upsert_counter_sample) appends an
-    /// integer one. An integer series it is appended to becomes a float
-    /// series (`CounterValues::push_float`). A NaN or infinite value is
-    /// dropped.
+    /// Add a float counter sample to the series with (name, labels),
+    /// creating it if absent, as
+    /// [`upsert_counter_sample`](Self::upsert_counter_sample) adds an integer
+    /// one. An integer series it is added to becomes a float series
+    /// (`CounterValues::push_float`). A NaN or infinite value is dropped,
+    /// and not counted.
+    /// A sample at the series' last time replaces that sample, counted in
+    /// [`replaced_samples`](Self::replaced_samples); one before it is
+    /// dropped and counted ([`dropped_samples`](Self::dropped_samples)).
     #[cfg(feature = "ingest")]
     pub fn upsert_float_counter_sample(&mut self, name: &str, labels: Labels, ts: u64, value: f64) {
         if !value.is_finite() {
@@ -336,10 +360,13 @@ impl Memory {
         }
     }
 
-    /// Append a float gauge sample, as
-    /// [`upsert_gauge_sample`](Self::upsert_gauge_sample) appends an integer
-    /// one. An integer series it is appended to becomes a float series. A
-    /// NaN or infinite value is dropped.
+    /// Add a float gauge sample to the series with (name, labels), creating
+    /// it if absent, as [`upsert_gauge_sample`](Self::upsert_gauge_sample)
+    /// adds an integer one. An integer series it is added to becomes a float
+    /// series. A NaN or infinite value is dropped, and not counted.
+    /// A sample at the series' last time replaces that sample, counted in
+    /// [`replaced_samples`](Self::replaced_samples); one before it is
+    /// dropped and counted ([`dropped_samples`](Self::dropped_samples)).
     #[cfg(feature = "ingest")]
     pub fn upsert_float_gauge_sample(&mut self, name: &str, labels: Labels, ts: u64, value: f64) {
         if !value.is_finite() {
@@ -367,8 +394,11 @@ impl Memory {
         }
     }
 
-    /// Append a histogram sample. If a series with matching (name, labels)
-    /// exists, the sample is appended to it; otherwise a new series is created.
+    /// Add a histogram sample to the series with (name, labels), creating it
+    /// if absent.
+    /// A sample at the series' last time replaces that sample, counted in
+    /// [`replaced_samples`](Self::replaced_samples); one before it is
+    /// dropped and counted ([`dropped_samples`](Self::dropped_samples)).
     #[cfg(feature = "ingest")]
     pub fn upsert_histogram_sample(
         &mut self,
@@ -391,7 +421,8 @@ impl Memory {
     }
 
     /// [`upsert_histogram_sample`](Self::upsert_histogram_sample) for a
-    /// gauge histogram: `snapshot` is the state at `ts`.
+    /// gauge histogram: `snapshot` is the state at `ts`. Replaced and
+    /// dropped samples are counted as there.
     #[cfg(feature = "ingest")]
     pub fn upsert_gauge_histogram_sample(
         &mut self,

@@ -23,10 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshot gave twice. The listings are unchanged and show such a series
   once.
 - **Changed:** `Memory`'s `upsert_*_sample` methods keep each series in
-  time order: a sample at the series' last time replaces that sample, and
-  one before it is dropped and counted (`Memory::dropped_samples`, warned
-  once). They appended either before. `Memory::histogram_last_timestamp`
-  is added.
+  time order: a sample at the series' last time replaces that sample,
+  counted (`Memory::replaced_samples`), and one before it is dropped and
+  counted (`Memory::dropped_samples`, warned once). Before, they appended
+  in both cases. `Memory::histogram_last_timestamp` is added.
 
 ### metriken-query 0.48.1
 
@@ -51,8 +51,9 @@ Requires metriken-storage 0.11.1.
   order, as `Memory`'s upserts now do: a snapshot ingested twice at one
   systemtime replaces the first's values, and one from a wall clock that
   stepped back is dropped until the clock passes the series' last sample,
-  its histogram overflow link included. Without it, the order check below
-  refused every query over such a point.
+  its histogram overflow link included. `MemoryStore::dropped_samples` and
+  `MemoryStore::replaced_samples` count the two. Without it, the order
+  check below refused every query over such a point.
 - **Fixed:** a query reading a series whose samples step back in time (a
   sample at or before the one before it) is an `EvaluationError` naming the
   metric and the label set, for every evaluator: `rate` and `irate` on both
@@ -67,8 +68,8 @@ Requires metriken-storage 0.11.1.
   stream's second index of one label set apart, where they joined every
   index of a label set under one); rows of one index at one time, as a
   pooling of recordings onto one clock gives, do not. Alternating
-  histogram columns, whose rows are read in time order, are not found. Before, such a read gave a wrong rate, or
-  panicked in a debug build.
+  histogram columns, whose rows are read in time order, are not found.
+  Before, such a read gave a wrong rate, or panicked in a debug build.
 - **Fixed:** the error for an exporter name stored under two names over
   an archive offered `<name>{source="..."}` whatever the recordings'
   labels were (#395). It now offers a recording label the recordings

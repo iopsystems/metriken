@@ -464,6 +464,17 @@ fn a_live_store_keeps_each_series_in_time_order() {
         },
         1,
     );
+    // Each snapshot's values: every one of the second copies replaces one,
+    // and the stepped clock's ticks 6 and 7 (at 3 s and 4 s) are dropped
+    // and tick 8 (at 5 s) replaces tick 5's.
+    assert_eq!((once.dropped_samples(), once.replaced_samples()), (0, 0));
+    let per = twice.replaced_samples() / TICKS;
+    assert!(per > 0 && twice.replaced_samples() == per * TICKS);
+    assert_eq!(twice.dropped_samples(), 0);
+    assert_eq!(
+        (stepped.dropped_samples(), stepped.replaced_samples()),
+        (2 * per, per)
+    );
     let queries = [
         "rate(x_total[3s])",
         "irate(x_total[3s])",

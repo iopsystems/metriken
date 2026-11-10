@@ -325,6 +325,19 @@ impl MemoryStore {
         self.state.memory.read().unwrap().histogram_labels(name)
     }
 
+    /// Samples ingest dropped because their time was before their series'
+    /// last sample (a wall clock that stepped back): see
+    /// [`ingest_snapshot`](Self::ingest_snapshot). The first is warned of.
+    pub fn dropped_samples(&self) -> u64 {
+        self.state.memory.read().unwrap().dropped_samples()
+    }
+
+    /// Samples ingest put in place of their series' last sample because they
+    /// were at its time (a snapshot ingested twice).
+    pub fn replaced_samples(&self) -> u64 {
+        self.state.memory.read().unwrap().replaced_samples()
+    }
+
     /// Names of all gauge histogram metrics (sorted, deduplicated).
     pub fn gauge_histogram_names(&self) -> Vec<String> {
         self.state.memory.read().unwrap().gauge_histogram_names()
@@ -534,12 +547,13 @@ impl MetricsSource for MemoryStore {
 impl MemoryStore {
     /// Ingest a single snapshot into the store, at the timestamp the snapshot
     /// carries. Each series stays in time order: a value at a series' last
-    /// time replaces that value (a snapshot ingested twice), and one before
-    /// it is dropped (a wall clock that stepped back; see
-    /// `Memory::dropped_samples`). Every metric in one snapshot shares that timestamp, so they
-    /// align by construction; this used to additionally round it to the
-    /// store's nominal interval, which moved readings the producer had already
-    /// timed exactly.
+    /// time replaces that value (a snapshot ingested twice; see
+    /// [`replaced_samples`](Self::replaced_samples)), and one before it is
+    /// dropped (a wall clock that stepped back; see
+    /// [`dropped_samples`](Self::dropped_samples)). Every metric in one
+    /// snapshot shares that timestamp, so they align by construction; this
+    /// used to additionally round it to the store's nominal interval, which
+    /// moved readings the producer had already timed exactly.
     ///
     /// Float counters and gauges (`Snapshot::float_counters`,
     /// `Snapshot::float_gauges`) are stored as counters and gauges with `f64`
@@ -562,7 +576,7 @@ impl MemoryStore {
         let mut memory = self.state.memory.write().unwrap();
         let ts = raw_ts;
         // Each kind's (name, labels) taken in this snapshot: a second value
-        // of one is joined to the first's series, which the store records
+        // of one replaces the first in its series, and the store records it
         // so a query refuses the series (`DataSource::duplicated_series`).
         // A float value counts with an integer one of its kind.
         let mut taken: [std::collections::HashSet<(String, Labels)>; 4] = Default::default();
