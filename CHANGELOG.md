@@ -14,10 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   histogram's highest finite bucket) set the y-axis minimum to -Infinity.
   ECharts drew that axis as 0 to 1, so every finite point left the chart.
   The rescale now counts only finite values, and on a chart with an OOB
-  band it skips values over `range.max`, which are drawn in the band.
-- **Fixed:** a line or multi-series chart, a decimated band, an uncertainty
-  band, or a percentile chart without `range.max` given ±Infinity drew its
-  y-axis as 0 to 1 at every zoom. Each now draws ±Infinity as a gap, and an
+  band it skips values over `range.max`, which are drawn in the band. This
+  also stops finite values above `range.max` from widening the zoomed axis
+  below the data.
+- **Fixed:** without a range bound on that side, a line or multi-series
+  chart, a decimated band, an uncertainty band, or a percentile chart
+  without `range.max` given ±Infinity drew its y-axis as 0 to 1 at every
+  zoom; with one, it drew the infinity clamped at the bound. Each now draws
+  ±Infinity as a gap, and an
   uncertainty band with an infinite end is not drawn at that point. A
   percentile chart with `range.max` draws +Inf in its OOB band, as before.
   A quantile heatmap's color scale and `heatmapTriplesMinMax` skip
