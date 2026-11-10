@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::histogram_stream::{HistogramRow, HistogramStream, HistogramStreamMeta, Overflow};
 use crate::labels::Labels;
@@ -6,6 +6,10 @@ use crate::labels::Labels;
 use crate::types::HistogramSnapshot;
 use crate::types::{Counter, Counters, Gauge, Gauges, Histogram};
 use crate::DataSource;
+
+/// One histogram series' overflow links by row timestamp: the overflow
+/// counter's name and the highest finite bound.
+type RowLinks = BTreeMap<u64, (String, f64)>;
 
 /// In-memory data source for tests. Callers build `Counter`/`Gauge`/`Histogram`
 /// values directly and hand them in; the source handles time-range filtering on
@@ -17,10 +21,11 @@ pub struct Memory {
     /// Gauge histogram series: stored as histograms are, listed and read
     /// apart (`DataSource::gauge_histogram_stream`).
     gauge_histograms: HashMap<String, Vec<Histogram>>,
-    /// Per histogram name and series labels: its overflow counter's name
-    /// and the histogram's highest finite bound
-    /// ([`set_histogram_overflow`](Self::set_histogram_overflow)).
-    histogram_overflows: HashMap<String, HashMap<Labels, (String, f64)>>,
+    /// Per histogram name, series labels and row timestamp: the row's
+    /// overflow counter's name and highest finite bound
+    /// ([`set_histogram_overflow`](Self::set_histogram_overflow)). A row
+    /// with no entry has no overflow.
+    histogram_overflows: HashMap<String, HashMap<Labels, RowLinks>>,
     interval_ms: u64,
     /// The row timestamps a caller declared, if it did. See
     /// [`DataSource::sample_timestamps`]; a source assembled from a table
@@ -72,29 +77,34 @@ impl Memory {
             .push(histogram);
     }
 
-    /// Name the overflow series of histogram `name`'s series `labels`: the
-    /// counter `overflow` with the same labels, whose value at a histogram
-    /// row's timestamp is that row's overflow, above `bound`. What a
-    /// histogram column's [`OVERFLOW_KEY`](crate::OVERFLOW_KEY) and
-    /// [`OVERFLOW_BOUND_KEY`](crate::OVERFLOW_BOUND_KEY) say in a recording.
+    /// Name the overflow series of histogram `name`'s series `labels` for
+    /// its row at `ts`: the counter `overflow` with the same labels, whose
+    /// value at `ts` is that row's overflow, above `bound`. What a histogram
+    /// column's [`OVERFLOW_KEY`](crate::OVERFLOW_KEY) and
+    /// [`OVERFLOW_BOUND_KEY`](crate::OVERFLOW_BOUND_KEY) say in a recording,
+    /// for one row: a row named by no call has no overflow, as a recorded
+    /// row of a column without the keys has none.
     pub fn set_histogram_overflow(
         &mut self,
         name: &str,
         labels: Labels,
+        ts: u64,
         overflow: &str,
         bound: f64,
     ) {
         self.histogram_overflows
             .entry(name.to_string())
             .or_default()
-            .insert(labels, (overflow.to_string(), bound));
+            .entry(labels)
+            .or_default()
+            .insert(ts, (overflow.to_string(), bound));
     }
 
-    /// The overflow of histogram `name`'s series `labels` at `ts`, when the
-    /// series names an overflow counter and that counter has a sample at
+    /// The overflow of histogram `name`'s series `labels` at `ts`, when its
+    /// row there names an overflow counter and that counter has a sample at
     /// `ts`.
     fn overflow_at(&self, name: &str, labels: &Labels, ts: u64) -> Option<Overflow> {
-        let (counter, bound) = self.histogram_overflows.get(name)?.get(labels)?;
+        let (counter, bound) = self.histogram_overflows.get(name)?.get(labels)?.get(&ts)?;
         let series = self
             .counters
             .get(counter)?

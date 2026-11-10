@@ -591,3 +591,151 @@ fn pooled_series_with_different_bounds_take_the_lowest() {
         OVER.1,
     );
 }
+
+/// [`one_series`], with the exporter serving its own counter
+/// `lat_overflow` (1000 a tick) from tick 6: the collision starts mid-run.
+fn collision_from_6(t: u64) -> String {
+    let mut text = one_series(t);
+    if t >= 6 {
+        text.push_str(&format!(
+            "# TYPE lat_overflow counter\nlat_overflow {}\n",
+            1000 * t
+        ));
+    }
+    text
+}
+
+/// `text` scraped once a second into a live `MemoryStore`.
+fn live(text: &dyn Fn(u64) -> String) -> metriken_query::MemoryStore {
+    let store = metriken_query::MemoryStore::builder()
+        .sampling_interval_ms(1000)
+        .build();
+    let mut converter = PrometheusConverter::new();
+    for t in 0..TICKS {
+        let ts = BASE + t * S;
+        let mut snapshot = converter.convert(&text(t), ts - S / 2, ts);
+        let Snapshot::V3(v3) = &mut snapshot else {
+            panic!("a scrape is a V3 snapshot")
+        };
+        v3.systemtime = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(ts);
+        store.ingest_snapshot(snapshot);
+    }
+    store
+}
+
+/// A query's points, `(value, band)`, from a result.
+fn result_points(query: &str, result: QueryResult) -> Vec<(f64, (f64, f64))> {
+    let QueryResult::Matrix { result, .. } = result else {
+        panic!("{query}: not a matrix")
+    };
+    result
+        .into_iter()
+        .flat_map(|m| {
+            let bands = m.intervals.unwrap_or_else(|| panic!("{query}: no bands"));
+            m.values
+                .into_iter()
+                .map(|(_, v)| v)
+                .zip(bands)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// A query and the test every point of its recorded answer must pass.
+type Expect<'a> = (&'a str, &'a dyn Fn(&(f64, (f64, f64))) -> bool);
+
+/// The live store and the recording of the same scrapes answer `queries`
+/// alike, and the recording's answer to each is `want` at every point.
+fn live_matches_recording(text: &dyn Fn(u64) -> String, queries: &[Expect]) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    simple(&path, text, false);
+    let reader = open(&path);
+    let store = live(text);
+    let (lo, hi) = ((BASE / S) as f64, (BASE / S + TICKS - 1) as f64);
+    for (q, want) in queries {
+        let recorded = result_points(q, reader.query_range(q, lo, hi, 1.0).unwrap());
+        let lived = result_points(q, store.query_range(q, lo, hi, 1.0).unwrap());
+        assert!(!recorded.is_empty(), "{q}");
+        assert!(recorded.iter().all(want), "{q}: recorded {recorded:?}");
+        assert_eq!(lived, recorded, "{q}: live, then recorded");
+    }
+}
+
+/// A collision that starts mid-run: from tick 6 the histogram has no
+/// overflow, live as recorded, and the exporter's own `lat_overflow` is
+/// never read as one.
+#[test]
+fn the_live_store_follows_a_collision_that_starts_mid_run() {
+    live_matches_recording(
+        &collision_from_6,
+        &[
+            ("histogram_quantile(0.5, lat)", &|p| *p == ONE),
+            ("histogram_quantile(0.95, lat)", &|p| {
+                *p == OVER || *p == TEN
+            }),
+        ],
+    );
+}
+
+/// A bound that moves from 10 to 20 at tick 8: each live row keeps its own
+/// bound, as the recording's do.
+#[test]
+fn the_live_store_keeps_each_rows_bound() {
+    let text = moving_top("");
+    live_matches_recording(
+        &text,
+        &[("histogram_quantile(0.95, lat)", &|p| {
+            p.0 == f64::INFINITY && (p.1 == (10.0, f64::INFINITY) || p.1 == (20.0, f64::INFINITY))
+        })],
+    );
+}
+
+/// A bound that moves from 10 to 20 at tick 8 keeps each row's bound
+/// through a stride window and through a process-group combine: the first
+/// point is above 10, the last above 20.
+#[test]
+fn a_stride_and_a_combine_keep_each_rows_bound() {
+    let text = moving_top("");
+    let ends = |q: &str, got: &[(f64, (f64, f64))]| {
+        assert!(got.iter().all(|p| p.0 == f64::INFINITY), "{q}: {got:?}");
+        assert_eq!(
+            got.first().unwrap().1,
+            (10.0, f64::INFINITY),
+            "{q}: {got:?}"
+        );
+        assert_eq!(got.last().unwrap().1, (20.0, f64::INFINITY), "{q}: {got:?}");
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    simple(&path, &text, false);
+    let reader = open(&path);
+    let q = "histogram_quantiles([0.95], lat, 3)";
+    ends(q, &points(&reader, q));
+
+    let path = dir.path().join("b.dendro");
+    record(
+        &path,
+        &[
+            Rec {
+                source: "exporter",
+                text: &text,
+                ticks: 0..7,
+                old: false,
+                epoch: Some("e"),
+            },
+            Rec {
+                source: "exporter",
+                text: &text,
+                ticks: 4..TICKS,
+                old: false,
+                epoch: Some("e"),
+            },
+        ],
+    );
+    let reader = open(&path);
+    assert_eq!(reader.process_groups().groups.len(), 1);
+    let q = "histogram_quantile(0.95, lat)";
+    ends(q, &points(&reader, q));
+}

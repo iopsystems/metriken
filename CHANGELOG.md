@@ -19,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counter has a value with the same labels in the same row; merging,
   re-stamping and rebucketing carry it unchanged.
   `Memory::set_histogram_overflow` names a histogram series' overflow
-  counter for the in-memory source.
+  counter and bound for one row (its timestamp) in the in-memory source,
+  as a recorded row's column does; a row it does not name has none.
 - **Changed (breaking):** `STORAGE_KEYS` adds `overflow` and
   `overflow_bound` (`OVERFLOW_KEY`, `OVERFLOW_BOUND_KEY`), so neither is a
   label. A reader on metriken-storage 0.9.0 or earlier shows them as two
@@ -56,8 +57,9 @@ Requires metriken-storage 0.10.0.
   HTTP API writes it, where it was `null`; deserialization reads numbers
   and these strings. Finite values are numbers as before.
 - **Added:** `MemoryStore::ingest_snapshot` takes a histogram's overflow
-  link from its metadata, so the live path counts the overflow as a
-  recording does.
+  link and bound from each snapshot's metadata for that row, so the live
+  path counts the overflow as a recording does, including when the link
+  goes away or the bound changes mid-run.
 
 ### metriken-recorder 0.11.0
 

@@ -590,7 +590,7 @@ impl MemoryStore {
                     .and_then(|b| b.parse::<f64>().ok()),
             );
             if let Some((counter, bound)) = overflow {
-                memory.set_histogram_overflow(&name, labels.clone(), counter, bound);
+                memory.set_histogram_overflow(&name, labels.clone(), ts, counter, bound);
             }
             memory.upsert_histogram_sample(&name, labels, config, ts, snap);
         }

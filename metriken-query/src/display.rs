@@ -182,7 +182,7 @@ pub enum DisplayResult {
     #[serde(rename = "scalar")]
     Scalar {
         /// `(timestamp, value)`; a non-finite value is a string, as in
-        /// [`QueryResult`](crate::QueryResult)'s JSON.
+        /// [`QueryResult`]'s JSON.
         #[serde(with = "crate::promql::json_f64::pair")]
         result: (f64, f64),
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

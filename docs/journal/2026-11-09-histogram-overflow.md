@@ -190,9 +190,11 @@ All four as recommended.
   and so its column metadata, changed within it); they name the same
   counter, which is read once and goes to each column's rows with that
   column's bound.
-  `Memory` (the live path) records the link from the ingested metadata
-  (`set_histogram_overflow`) and attaches the counter's sample at the
-  histogram row's timestamp. The names index is written as `MNI2`; an
+  `Memory` (the live path) records the link and bound per histogram row
+  from that row's ingested metadata (`set_histogram_overflow`, keyed by
+  timestamp) and attaches the counter's sample at the row's timestamp, so
+  a link that goes away (a collision that starts) or a bound that moves
+  applies from that row on, as in a recording. The names index is written as `MNI2`; an
   `MNI1` index is still read, and its columns frame's label sets lose any
   key that is a storage key now, which is what a read of the segment's
   footer gives.
@@ -230,4 +232,7 @@ All four as recommended.
 5. Review fixes (2026-11-09): one counter read for every histogram column
    of its series in a segment; a histogram counted in the name collision;
    fractional overflow counts rounded before differencing; display JSON
-   through `json_f64`.
+   through `json_f64`. Second round: the live store's link per row, not
+   per series (tested live against the recording with a collision that
+   starts mid-run and a bound that moves); a stride and a combine across a
+   bound move keep each row's bound.

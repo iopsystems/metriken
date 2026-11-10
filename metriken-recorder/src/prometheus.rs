@@ -24,7 +24,7 @@ use tracing::{debug, warn};
 /// bound, which only its `+Inf` bucket counts, are the float counter
 /// `<name>_overflow` with the histogram's labels, which the histogram's
 /// column names ([`OVERFLOW_KEY`], with its highest finite bound as
-/// [`OVERFLOW_BOUND_KEY`]); see [`convert_histogram`].
+/// [`OVERFLOW_BOUND_KEY`]); see `convert_histogram`.
 ///
 /// Maintains a stable mapping from (metric_name, labels) to numeric IDs across
 /// scrapes within a recording session, ensuring consistent column identity.
