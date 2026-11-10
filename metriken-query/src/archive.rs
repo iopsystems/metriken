@@ -693,16 +693,66 @@ fn resolve_names(
                 continue;
             }
             let label = metriken_storage::PROMETHEUS_NAME_LABEL;
-            let found: Vec<String> = candidates
+            let mut found: Vec<String> = candidates
                 .into_iter()
                 .filter(|c| reach.iter().any(|t| t.holds_labeled(c, label, name)))
                 .collect();
-            if let Some(stored) = crate::promql::prometheus_names::one_of(name, found, true)? {
+            if found.len() > 1 {
+                // Under `Precedence::Series` a recording-label matcher does
+                // not choose recordings, so none is offered.
+                let holding: Vec<Vec<&metriken_storage::Labels>> = found
+                    .iter()
+                    .map(|c| {
+                        reach
+                            .iter()
+                            .filter(|t| t.holds_labeled(c, label, name))
+                            .map(|t| labels.of(t))
+                            .collect()
+                    })
+                    .collect();
+                let offered = match precedence {
+                    Precedence::Recording => distinguishing_label(&holding),
+                    Precedence::Series => None,
+                };
+                let offered = offered.as_ref().map(|(k, v)| (k.as_str(), v.as_str()));
+                return Err(crate::promql::prometheus_names::ambiguous(
+                    name, &found, offered,
+                ));
+            }
+            if let Some(stored) = found.pop() {
                 names.insert(key, stored);
             }
         }
     }
     Ok(names)
+}
+
+/// A recording label whose values tell apart the recordings holding each
+/// candidate (`holding[i]`, the labels of each recording holding candidate
+/// `i`), with the value the first candidate's first recording has: every
+/// recording holding a candidate carries the key, and no value is carried
+/// by recordings of two candidates. The first such key in order; `None`
+/// when none does. Internal labels (`__recording__`) are not offered.
+fn distinguishing_label(holding: &[Vec<&metriken_storage::Labels>]) -> Option<(String, String)> {
+    let keys: std::collections::BTreeSet<&String> = holding
+        .iter()
+        .flatten()
+        .flat_map(|l| l.inner.keys())
+        .filter(|k| !metriken_storage::is_internal_label(k))
+        .collect();
+    keys.into_iter().find_map(|key| {
+        let mut owner: HashMap<&String, usize> = HashMap::new();
+        for (i, recordings) in holding.iter().enumerate() {
+            for labels in recordings {
+                let value = labels.inner.get(key)?;
+                if *owner.entry(value).or_insert(i) != i {
+                    return None;
+                }
+            }
+        }
+        let value = holding.first()?.first()?.inner.get(key)?;
+        Some((key.clone(), value.clone()))
+    })
 }
 
 /// The span `scope` reads of `table`'s source: `None` when the scope does

@@ -357,6 +357,8 @@ impl<'a> CounterGridRate<'a> {
         self.prev_value = Some(sample.value);
         if let Some(last) = self.last_ts {
             if self.spacings.len() < SPACING_PROBE - 1 {
+                // In time order: a query's sources end a series at a sample
+                // that is not, and refuse the query (`order::Ordered`).
                 self.spacings.push(sample.ts - last);
             }
         }

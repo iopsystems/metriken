@@ -1050,6 +1050,62 @@ pub(crate) fn extract_filter_labels(matchers: &[Matcher]) -> Labels {
     filter_labels
 }
 
+/// An error when `filter` matches a series of metric `name` that more than
+/// one column of one kind holds within one table of `source`, or that one
+/// snapshot gave a live store twice
+/// ([`DataSource::duplicated_series`]): a read would join their samples
+/// into one series, which no rate, gauge or histogram read gives a correct
+/// answer for. It names the metric and the series' label set.
+pub(crate) fn refuse_duplicated(
+    source: &dyn DataSource,
+    name: &str,
+    filter: &Labels,
+) -> Result<(), QueryError> {
+    let duplicated = source.duplicated_series(name);
+    let Some(labels) = duplicated
+        .into_iter()
+        .find(|set| Labels::from(set.clone()).matches(filter))
+    else {
+        return Ok(());
+    };
+    Err(joined_series(
+        name,
+        labels.iter(),
+        "is two or more stored series with one label set (columns of one table, or values \
+         of one snapshot), and reading them as one series interleaves their samples",
+    ))
+}
+
+/// The error for series `name` with `labels` read as one series from two
+/// or more stored ones: `what` says how it was found. The footer check
+/// ([`refuse_duplicated`]) and the readers that find a series' samples out
+/// of time order give it.
+pub(crate) fn joined_series<'a>(
+    name: &str,
+    labels: impl Iterator<Item = (&'a String, &'a String)>,
+    what: &str,
+) -> QueryError {
+    let mut shown: Vec<String> = labels
+        .filter(|(k, _)| k.as_str() != "__name__")
+        .map(|(k, v)| format!("{k}={v:?}"))
+        .collect();
+    shown.sort();
+    // `metric` is the name: columns that differ by it are other series.
+    let keys: Vec<&str> = metriken_storage::STORAGE_KEYS
+        .iter()
+        .copied()
+        .filter(|k| *k != "metric")
+        .collect();
+    QueryError::EvaluationError(format!(
+        "the series {name}{{{}}} {what}. Two columns can hold one label set when they differ \
+         only by a key that is not a label ({}), as an exporter label with one of those names \
+         recorded under that key does. Select other series of {name} with a label matcher; \
+         metriken-recorder 0.13.0 and later store such a label as exported_<key>",
+        shown.join(", "),
+        keys.join(", "),
+    ))
+}
+
 impl QueryEngine {
     pub(crate) fn new(source: Arc<dyn DataSource>) -> Self {
         Self {
@@ -1083,10 +1139,31 @@ impl QueryEngine {
         }
     }
 
+    /// [`stored_name`](Self::stored_name), refusing the selector when the
+    /// series it reads include one that two columns of one table hold
+    /// ([`refuse_duplicated`]).
+    fn selector_name(&self, name: &str, filter: &Labels) -> Result<Option<String>, QueryError> {
+        let stored = self.stored_name(name, filter)?;
+        match &stored {
+            Some(stored) => refuse_duplicated(
+                &*self.source,
+                stored,
+                &prometheus_names::renamed_filter(filter.clone(), name),
+            )?,
+            None => refuse_duplicated(&*self.source, name, filter)?,
+        }
+        Ok(stored)
+    }
+
     /// `expr`'s selectors pointed at stored names where they name a series
-    /// by its exporter name.
+    /// by its exporter name, and an error for a selector matching a
+    /// series two columns of one table hold.
     pub(crate) fn resolve_names(&self, expr: &mut Expr) -> Result<(), QueryError> {
-        prometheus_names::resolve_selectors(expr, &|name, filter| self.stored_name(name, filter))
+        prometheus_names::resolve_selectors(
+            expr,
+            &|name, filter| self.selector_name(name, filter),
+            &|name, filter| refuse_duplicated(&*self.source, name, filter),
+        )
     }
 
     /// An engine over `source`, some of whose recordings form the process
@@ -1102,6 +1179,36 @@ impl QueryEngine {
             names: None,
             held: std::sync::OnceLock::new(),
         }
+    }
+
+    /// This engine with every source it reads wrapped to check that each
+    /// series' samples are in time order ([`streaming::order`]), for one
+    /// query, and the query's [`Disorder`](streaming::order::Disorder).
+    fn ordered(&self) -> (QueryEngine, Arc<streaming::order::Disorder>) {
+        let disorder = Arc::new(streaming::order::Disorder::default());
+        let wrap = |source: &Arc<dyn DataSource>| -> Arc<dyn DataSource> {
+            Arc::new(streaming::order::Ordered::new(
+                Arc::clone(source),
+                Arc::clone(&disorder),
+            ))
+        };
+        // Filled here, on the engine that lives on, so a reader's engine
+        // lists its names once rather than once per query. An engine with
+        // `names` resolves without them.
+        let held = std::sync::OnceLock::new();
+        if self.names.is_none() {
+            let names = self
+                .held
+                .get_or_init(|| prometheus_names::held_names(&*self.source));
+            let _ = held.set(names.clone());
+        }
+        let engine = QueryEngine {
+            source: wrap(&self.source),
+            groups: self.groups.as_ref().map(|g| Arc::new(g.wrapped(&wrap))),
+            names: self.names.clone(),
+            held,
+        };
+        (engine, disorder)
     }
 
     /// The conflicts in the rows the engine read of its process groups'
@@ -1232,7 +1339,7 @@ impl QueryEngine {
     /// series by its exporter name.
     fn parse_metric_selector(&self, selector: &str) -> Result<(String, Labels), QueryError> {
         let (name, filter) = self.parse_metric_selector_as_written(selector)?;
-        Ok(match self.stored_name(&name, &filter)? {
+        Ok(match self.selector_name(&name, &filter)? {
             Some(stored) => (stored, prometheus_names::renamed_filter(filter, &name)),
             None => (name, filter),
         })
@@ -1695,7 +1802,14 @@ impl QueryEngine {
         opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
         refuse_archive_options(opts)?;
-        self.evaluate_range(query_str, start, end, step, opts)
+        let (ordered, disorder) = self.ordered();
+        let result = ordered.evaluate_range(query_str, start, end, step, opts);
+        // A series read out of order is refused whatever the evaluation
+        // made of it: its evaluator may have failed on it too.
+        match disorder.take() {
+            Some(error) => Err(error),
+            None => result,
+        }
     }
 
     /// [`query_range_opts`](Self::query_range_opts) in display form; see
@@ -1711,6 +1825,21 @@ impl QueryEngine {
         opts: &QueryOptions,
     ) -> Result<crate::DisplayResult, QueryError> {
         refuse_archive_options(opts)?;
+        let (ordered, disorder) = self.ordered();
+        let result = ordered.display_range(query_str, (start, end, step), display, opts);
+        match disorder.take() {
+            Some(error) => Err(error),
+            None => result,
+        }
+    }
+
+    fn display_range(
+        &self,
+        query_str: &str,
+        (start, end, step): (f64, f64, f64),
+        display: &crate::DisplayOptions,
+        opts: &QueryOptions,
+    ) -> Result<crate::DisplayResult, QueryError> {
         self.evaluate_range_as(
             query_str,
             (start, end, step),

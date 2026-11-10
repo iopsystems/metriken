@@ -44,6 +44,12 @@ use tracing::{debug, warn};
 /// stored under its own names, unscaled, from that scrape on for the life
 /// of the converter, so a histogram's buckets and `_sum` stay in one unit.
 ///
+/// An exporter label whose key is a storage key
+/// ([`metriken_storage::STORAGE_KEYS`]: `unit`, `scale`, `metric`, …) is
+/// stored as `exported_<key>`, prefixed again while the series carries that
+/// key already, as Prometheus does for a label colliding with a target
+/// label; see `rename_storage_keys`.
+///
 /// Maintains a stable mapping from (metric_name, labels) to numeric IDs across
 /// scrapes within a recording session, ensuring consistent column identity.
 pub struct PrometheusConverter {
@@ -64,6 +70,10 @@ pub struct PrometheusConverter {
     /// a sample of the same name and labels. Logged at `warn` once per
     /// converter, later at `debug`.
     overflow_collision_warned: bool,
+    /// A sample was dropped because the scrape already had one of the same
+    /// stored name and labels. Logged at `warn` once per converter, later at
+    /// `debug`.
+    repeat_warned: bool,
     /// Families (exporter names without a `_bucket`, `_sum`, `_count` or
     /// `_total` suffix) stored under their own names, unscaled, because a
     /// member's normalized name collided with another's in some scrape.
@@ -97,6 +107,7 @@ impl PrometheusConverter {
             descriptions_changed: false,
             skips_warned: false,
             overflow_collision_warned: false,
+            repeat_warned: false,
             keep_original: HashSet::new(),
             unit_collision_warned: false,
         }
@@ -147,6 +158,19 @@ impl PrometheusConverter {
         // converter is one endpoint), and an exporter's own `source` label
         // is kept.
         metadata
+    }
+
+    fn log_repeat(&mut self, name: &str) {
+        if self.repeat_warned {
+            debug!("the scrape has {name} twice with one label set: the later sample is dropped");
+        } else {
+            self.repeat_warned = true;
+            warn!(
+                "the scrape has {name} twice with one label set (served twice, or an \
+                 exported_<key> label beside a label <key> stored as exported_<key>): the \
+                 later sample is dropped (later scrapes log at debug)"
+            );
+        }
     }
 
     fn log_overflow_collision(&mut self, name: &str) {
@@ -300,6 +324,7 @@ impl PrometheusConverter {
             // and the factor every value is multiplied by.
             let normalized = plan.get(&sample.metric).and_then(Option::as_ref);
             let mut labels = sample.labels;
+            rename_storage_keys(&mut labels);
             let (name, unit, factor) = match normalized {
                 Some(n) => {
                     if n.name != sample.metric {
@@ -311,10 +336,20 @@ impl PrometheusConverter {
                 }
                 None => (sample.metric.clone(), None, 1.0),
             };
-            taken.insert(MetricKey {
+            // One series is one column: a second sample of it in this scrape
+            // (a line served twice, or `exported_<key>` beside a `<key>` the
+            // rename moved there) would give the column two values in one
+            // row, which the segment encoder refuses. The first value
+            // accepted is kept: a key is taken once a value is stored, so a
+            // NaN or an unconvertible histogram does not take it.
+            let key = MetricKey {
                 name: name.clone(),
                 labels: labels.clone(),
-            });
+            };
+            if taken.contains(&key) {
+                self.log_repeat(&name);
+                continue;
+            }
             let metadata = |this: &Self, labels: &[(String, String)]| {
                 let mut metadata = this.build_metadata(&name, labels);
                 if let Some(unit) = unit {
@@ -333,6 +368,7 @@ impl PrometheusConverter {
                         FloatCounter::new(id, v * factor, metadata(self, &labels))
                             .with_window(window),
                     );
+                    taken.insert(key);
                 }
                 Value::Gauge(v) => {
                     if !v.is_finite() {
@@ -343,6 +379,7 @@ impl PrometheusConverter {
                         FloatGauge::new(id, v * factor, metadata(self, &labels))
                             .with_window(window),
                     );
+                    taken.insert(key);
                 }
                 Value::Untyped(v) => {
                     if !v.is_finite() {
@@ -364,6 +401,7 @@ impl PrometheusConverter {
                     } else {
                         gauges.push(FloatGauge::new(id, v * factor, metadata).with_window(window));
                     }
+                    taken.insert(key);
                 }
                 Value::Histogram(ref buckets) => {
                     if let Some((h, mut metadata, overflow)) =
@@ -374,14 +412,11 @@ impl PrometheusConverter {
                         }
                         let id = self.get_or_assign_id(&name, &labels);
                         if let Some(overflow) = overflow {
-                            let key = MetricKey {
-                                name: name.clone(),
-                                labels: labels.clone(),
-                            };
-                            overflows.push((key, overflow, histograms.len()));
+                            overflows.push((key.clone(), overflow, histograms.len()));
                         }
                         histograms
                             .push(SnapshotHistogram::new(id, h, metadata).with_window(window));
+                        taken.insert(key);
                     }
                 }
                 Value::Summary(ref quantiles) => {
@@ -398,6 +433,7 @@ impl PrometheusConverter {
                             FloatGauge::new(id, quantile.count * factor, metadata(self, &q_labels))
                                 .with_window(window),
                         );
+                        taken.insert(key.clone());
                     }
                 }
             }
@@ -666,6 +702,43 @@ fn compute_generic_scale(bounds: impl Iterator<Item = f64>) -> f64 {
 
 /// The `unit` storage key.
 const UNIT_KEY: &str = "unit";
+
+/// Move each exporter label whose key is a storage key
+/// ([`metriken_storage::is_storage_key`]: `unit`, `metric`, `scale`, …)
+/// to `exported_<key>`, or, when the series already carries that key,
+/// to the first of `exported_exported_<key>`, … it does not. This is the
+/// rule Prometheus applies to an exposed label that collides with a
+/// target label (`honor_labels: false`): a key the series already
+/// carries is never displaced.
+///
+/// A reader drops storage keys from a column's labels, so without this
+/// two series that differ only by such a label were stored as two columns
+/// with one label set, and an exporter label named `metric` replaced the
+/// series' name. `labels` stays sorted by key.
+fn rename_storage_keys(labels: &mut Vec<(String, String)>) {
+    if !labels
+        .iter()
+        .any(|(k, _)| metriken_storage::is_storage_key(k))
+    {
+        return;
+    }
+    let (moving, kept): (Vec<_>, Vec<_>) = std::mem::take(labels)
+        .into_iter()
+        .partition(|(k, _)| metriken_storage::is_storage_key(k));
+    let mut keys: HashSet<String> = kept.iter().map(|(k, _)| k.clone()).collect();
+    *labels = kept;
+    for (key, value) in moving {
+        let mut name = key;
+        loop {
+            name = format!("{}{name}", metriken_storage::labeled::EXPORTED_PREFIX);
+            if keys.insert(name.clone()) {
+                break;
+            }
+        }
+        labels.push((name, value));
+    }
+    labels.sort();
+}
 
 /// The `# UNIT` value for exporter name `name`: its own, or its family's
 /// (the name without one of the [`SUFFIXES`](metriken_storage::prometheus_units::SUFFIXES)).
@@ -1102,6 +1175,109 @@ b 3
         // A metric appearing IS a membership change, and must re-anchor.
         let grown = hash_of(conv.convert(&many(&[1; 13]), 5_000, 6_000));
         assert_ne!(first, grown, "a new metric changes the membership");
+    }
+
+    /// Each series' metadata from one scrape of `text`.
+    fn metadata_of(text: &str) -> Vec<HashMap<String, String>> {
+        let mut snap = PrometheusConverter::new().convert(text, 0, 1);
+        snap.float_counters()
+            .into_iter()
+            .map(|c| c.metadata)
+            .chain(snap.float_gauges().into_iter().map(|g| g.metadata))
+            .chain(snap.histograms().into_iter().map(|h| h.metadata))
+            .collect()
+    }
+
+    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// An exporter label whose key is a storage key is stored as
+    /// `exported_<key>`, and as `exported_exported_<key>` when the series
+    /// also carries `exported_<key>`, which keeps its own value. A label
+    /// named `metric` no longer replaces the series' name.
+    #[test]
+    fn a_label_named_like_a_storage_key_is_stored_as_exported() {
+        let text = "\
+# TYPE x_total counter
+x_total{unit=\"a\"} 1
+x_total{unit=\"b\",exported_unit=\"own\"} 2
+x_total{metric=\"m\",metric_type=\"t\",scale=\"s\"} 3
+";
+        let all = metadata_of(text);
+        for want in [
+            map(&[("metric", "x_total"), ("exported_unit", "a")]),
+            map(&[
+                ("metric", "x_total"),
+                ("exported_unit", "own"),
+                ("exported_exported_unit", "b"),
+            ]),
+            map(&[
+                ("metric", "x_total"),
+                ("exported_metric", "m"),
+                ("exported_metric_type", "t"),
+                ("exported_scale", "s"),
+            ]),
+        ] {
+            assert!(all.contains(&want), "{want:?} in {all:?}");
+        }
+        assert_eq!(all.len(), 3, "{all:?}");
+    }
+
+    /// The rule holds for a histogram, whose own storage keys are written
+    /// beside the exporter's, for its overflow series, for a summary's
+    /// quantiles, and for a series renamed for its unit, whose `unit` is
+    /// the normalized one.
+    #[test]
+    fn every_series_of_a_family_takes_the_exported_label() {
+        let text = "\
+# TYPE lat_seconds histogram
+lat_seconds_bucket{scale=\"x\",le=\"0.5\"} 1
+lat_seconds_bucket{scale=\"x\",le=\"+Inf\"} 2
+# TYPE q summary
+q{unit=\"u\",quantile=\"0.5\"} 4
+# TYPE g_seconds gauge
+g_seconds{unit=\"u\"} 5
+";
+        let all = metadata_of(text);
+        let find = |name: &str| -> Vec<&HashMap<String, String>> {
+            all.iter().filter(|m| m["metric"] == name).collect()
+        };
+        let lat = find("lat_nanoseconds");
+        assert_eq!(lat.len(), 1, "{all:?}");
+        assert_eq!(lat[0]["exported_scale"], "x");
+        assert_eq!(lat[0][OVERFLOW_KEY], "lat_nanoseconds_overflow");
+        assert!(!lat[0].contains_key(SCALE_KEY), "{:?}", lat[0]);
+        let overflow = find("lat_nanoseconds_overflow");
+        assert_eq!(overflow.len(), 1, "{all:?}");
+        assert_eq!(overflow[0]["exported_scale"], "x");
+        assert!(!overflow[0].contains_key("scale"), "{:?}", overflow[0]);
+        let q = find("q");
+        assert_eq!(q.len(), 1, "{all:?}");
+        assert_eq!(q[0]["exported_unit"], "u");
+        assert_eq!(q[0]["quantile"], "0.5");
+        assert!(!q[0].contains_key(UNIT_KEY), "{:?}", q[0]);
+        let g = find("g_nanoseconds");
+        assert_eq!(g.len(), 1, "{all:?}");
+        assert_eq!(g[0]["exported_unit"], "u");
+        assert_eq!(g[0][UNIT_KEY], "nanoseconds");
+        assert_eq!(g[0][PROMETHEUS_NAME_LABEL], "g_seconds");
+    }
+
+    /// A repeated series keeps its first value the converter accepts: a
+    /// NaN first sample is dropped and does not take the series from the
+    /// finite one after it.
+    #[test]
+    fn a_dropped_first_sample_does_not_take_its_series() {
+        let mut snap =
+            PrometheusConverter::new().convert("x_total NaN\nx_total 5\ny NaN\ny 7\ny 8\n", 0, 1);
+        let counters: Vec<f64> = snap.float_counters().iter().map(|c| c.value).collect();
+        let gauges: Vec<f64> = snap.float_gauges().iter().map(|g| g.value).collect();
+        assert_eq!(counters, [5.0]);
+        assert_eq!(gauges, [7.0]);
     }
 
     /// A wall clock that steps backwards mid-scrape (NTP, a VM migration) must

@@ -26,6 +26,14 @@ use regex::Regex;
 /// version as well (`names.rs`), unless the version it joins has not been
 /// released yet.
 ///
+/// A column whose metadata holds one of these keys as a series label is
+/// read without it. Two columns that differ only by such a key therefore
+/// have one label set; where they hold values in the same rows, a reader
+/// reports the series through
+/// [`DataSource::duplicated_series`](crate::DataSource::duplicated_series).
+/// metriken-recorder's Prometheus converter stores an exporter label whose
+/// key is in this list as `exported_<key>`, so its columns do not.
+///
 /// A slice rather than an array so that adding a key is not a change to a
 /// public type.
 pub const STORAGE_KEYS: &[&str] = &[

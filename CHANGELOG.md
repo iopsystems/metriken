@@ -7,6 +7,118 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-storage 0.11.1
+
+- **Added:** `DataSource::duplicated_series`: the label sets of a metric's
+  series that more than one column of one kind holds within one parquet
+  file or segment, where the footer's null counts show the columns holding
+  values in one row, which a read joins into one series. Such columns
+  differ only by a storage key: metriken-recorder 0.12.0 and earlier
+  stored an exporter label named `unit`, `scale` or another key in
+  `STORAGE_KEYS` under that key (#394). Columns that follow one another,
+  as a series whose value type or histogram bound changed mid-segment
+  does, are not reported; nor are overlapping columns whose values the
+  null counts do not prove overlap. The default is empty; the sources in
+  this crate forward it, and `Memory::mark_duplicated` records a series a
+  snapshot gave twice. The listings are unchanged and show such a series
+  once.
+- **Changed:** `Memory`'s `upsert_*_sample` methods keep each series in
+  time order: a sample at the series' last time replaces that sample,
+  counted (`Memory::replaced_samples`), and one before it is dropped and
+  counted (`Memory::dropped_samples`, warned once). Before, they appended
+  in both cases. `Memory::histogram_last_timestamp` is added.
+- **Changed:** in a merge of two or more streams,
+  `HistogramStream::merge` and `merge_on_clock` put a stream's row of a
+  label set at the time of that stream's previous row of it from another
+  index (two columns of one series sharing a time) on a second index of
+  those labels, decided before re-stamping, so the merged stream's rows of
+  two indices of one label set at one time stay on two indices. Every
+  other row of a label set is on one index, as before; the series list
+  holds a second entry of those labels, which may have no rows. A single
+  stream passes through unchanged, its indices included.
+
+### metriken-query 0.48.1
+
+Requires metriken-storage 0.11.1.
+
+- **Fixed:** a selector matching a series that two columns of one table
+  hold (`DataSource::duplicated_series`), or that one snapshot gave a
+  `MemoryStore` twice, is an `EvaluationError` naming the metric and the
+  label set, in PromQL (both rate paths, gauges, `histogram_quantile`)
+  and in `histogram_quantiles`, `histogram_heatmap`, `histogram_irate`,
+  `histogram_mean`, `histogram_count`, `histogram_sum` and `columns`, a
+  selector with `or` matchers included (checked against every series of
+  the name, which is what such a selector reads).
+  Before, `rate` or `irate` of such a counter panicked with `attempt to
+  subtract with overflow` in a debug build, and a gauge or histogram read
+  their samples as one series (#394). An archive recorded through
+  metriken-recorder 0.12.0 or earlier from an exporter whose series
+  differ only by a label named like a storage key gives this error where
+  its queries returned such results; a selector that leaves those series
+  out reads as before.
+- **Fixed:** `MemoryStore::ingest_snapshot` keeps each series in time
+  order, as `Memory`'s upserts now do: a snapshot ingested twice at one
+  systemtime replaces the first's values, and one from a wall clock that
+  stepped back is dropped until the clock passes the series' last sample,
+  its histogram overflow link included. `MemoryStore::dropped_samples` and
+  `MemoryStore::replaced_samples` count the two. Without it, the order
+  check below refused every query over such a point.
+- **Fixed:** a query reading a series whose samples step back in time (a
+  sample at or before the one before it) is an `EvaluationError` naming the
+  metric and the label set, for every evaluator: `rate` and `irate` on both
+  paths, `deriv`, `*_over_time`, a gauge read, and a histogram's deltas.
+  This is how two columns of one label set read as one series show
+  themselves where the footer check above does not find them (columns that
+  share fewer rows than its null counts prove, or that alternate). In a
+  histogram stream, rows of two columns of one label set at one time count
+  as stepping back, in a read of one segment or of several, of a long
+  table, and beside other recordings (the segmented reader's splice and
+  `HistogramStream`'s merges put such a row on a second index of the
+  labels, and a long table's relabelling keeps a column's second index of
+  one label set apart, where each joined them under one index); rows of
+  one index at one time, as a pooling of recordings onto one clock gives,
+  do not. Alternating histogram columns, whose rows are read in time
+  order, are not found. Before, such a read gave a wrong rate, or
+  panicked in a debug build.
+- **Fixed:** the error for an exporter name stored under two names over
+  an archive offered `<name>{source="..."}` whatever the recordings'
+  labels were (#395). It now offers a recording label the recordings
+  holding the candidates carry, with the value of a recording holding the
+  first stored name it gives (`jobs_total{alias="other"}`): the first key,
+  in order, that every such recording carries and whose values no two
+  candidates' recordings share. Internal labels (`__recording__`) are not
+  offered. When no key qualifies, or under `QueryOptions::series_labels`
+  (where a recording-label matcher does not choose recordings), no
+  recording-label matcher is offered. The `__prometheus_name__` form is
+  offered first, as before.
+
+### metriken-recorder 0.13.0
+
+- **Changed (breaking):** an exporter label whose key is a storage key
+  (`metriken_storage::STORAGE_KEYS`: `metric`, `metric_type`, `unit`,
+  `grouping_power`, `max_value_power`, `overflow`, `overflow_bound`,
+  `scale`) is stored as `exported_<key>`, and as
+  `exported_exported_<key>` (and so on) when the series also carries
+  `exported_<key>`, which keeps its value; this is Prometheus's rule for
+  an exposed label that collides with a target label. Such a label was
+  dropped by every reader before, so two series that differed only by it
+  were one series to a query, and `rate` over them panicked in a debug
+  build (#394); they are now two series, each with the label. A series
+  with such a label carries `exported_<key>` where it carried no label,
+  so a query matching the old label set exactly no longer matches it. An
+  exporter label `metric` no longer replaces the series' name. The rule
+  applies to counters, gauges, untyped samples, histograms and their
+  overflow series, and summaries' quantiles.
+- **Fixed:** a sample whose stored name and labels another sample of the
+  same scrape already has is dropped, the first value stored kept (a NaN
+  or infinite sample, or a histogram without a finite bucket, is not
+  stored and does not count) (warned once per
+  endpoint, then logged at debug): a line the exporter serves twice, or
+  `x{exported_unit="a"}` beside `x{unit="a"}`, which the rename above
+  stores as `exported_unit="a"`. Before, both were given one column,
+  whose segment failed to seal with "all columns in a record batch must
+  have the same length", and the recorder failed the recording.
+
 ### metriken-charts 0.1.4
 
 - **Fixed:** `STORAGE_KEYS` (`util/labels.js`) adds `overflow`,

@@ -287,6 +287,32 @@ pub(crate) struct SegmentColumns {
 }
 
 impl SegmentColumns {
+    /// The `(name, labels)` that more than one column of one kind carries,
+    /// once each: a counter column counts with a float counter column, a
+    /// gauge with a float gauge, as a listing counts them. Whether those
+    /// columns overlap in rows is not known from the lists.
+    pub(crate) fn duplicated(&self) -> Vec<(String, Labels)> {
+        let kinds: [&[&Vec<(String, Labels)>]; 4] = [
+            &[&self.counters, &self.float_counters],
+            &[&self.gauges, &self.float_gauges],
+            &[&self.histograms],
+            &[&self.gauge_histograms],
+        ];
+        let mut out: Vec<(String, Labels)> = Vec::new();
+        for lists in kinds {
+            let mut seen: std::collections::HashSet<(&str, &Labels)> =
+                std::collections::HashSet::new();
+            for (name, labels) in lists.iter().flat_map(|l| l.iter()) {
+                if !seen.insert((name, labels))
+                    && !out.iter().any(|(n, l)| n == name && l == labels)
+                {
+                    out.push((name.clone(), labels.clone()));
+                }
+            }
+        }
+        out
+    }
+
     /// `seg`'s columns, in its schema order. An error for a segment
     /// holding one histogram under two configs, which the segmented reader
     /// refuses.
@@ -497,6 +523,10 @@ struct OpenState {
     opened: usize,
     /// Whether a column named an occupant the relabel did not describe.
     unresolved: bool,
+    /// name -> the label sets, as presented, that more than one column of
+    /// one kind carries within one segment (see
+    /// [`DataSource::duplicated_series`]), sorted and deduplicated.
+    duplicated: HashMap<String, Vec<BTreeMap<String, String>>>,
 }
 
 impl OpenState {
@@ -512,6 +542,20 @@ impl OpenState {
         let columns = SegmentColumns::of(seg).map_err(|e| format!("segment {idx}: {e}"))?;
         self.listing
             .fold(idx, &columns, relabel, memo, &mut unresolved);
+        // A label set two columns carry is a duplicate where the segment's
+        // statistics show the columns hold values in one row; a series
+        // whose bound or value type changed mid-segment is two columns
+        // that do not (see `ParquetSource::duplicated`).
+        for (name, labels) in columns.duplicated() {
+            if !seg.duplicated_series(&name).contains(&labels.inner) {
+                continue;
+            }
+            let sets = memo.presents(relabel, &name, &labels, &mut unresolved);
+            let held = self.duplicated.entry(name).or_default();
+            held.extend(sets.of(&labels).iter().map(|l| l.inner.clone()));
+            held.sort();
+            held.dedup();
+        }
         // Where each counter series' samples are, by segment: the
         // column, located once here so a stream can read it back
         // without a schema scan. A relabelled column feeds every series
@@ -1506,15 +1550,25 @@ fn relabel_histogram_stream(
     // complete before the rows are consumed, so it is built from every
     // identity each column can present as, in column order, and rows map
     // into it.
+    //
+    // A set is keyed with how many earlier columns carry the column's own
+    // labels: a stream's second column of one label set (two columns that
+    // differ only by a storage key) presents under indices of its own, as
+    // it has in the stream, rather than joining the first's.
+    let nth: Vec<usize> = base
+        .iter()
+        .enumerate()
+        .map(|(i, labels)| base[..i].iter().filter(|l| *l == labels).count())
+        .collect();
     let mut series: Vec<Labels> = Vec::new();
-    let mut position: HashMap<Labels, usize, LabelsHash> = HashMap::default();
-    for labels in &base {
+    let mut position: HashMap<(Labels, usize), usize> = HashMap::default();
+    for (labels, k) in base.iter().zip(&nth) {
         let sets = relabel
             .identities(&name, labels)
             .unwrap_or_else(|| vec![labels.clone()]);
         for l in sets {
-            if !position.contains_key(&l) {
-                position.insert(l.clone(), series.len());
+            if let std::collections::hash_map::Entry::Vacant(e) = position.entry((l.clone(), *k)) {
+                e.insert(series.len());
                 series.push(l);
             }
         }
@@ -1527,7 +1581,7 @@ fn relabel_histogram_stream(
         if !labels.matches(&filter) {
             return None;
         }
-        row.series_idx = *position.get(&labels)?;
+        row.series_idx = *position.get(&(labels, nth[row.series_idx]))?;
         Some(row)
     });
     HistogramStream {
@@ -1578,15 +1632,30 @@ fn splice_histogram_streams(
     );
     let mut series: Vec<Labels> = Vec::new();
     let mut local_of_global: HashMap<usize, usize> = HashMap::new();
+    // Per series a segment holds two or more columns of (columns that
+    // differ only by a storage key), a second output index of its labels.
+    // A row of one of them at the time of the series' previous row from
+    // another of its columns is given that index instead of the series',
+    // so the two columns sharing a time stay two indices of one label set,
+    // which a reader can refuse (metriken-query's order check). Rows that
+    // follow one another (a bound that moved mid-segment) keep one index.
+    let mut collision_of_global: HashMap<usize, usize> = HashMap::new();
     let mut parts: Vec<Box<dyn Iterator<Item = crate::histogram_stream::HistogramRow> + Send>> =
         Vec::with_capacity(streams.len());
     for stream in streams {
+        let globals: Vec<Option<usize>> = stream
+            .meta
+            .series
+            .iter()
+            .map(|labels| identity.position(name, labels))
+            .collect();
         let remap: Vec<usize> = stream
             .meta
             .series
             .iter()
-            .map(|labels| match identity.position(name, labels) {
-                Some(global) => *local_of_global.entry(global).or_insert_with(|| {
+            .zip(&globals)
+            .map(|(labels, global)| match global {
+                Some(global) => *local_of_global.entry(*global).or_insert_with(|| {
                     series.push(labels.clone());
                     series.len() - 1
                 }),
@@ -1605,8 +1674,37 @@ fn splice_histogram_streams(
                 }
             })
             .collect();
+        // A series this segment holds under two or more local indices
+        // gets its collision index, for each of them.
+        let mut count: HashMap<usize, usize> = HashMap::new();
+        for global in globals.iter().flatten() {
+            *count.entry(*global).or_insert(0) += 1;
+        }
+        let collision: Vec<Option<usize>> = globals
+            .iter()
+            .enumerate()
+            .map(|(i, global)| {
+                let global = (*global).filter(|g| count[g] > 1)?;
+                Some(*collision_of_global.entry(global).or_insert_with(|| {
+                    series.push(stream.meta.series[i].clone());
+                    series.len() - 1
+                }))
+            })
+            .collect();
+        // Per output index, the time and local index of its last row.
+        let mut last: HashMap<usize, (u64, usize)> = HashMap::new();
         parts.push(Box::new(stream.rows.map(move |mut row| {
-            row.series_idx = remap[row.series_idx];
+            let local = row.series_idx;
+            let out = remap[local];
+            row.series_idx = out;
+            if let Some(alt) = collision[local] {
+                if let Some(&(ts, from)) = last.get(&out) {
+                    if ts == row.timestamp && from != local {
+                        row.series_idx = alt;
+                    }
+                }
+            }
+            last.insert(out, (row.timestamp, local));
             row
         })));
     }
@@ -1960,6 +2058,10 @@ impl DataSource for SegmentedSource {
 
     fn gauge_histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.state.listing.histogram_labels(HistKind::Gauge, name)
+    }
+
+    fn duplicated_series(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.state.duplicated.get(name).cloned().unwrap_or_default()
     }
 
     fn file_metadata(&self) -> HashMap<String, String> {

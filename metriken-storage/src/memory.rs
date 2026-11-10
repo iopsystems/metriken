@@ -43,6 +43,15 @@ pub struct Memory {
     /// knows its rows, and a series-by-series union would not recover a row
     /// that every series skipped.
     sample_timestamps: Option<Vec<u64>>,
+    /// name -> the label sets [`mark_duplicated`](Self::mark_duplicated)
+    /// was given, sorted and deduplicated.
+    duplicated: HashMap<String, Vec<BTreeMap<String, String>>>,
+    /// Samples the `upsert_*` methods dropped for a time before their
+    /// series' last ([`dropped_samples`](Self::dropped_samples)).
+    dropped: u64,
+    /// Samples the `upsert_*` methods put in place of their series' last,
+    /// at its time ([`replaced_samples`](Self::replaced_samples)).
+    replaced: u64,
 }
 
 impl Memory {
@@ -55,6 +64,70 @@ impl Memory {
             histogram_overflows: HashMap::new(),
             interval_ms,
             sample_timestamps: None,
+            duplicated: HashMap::new(),
+            dropped: 0,
+            replaced: 0,
+        }
+    }
+
+    /// Samples the `upsert_*` methods dropped because their time was before
+    /// their series' last sample (a wall clock that stepped back). The
+    /// first is warned of.
+    pub fn dropped_samples(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Samples the `upsert_*` methods put in place of their series' last
+    /// sample because they were at its time (a snapshot given twice, or a
+    /// second value of one series in one snapshot). Not warned of: the value
+    /// replaced is of the same time.
+    pub fn replaced_samples(&self) -> u64 {
+        self.replaced
+    }
+
+    /// The time of histogram `name`'s last row with `labels`, if it has one.
+    pub fn histogram_last_timestamp(&self, name: &str, labels: &Labels) -> Option<u64> {
+        self.histograms
+            .get(name)?
+            .iter()
+            .find(|h| h.labels == *labels)?
+            .timestamps
+            .last()
+            .copied()
+    }
+
+    /// Where a sample at `ts` goes in a series whose last sample is at
+    /// `last`; counts a dropped one, warning the first time.
+    #[cfg(feature = "ingest")]
+    fn place(&mut self, last: Option<u64>, ts: u64) -> Place {
+        match last {
+            Some(last) if ts < last => {
+                if self.dropped == 0 {
+                    tracing::warn!(
+                        "a sample at {ts} ns is before its series' last at {last} ns (a wall \
+                         clock that stepped back?): dropped, as later ones of that kind are \
+                         (Memory::dropped_samples counts them)"
+                    );
+                }
+                self.dropped += 1;
+                Place::Drop
+            }
+            Some(last) if ts == last => {
+                self.replaced += 1;
+                Place::Replace
+            }
+            _ => Place::Append,
+        }
+    }
+
+    /// Record that two values of one kind of metric `name` with `labels`
+    /// arrived in one snapshot, so the second replaced the first in its
+    /// series ([`DataSource::duplicated_series`]). metriken-query's
+    /// `MemoryStore::ingest_snapshot` calls it.
+    pub fn mark_duplicated(&mut self, name: &str, labels: &Labels) {
+        let held = self.duplicated.entry(name.to_string()).or_default();
+        if let Err(at) = held.binary_search(&labels.inner) {
+            held.insert(at, labels.inner.clone());
         }
     }
 
@@ -194,15 +267,26 @@ impl Memory {
             .push(histogram);
     }
 
-    /// Append a counter sample. If a series with matching (name, labels)
-    /// exists, the sample is appended to it; otherwise a new series is created.
+    /// Add a counter sample to the series with (name, labels), creating it
+    /// if absent.
+    /// A sample at the series' last time replaces that sample, counted in
+    /// [`replaced_samples`](Self::replaced_samples); one before it is
+    /// dropped and counted ([`dropped_samples`](Self::dropped_samples)).
     #[cfg(feature = "ingest")]
     pub fn upsert_counter_sample(&mut self, name: &str, labels: Labels, ts: u64, value: u64) {
-        let series = self.counters.entry(name.to_string()).or_default();
-        if let Some(c) = series.iter_mut().find(|c| c.labels == labels) {
-            c.timestamps.push(ts);
-            c.values.push_int(value);
+        let at = self
+            .counters
+            .get(name)
+            .and_then(|series| series.iter().position(|c| c.labels == labels));
+        if let Some(i) = at {
+            let place = self.place(self.counters[name][i].timestamps.last().copied(), ts);
+            let c = &mut self.counters.get_mut(name).expect("held")[i];
+            if place.keep(&mut c.timestamps, ts) {
+                pop_counter(&mut c.values, place);
+                c.values.push_int(value);
+            }
         } else {
+            let series = self.counters.entry(name.to_string()).or_default();
             series.push(Counter {
                 labels,
                 timestamps: vec![ts],
@@ -212,15 +296,26 @@ impl Memory {
         }
     }
 
-    /// Append a gauge sample. If a series with matching (name, labels)
-    /// exists, the sample is appended to it; otherwise a new series is created.
+    /// Add a gauge sample to the series with (name, labels), creating it if
+    /// absent.
+    /// A sample at the series' last time replaces that sample, counted in
+    /// [`replaced_samples`](Self::replaced_samples); one before it is
+    /// dropped and counted ([`dropped_samples`](Self::dropped_samples)).
     #[cfg(feature = "ingest")]
     pub fn upsert_gauge_sample(&mut self, name: &str, labels: Labels, ts: u64, value: i64) {
-        let series = self.gauges.entry(name.to_string()).or_default();
-        if let Some(g) = series.iter_mut().find(|g| g.labels == labels) {
-            g.timestamps.push(ts);
-            g.values.push_int(value);
+        let at = self
+            .gauges
+            .get(name)
+            .and_then(|series| series.iter().position(|g| g.labels == labels));
+        if let Some(i) = at {
+            let place = self.place(self.gauges[name][i].timestamps.last().copied(), ts);
+            let g = &mut self.gauges.get_mut(name).expect("held")[i];
+            if place.keep(&mut g.timestamps, ts) {
+                pop_gauge(&mut g.values, place);
+                g.values.push_int(value);
+            }
         } else {
+            let series = self.gauges.entry(name.to_string()).or_default();
             series.push(Gauge {
                 labels,
                 timestamps: vec![ts],
@@ -230,21 +325,33 @@ impl Memory {
         }
     }
 
-    /// Append a float counter sample, as
-    /// [`upsert_counter_sample`](Self::upsert_counter_sample) appends an
-    /// integer one. An integer series it is appended to becomes a float
-    /// series (`CounterValues::push_float`). A NaN or infinite value is
-    /// dropped.
+    /// Add a float counter sample to the series with (name, labels),
+    /// creating it if absent, as
+    /// [`upsert_counter_sample`](Self::upsert_counter_sample) adds an integer
+    /// one. An integer series it is added to becomes a float series
+    /// (`CounterValues::push_float`). A NaN or infinite value is dropped,
+    /// and not counted.
+    /// A sample at the series' last time replaces that sample, counted in
+    /// [`replaced_samples`](Self::replaced_samples); one before it is
+    /// dropped and counted ([`dropped_samples`](Self::dropped_samples)).
     #[cfg(feature = "ingest")]
     pub fn upsert_float_counter_sample(&mut self, name: &str, labels: Labels, ts: u64, value: f64) {
         if !value.is_finite() {
             return;
         }
-        let series = self.counters.entry(name.to_string()).or_default();
-        if let Some(c) = series.iter_mut().find(|c| c.labels == labels) {
-            c.timestamps.push(ts);
-            c.values.push_float(value);
+        let at = self
+            .counters
+            .get(name)
+            .and_then(|series| series.iter().position(|c| c.labels == labels));
+        if let Some(i) = at {
+            let place = self.place(self.counters[name][i].timestamps.last().copied(), ts);
+            let c = &mut self.counters.get_mut(name).expect("held")[i];
+            if place.keep(&mut c.timestamps, ts) {
+                pop_counter(&mut c.values, place);
+                c.values.push_float(value);
+            }
         } else {
+            let series = self.counters.entry(name.to_string()).or_default();
             series.push(Counter {
                 labels,
                 timestamps: vec![ts],
@@ -254,20 +361,31 @@ impl Memory {
         }
     }
 
-    /// Append a float gauge sample, as
-    /// [`upsert_gauge_sample`](Self::upsert_gauge_sample) appends an integer
-    /// one. An integer series it is appended to becomes a float series. A
-    /// NaN or infinite value is dropped.
+    /// Add a float gauge sample to the series with (name, labels), creating
+    /// it if absent, as [`upsert_gauge_sample`](Self::upsert_gauge_sample)
+    /// adds an integer one. An integer series it is added to becomes a float
+    /// series. A NaN or infinite value is dropped, and not counted.
+    /// A sample at the series' last time replaces that sample, counted in
+    /// [`replaced_samples`](Self::replaced_samples); one before it is
+    /// dropped and counted ([`dropped_samples`](Self::dropped_samples)).
     #[cfg(feature = "ingest")]
     pub fn upsert_float_gauge_sample(&mut self, name: &str, labels: Labels, ts: u64, value: f64) {
         if !value.is_finite() {
             return;
         }
-        let series = self.gauges.entry(name.to_string()).or_default();
-        if let Some(g) = series.iter_mut().find(|g| g.labels == labels) {
-            g.timestamps.push(ts);
-            g.values.push_float(value);
+        let at = self
+            .gauges
+            .get(name)
+            .and_then(|series| series.iter().position(|g| g.labels == labels));
+        if let Some(i) = at {
+            let place = self.place(self.gauges[name][i].timestamps.last().copied(), ts);
+            let g = &mut self.gauges.get_mut(name).expect("held")[i];
+            if place.keep(&mut g.timestamps, ts) {
+                pop_gauge(&mut g.values, place);
+                g.values.push_float(value);
+            }
         } else {
+            let series = self.gauges.entry(name.to_string()).or_default();
             series.push(Gauge {
                 labels,
                 timestamps: vec![ts],
@@ -277,8 +395,11 @@ impl Memory {
         }
     }
 
-    /// Append a histogram sample. If a series with matching (name, labels)
-    /// exists, the sample is appended to it; otherwise a new series is created.
+    /// Add a histogram sample to the series with (name, labels), creating it
+    /// if absent.
+    /// A sample at the series' last time replaces that sample, counted in
+    /// [`replaced_samples`](Self::replaced_samples); one before it is
+    /// dropped and counted ([`dropped_samples`](Self::dropped_samples)).
     #[cfg(feature = "ingest")]
     pub fn upsert_histogram_sample(
         &mut self,
@@ -288,17 +409,21 @@ impl Memory {
         ts: u64,
         snapshot: HistogramSnapshot,
     ) {
+        let last = self.histogram_last_timestamp(name, &labels);
+        let place = self.place(last, ts);
         upsert_histogram(
             self.histograms.entry(name.to_string()).or_default(),
             labels,
             config,
             ts,
             snapshot,
+            place,
         );
     }
 
     /// [`upsert_histogram_sample`](Self::upsert_histogram_sample) for a
-    /// gauge histogram: `snapshot` is the state at `ts`.
+    /// gauge histogram: `snapshot` is the state at `ts`. Replaced and
+    /// dropped samples are counted as there.
     #[cfg(feature = "ingest")]
     pub fn upsert_gauge_histogram_sample(
         &mut self,
@@ -308,12 +433,19 @@ impl Memory {
         ts: u64,
         snapshot: HistogramSnapshot,
     ) {
+        let last = self
+            .gauge_histograms
+            .get(name)
+            .and_then(|series| series.iter().find(|h| h.labels == labels))
+            .and_then(|h| h.timestamps.last().copied());
+        let place = self.place(last, ts);
         upsert_histogram(
             self.gauge_histograms.entry(name.to_string()).or_default(),
             labels,
             config,
             ts,
             snapshot,
+            place,
         );
     }
 }
@@ -325,10 +457,15 @@ fn upsert_histogram(
     config: ::histogram::Config,
     ts: u64,
     snapshot: HistogramSnapshot,
+    place: Place,
 ) {
     if let Some(h) = series.iter_mut().find(|h| h.labels == labels) {
-        h.timestamps.push(ts);
-        h.snapshots.push(snapshot);
+        if place.keep(&mut h.timestamps, ts) {
+            if place == Place::Replace {
+                h.snapshots.pop();
+            }
+            h.snapshots.push(snapshot);
+        }
     } else {
         series.push(Histogram {
             labels,
@@ -336,6 +473,64 @@ fn upsert_histogram(
             timestamps: vec![ts],
             snapshots: vec![snapshot],
         });
+    }
+}
+
+/// Where an upserted sample goes in its series ([`Memory::place`]).
+#[cfg(feature = "ingest")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Place {
+    /// After the last sample.
+    Append,
+    /// In place of the last sample, at its time.
+    Replace,
+    /// Nowhere: its time is before the last sample's.
+    Drop,
+}
+
+#[cfg(feature = "ingest")]
+impl Place {
+    /// Apply this to `timestamps` for a sample at `ts`: whether its value
+    /// is pushed (after the caller pops the last for [`Place::Replace`]).
+    fn keep(self, timestamps: &mut Vec<u64>, ts: u64) -> bool {
+        match self {
+            Place::Append => {
+                timestamps.push(ts);
+                true
+            }
+            Place::Replace => true,
+            Place::Drop => false,
+        }
+    }
+}
+
+/// Pop `values`' last for [`Place::Replace`].
+#[cfg(feature = "ingest")]
+fn pop_counter(values: &mut crate::types::CounterValues, place: Place) {
+    if place == Place::Replace {
+        match values {
+            crate::types::CounterValues::Int(v) => {
+                v.pop();
+            }
+            crate::types::CounterValues::Float(v) => {
+                v.pop();
+            }
+        }
+    }
+}
+
+/// [`pop_counter`] for gauge values.
+#[cfg(feature = "ingest")]
+fn pop_gauge(values: &mut crate::types::GaugeValues, place: Place) {
+    if place == Place::Replace {
+        match values {
+            crate::types::GaugeValues::Int(v) => {
+                v.pop();
+            }
+            crate::types::GaugeValues::Float(v) => {
+                v.pop();
+            }
+        }
     }
 }
 
@@ -564,6 +759,10 @@ impl DataSource for Memory {
             .get(name)
             .map(|series| series.iter().map(|h| h.labels.inner.clone()).collect())
             .unwrap_or_default()
+    }
+
+    fn duplicated_series(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.duplicated.get(name).cloned().unwrap_or_default()
     }
 
     fn time_range(&self) -> Option<(u64, u64)> {

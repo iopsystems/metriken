@@ -260,6 +260,25 @@ impl DataSource for LazySource {
             .unwrap_or_default()
     }
 
+    /// Loads the source only when the catalog holds `name`, as the
+    /// listings do.
+    fn duplicated_series(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        let held = [
+            &self.catalog.counters,
+            &self.catalog.gauges,
+            &self.catalog.histograms,
+            &self.catalog.gauge_histograms,
+        ]
+        .into_iter()
+        .any(|names| names.contains(name));
+        if !held {
+            return Vec::new();
+        }
+        self.loaded()
+            .map(|s| s.duplicated_series(name))
+            .unwrap_or_default()
+    }
+
     fn file_metadata(&self) -> HashMap<String, String> {
         self.catalog.metadata.clone()
     }

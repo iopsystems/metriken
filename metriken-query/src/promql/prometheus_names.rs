@@ -78,35 +78,36 @@ pub(crate) fn stored_name(
         .into_iter()
         .filter(|c| held.contains(c) && holds_renamed(source, c, name))
         .collect();
-    one_of(name, found, false)
+    one_of(name, found)
 }
 
 /// The one stored name in `found`, `None` for none, or the error for
-/// several ([`ambiguous`], with `archive` passed on).
-pub(crate) fn one_of(
-    name: &str,
-    mut found: Vec<String>,
-    archive: bool,
-) -> Result<Option<String>, QueryError> {
+/// several ([`ambiguous`], offering no recording-label matcher).
+fn one_of(name: &str, mut found: Vec<String>) -> Result<Option<String>, QueryError> {
     match found.len() {
         0 => Ok(None),
         1 => Ok(found.pop()),
-        _ => Err(ambiguous(name, &found, archive)),
+        _ => Err(ambiguous(name, &found, None)),
     }
 }
 
 /// The error for exporter name `name` stored under each of `stored`. It
 /// names the form that selects one on any source, a stored name with
-/// `__prometheus_name__="<name>"`; with `archive`, also a recording-label
-/// matcher, which selects recordings only over an archive.
-pub(crate) fn ambiguous(name: &str, stored: &[String], archive: bool) -> QueryError {
+/// `__prometheus_name__="<name>"`; with `recording`, a recording label and
+/// a value of it, also that recording-label matcher, which selects
+/// recordings only over an archive.
+pub(crate) fn ambiguous(
+    name: &str,
+    stored: &[String],
+    recording: Option<(&str, &str)>,
+) -> QueryError {
     let first = &stored[0];
-    let recording = if archive {
-        format!(
-            ", or select one recording with a recording-label matcher ({name}{{source=\"...\"}})"
-        )
-    } else {
-        String::new()
+    let recording = match recording {
+        Some((key, value)) => format!(
+            ", or select one recording with a recording-label matcher \
+             ({name}{{{key}={value:?}}})"
+        ),
+        None => String::new(),
     };
     QueryError::EvaluationError(format!(
         "no series this selector reaches is named {name}, and series an exporter served as \
@@ -129,45 +130,62 @@ pub(crate) fn renamed_filter(mut filter: Labels, original: &str) -> Labels {
 /// filter to the stored name it reads, if any.
 pub(crate) type Resolve<'a> = dyn Fn(&str, &Labels) -> Result<Option<String>, QueryError> + 'a;
 
+/// The check [`resolve_selectors`] runs on a selector it does not resolve
+/// (one with `or` matchers): its name and an empty filter, every series of
+/// the name, which is what such a selector reads.
+pub(crate) type Check<'a> = dyn Fn(&str, &Labels) -> Result<(), QueryError> + 'a;
+
 /// Point each named selector of `expr` that `resolve` resolves at the
 /// stored name, adding the `__prometheus_name__` matcher. `resolve` takes
-/// the selector's name and filter. A selector with `or` matchers is left
-/// as it is. The first error `resolve` returns is returned.
-pub(crate) fn resolve_selectors(expr: &mut Expr, resolve: &Resolve) -> Result<(), QueryError> {
+/// the selector's name and filter. A selector with `or` matchers is not
+/// resolved; `check` is run on its name with the filter its read applies:
+/// every series of the name, which is what such a selector reads (the
+/// parser moves every matcher into the `or` branches, and the readers do
+/// not apply them). The first error either returns is returned.
+pub(crate) fn resolve_selectors(
+    expr: &mut Expr,
+    resolve: &Resolve,
+    check: &Check,
+) -> Result<(), QueryError> {
+    let each = |e: &mut Expr| resolve_selectors(e, resolve, check);
     match expr {
         Expr::Aggregate(agg) => {
-            resolve_selectors(&mut agg.expr, resolve)?;
+            each(&mut agg.expr)?;
             if let Some(param) = agg.param.as_mut() {
-                resolve_selectors(param, resolve)?;
+                each(param)?;
             }
             Ok(())
         }
-        Expr::Unary(u) => resolve_selectors(&mut u.expr, resolve),
+        Expr::Unary(u) => each(&mut u.expr),
         Expr::Binary(b) => {
-            resolve_selectors(&mut b.lhs, resolve)?;
-            resolve_selectors(&mut b.rhs, resolve)
+            each(&mut b.lhs)?;
+            each(&mut b.rhs)
         }
-        Expr::Paren(p) => resolve_selectors(&mut p.expr, resolve),
+        Expr::Paren(p) => each(&mut p.expr),
         Expr::Call(call) => {
             for arg in call.args.args.iter_mut() {
-                resolve_selectors(arg, resolve)?;
+                each(arg)?;
             }
             Ok(())
         }
-        Expr::VectorSelector(sel) => resolve_selector(sel, resolve),
-        Expr::MatrixSelector(sel) => resolve_selector(&mut sel.vs, resolve),
-        Expr::Subquery(s) => resolve_selectors(&mut s.expr, resolve),
+        Expr::VectorSelector(sel) => resolve_selector(sel, resolve, check),
+        Expr::MatrixSelector(sel) => resolve_selector(&mut sel.vs, resolve, check),
+        Expr::Subquery(s) => each(&mut s.expr),
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => Ok(()),
     }
 }
 
-fn resolve_selector(sel: &mut parser::VectorSelector, resolve: &Resolve) -> Result<(), QueryError> {
-    if !sel.matchers.or_matchers.is_empty() {
-        return Ok(());
-    }
+fn resolve_selector(
+    sel: &mut parser::VectorSelector,
+    resolve: &Resolve,
+    check: &Check,
+) -> Result<(), QueryError> {
     let Some(name) = sel.name.clone() else {
         return Ok(());
     };
+    if !sel.matchers.or_matchers.is_empty() {
+        return check(&name, &Labels::default());
+    }
     let filter = extract_filter_labels(&sel.matchers.matchers);
     let Some(stored) = resolve(&name, &filter)? else {
         return Ok(());
@@ -269,5 +287,25 @@ mod tests {
         engine.resolve_names(&mut expr).unwrap();
         assert_eq!(source.listings.load(Ordering::Relaxed), 1);
         assert!(expr.to_string().contains("b_nanoseconds_total"), "{expr}");
+    }
+
+    /// A query fills the engine's names, so an engine that lives for a
+    /// reader's life lists them once, not once per query.
+    #[test]
+    fn a_query_keeps_the_names_for_the_next() {
+        let mut inner = Memory::new(1000);
+        inner.upsert_float_counter_sample("a_total", Labels::default(), 1_000_000_000, 1.0);
+        let engine = QueryEngine::new(Arc::new(inner) as Arc<dyn DataSource>);
+        assert!(engine.held.get().is_none());
+        engine
+            .query_range_opts(
+                "rate(a_total[1s])",
+                1.0,
+                2.0,
+                1.0,
+                &crate::QueryOptions::default(),
+            )
+            .unwrap();
+        assert!(engine.held.get().is_some(), "the names are kept");
     }
 }

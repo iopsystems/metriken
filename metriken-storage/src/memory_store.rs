@@ -102,6 +102,10 @@ impl DataSource for MemoryStoreInner {
         self.memory.read().unwrap().gauge_histogram_labels(name)
     }
 
+    fn duplicated_series(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.memory.read().unwrap().duplicated_series(name)
+    }
+
     fn file_metadata(&self) -> HashMap<String, String> {
         self.metadata.read().unwrap().clone()
     }

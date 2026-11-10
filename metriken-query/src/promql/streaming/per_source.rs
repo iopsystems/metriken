@@ -108,6 +108,37 @@ pub(crate) struct SourceGroups {
     pub conflicts: Arc<super::conflicts::Conflicts>,
 }
 
+/// What [`SourceGroups::wrapped`] reads each source through.
+pub(crate) type Wrap<'a> = dyn Fn(&Arc<dyn DataSource>) -> Arc<dyn DataSource> + 'a;
+
+impl SourceGroups {
+    /// These groups with every source read through `wrap`, sharing the
+    /// conflicts.
+    pub(crate) fn wrapped(&self, wrap: &Wrap) -> Self {
+        let parts = self
+            .parts
+            .iter()
+            .map(|part| match part {
+                Part::Single(source) => Part::Single(wrap(source)),
+                Part::Group(members) => Part::Group(
+                    members
+                        .iter()
+                        .map(|m| Member {
+                            source: wrap(&m.source),
+                            raw: wrap(&m.raw),
+                            ..m.clone()
+                        })
+                        .collect(),
+                ),
+            })
+            .collect();
+        Self {
+            parts,
+            conflicts: Arc::clone(&self.conflicts),
+        }
+    }
+}
+
 /// One recording of [`SourceGroups`].
 #[cfg_attr(not(feature = "archive"), allow(dead_code))]
 pub(crate) enum Part {
@@ -1481,6 +1512,9 @@ impl DataSource for Tap {
     fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.inner.histogram_labels(name)
     }
+    fn duplicated_series(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.inner.duplicated_series(name)
+    }
     fn file_metadata(&self) -> HashMap<String, String> {
         self.inner.file_metadata()
     }
@@ -1769,6 +1803,9 @@ impl DataSource for GroupSource {
     }
     fn histogram_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.listing(|s| s.histogram_labels(name))
+    }
+    fn duplicated_series(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+        self.listing(|s| s.duplicated_series(name))
     }
     fn file_metadata(&self) -> HashMap<String, String> {
         self.sources[0].file_metadata()
