@@ -95,8 +95,8 @@ impl Memory {
     /// [`OVERFLOW_BOUND_KEY`](crate::OVERFLOW_BOUND_KEY) say in a recording,
     /// for one row: a row named by no call has no overflow, as a recorded
     /// row of a column without the keys has none. A link is keyed by the
-    /// row's timestamp, so two rows of the series at one timestamp (which
-    /// the live store reads as malformed) share one link, the last set.
+    /// row's timestamp, so two rows of the series at one timestamp share
+    /// one link, the last set.
     pub fn set_histogram_overflow(
         &mut self,
         name: &str,
@@ -120,7 +120,7 @@ impl Memory {
     }
 
     /// The series of counter `name`, each one counted in
-    /// [`COUNTER_SERIES_VISITED`] (tests) as it is yielded, so a test can
+    /// `COUNTER_SERIES_VISITED` (tests) as it is yielded, so a test can
     /// bound how many a read visits.
     fn counter_series<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a Counter> + 'a {
         self.counters.get(name).into_iter().flatten().inspect(|_| {
@@ -145,9 +145,13 @@ impl Memory {
             let (counter, bound) = links?.get(labels)?.get(&ts)?;
             let mut indexes = indexes.borrow_mut();
             let index = indexes.entry(Arc::clone(counter)).or_insert_with(|| {
-                self.counter_series(counter)
-                    .map(|c| (&c.labels, c))
-                    .collect()
+                // The first series of a label set, as a search in order
+                // would find.
+                let mut index = HashMap::new();
+                for c in self.counter_series(counter) {
+                    index.entry(&c.labels).or_insert(c);
+                }
+                index
             });
             let series = index.get(labels)?;
             let i = series.timestamps.binary_search(&ts).ok()?;
@@ -705,6 +709,70 @@ mod tests {
         assert_eq!(overflow.len(), (k * rows) as usize);
         assert!(overflow.iter().all(|o| o.is_some()));
         assert_eq!(COUNTER_SERIES_VISITED.with(|v| v.get()), k as usize);
+    }
+
+    /// One histogram row at `t` with labels `labels`, linked to counter
+    /// `counter`.
+    fn one_row(m: &mut Memory, labels: &Labels, counter: &str, t: u64) {
+        m.push_histogram_series(
+            "h",
+            Histogram {
+                labels: labels.clone(),
+                config: ::histogram::Config::new(7, 16).unwrap(),
+                timestamps: vec![t],
+                snapshots: vec![HistogramSnapshot {
+                    index: vec![1],
+                    count: vec![1],
+                }],
+            },
+        );
+        m.set_histogram_overflow("h", labels.clone(), t, counter, 10.0);
+    }
+
+    fn counter(m: &mut Memory, name: &str, labels: &Labels, t: u64, value: f64) {
+        m.push_counter_series(
+            name,
+            Counter {
+                labels: labels.clone(),
+                timestamps: vec![t],
+                values: vec![value].into(),
+                windows: None,
+            },
+        );
+    }
+
+    fn overflows(m: &Memory) -> Vec<Option<f64>> {
+        m.histogram_stream("h", &Labels::default(), 0, u64::MAX)
+            .unwrap()
+            .rows
+            .map(|r| r.overflow.map(|o| o.count))
+            .collect()
+    }
+
+    /// Of two overflow counter series with the same labels, the first is
+    /// read, as a search of them in order would.
+    #[test]
+    fn of_two_counter_series_with_one_label_set_the_first_is_read() {
+        let mut m = Memory::new(1000);
+        let none = Labels::default();
+        one_row(&mut m, &none, "h_overflow", 1);
+        counter(&mut m, "h_overflow", &none, 1, 5.0);
+        counter(&mut m, "h_overflow", &none, 1, 9.0);
+        assert_eq!(overflows(&m), vec![Some(5.0)]);
+    }
+
+    /// Two series of one histogram linked to different counters each read
+    /// their own.
+    #[test]
+    fn each_series_reads_its_own_counter() {
+        let mut m = Memory::new(1000);
+        let label = |v: &str| Labels::from(BTreeMap::from([("s".to_string(), v.to_string())]));
+        let (a, b) = (label("a"), label("b"));
+        one_row(&mut m, &a, "a_overflow", 1);
+        one_row(&mut m, &b, "b_overflow", 1);
+        counter(&mut m, "a_overflow", &a, 1, 3.0);
+        counter(&mut m, "b_overflow", &b, 1, 7.0);
+        assert_eq!(overflows(&m), vec![Some(3.0), Some(7.0)]);
     }
 
     /// The rows of one series share one allocation of the counter's name.
