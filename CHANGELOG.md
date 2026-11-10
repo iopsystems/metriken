@@ -11,10 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Requires dendro 0.7.0.
 
-- **Breaking:** takes dendro 0.7 (was 0.6), whose rusqlite 0.41 bundles
-  SQLite 3.54.0 or later and clears RUSTSEC-2026-0459.
-  `FrameProducer::opening` returns `dendro::Result`, so a caller that also
-  depends on dendro moves to 0.7 with it.
+- **Breaking:** takes dendro 0.7 (was 0.6). `FrameProducer::opening`
+  returns `dendro::Result`, so a caller that also depends on dendro moves to
+  0.7 with it. This crate does not link SQLite.
 
 ### metriken-storage 0.9.0
 
@@ -23,7 +22,8 @@ Requires dendro 0.7.0 and metriken-exposition 0.27.0.
 - **Breaking:** takes dendro 0.7 (was 0.6) and rusqlite 0.41 (was 0.40),
   which clear RUSTSEC-2026-0459. `DendroCatalog` and `Encoder::for_archive`
   carry dendro types, so a caller that also depends on dendro moves to 0.7
-  with it.
+  with it. On wasm32-unknown-unknown SQLite comes from sqlite-wasm-rs 0.5
+  (SQLite 3.53.0); see dendro 0.7.0's notes.
 
 ### metriken-query 0.46.0
 
