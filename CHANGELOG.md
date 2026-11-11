@@ -74,6 +74,41 @@ from the two histogram heatmap fixes below.
   (`Event::SourceFailed`, "its pass panicked: …"); the other sources keep
   recording. Before, the panic failed the recording (`Event::Failed`) and
   left the archive unfinalized.
+Requires metriken-storage's unreleased `prometheus_units` above.
+
+- **Breaking:** the Prometheus converter stores every series under the
+  name the exporter serves it as, with the value it serves: a
+  `_seconds` series in seconds, a `_ms` series in milliseconds, a `_bits`
+  series in bits, a `_percent` series in 0 to 100. The `unit` key is the
+  unit the name's token or the metric's `# UNIT` line gives, by its name
+  in `metriken_storage::prometheus_units::UNITS` (`seconds`,
+  `milliseconds`, `bytes`, `percent`, …); a `_count` sample and a
+  histogram's overflow series have none. Before, such a series was stored
+  in nanoseconds or bytes under a converted name (`rpc_seconds_sum` as
+  `rpc_nanoseconds_sum`, `rx_bits_total` as `rx_bytes_total`) with the
+  exporter's name in `__prometheus_name__`, and a `_percent` series had
+  `unit="percentage"`. A reader querying the converted names, or
+  matching `__prometheus_name__`, finds nothing in a new recording; one
+  that took a time series' values as nanoseconds reads seconds,
+  milliseconds or microseconds, as the `unit` key says.
+- **Breaking:** a histogram's bounds are stored as integers: each `le` is
+  multiplied by a scale, written as `scale` when it is not 1, and rounded
+  (it was truncated, so bounds 0.1, 0.25 and 0.5 stored 0.25 as 2 and read
+  a p50 of 0.2). A time unit has a fixed scale, its nanoseconds per unit:
+  `seconds` 1e9, `milliseconds` 1e6, `microseconds` 1e3, `nanoseconds` 1,
+  so a `_seconds` histogram is stored in nanoseconds whatever its smallest
+  bucket, and two endpoints' histograms of one name pool. Any other
+  histogram takes the smallest power of 10, at most 1e9, that makes every
+  finite bound an integer (0.1, 0.25, 0.5 take 100; 0.0003 takes 10_000).
+  The overflow bound takes the same scale. Two bounds that land in one
+  bucket of the `histogram` crate add their observations there.
+  metriken-query divides by `scale`, so the histogram reads in its unit.
+  Its `_sum` is in the exporter's unit, unscaled. The overflow series is
+  `<exporter name>_overflow` (`rpc_seconds_overflow`).
+- **Breaking:** the collision path is removed: two exporter names that
+  would have been stored under one name are stored under their own names,
+  as every series is. A `# HELP` text is kept under the exporter's name
+  only.
 
 ### metriken-storage (unreleased)
 
@@ -164,44 +199,6 @@ from the two histogram heatmap fixes below.
   `MemoryStore`, whose ingest records each series' unit from its snapshot
   metadata. The default is `None`, so a `MetricsSource` that wraps another
   must forward `metric_unit`.
-
-### metriken-recorder (unreleased)
-
-Requires metriken-storage's unreleased `prometheus_units` above.
-
-- **Breaking:** the Prometheus converter stores every series under the
-  name the exporter serves it as, with the value it serves: a
-  `_seconds` series in seconds, a `_ms` series in milliseconds, a `_bits`
-  series in bits, a `_percent` series in 0 to 100. The `unit` key is the
-  unit the name's token or the metric's `# UNIT` line gives, by its name
-  in `metriken_storage::prometheus_units::UNITS` (`seconds`,
-  `milliseconds`, `bytes`, `percent`, …); a `_count` sample and a
-  histogram's overflow series have none. Before, such a series was stored
-  in nanoseconds or bytes under a converted name (`rpc_seconds_sum` as
-  `rpc_nanoseconds_sum`, `rx_bits_total` as `rx_bytes_total`) with the
-  exporter's name in `__prometheus_name__`, and a `_percent` series had
-  `unit="percentage"`. A reader querying the converted names, or
-  matching `__prometheus_name__`, finds nothing in a new recording; one
-  that took a time series' values as nanoseconds reads seconds,
-  milliseconds or microseconds, as the `unit` key says.
-- **Breaking:** a histogram's bounds are stored as integers: each `le` is
-  multiplied by a scale, written as `scale` when it is not 1, and rounded
-  (it was truncated, so bounds 0.1, 0.25 and 0.5 stored 0.25 as 2 and read
-  a p50 of 0.2). A time unit has a fixed scale, its nanoseconds per unit:
-  `seconds` 1e9, `milliseconds` 1e6, `microseconds` 1e3, `nanoseconds` 1,
-  so a `_seconds` histogram is stored in nanoseconds whatever its smallest
-  bucket, and two endpoints' histograms of one name pool. Any other
-  histogram takes the smallest power of 10, at most 1e9, that makes every
-  finite bound an integer (0.1, 0.25, 0.5 take 100; 0.0003 takes 10_000).
-  The overflow bound takes the same scale. Two bounds that land in one
-  bucket of the `histogram` crate add their observations there.
-  metriken-query divides by `scale`, so the histogram reads in its unit.
-  Its `_sum` is in the exporter's unit, unscaled. The overflow series is
-  `<exporter name>_overflow` (`rpc_seconds_overflow`).
-- **Breaking:** the collision path is removed: two exporter names that
-  would have been stored under one name are stored under their own names,
-  as every series is. A `# HELP` text is kept under the exporter's name
-  only.
 
 ### metriken-storage 0.12.0
 
