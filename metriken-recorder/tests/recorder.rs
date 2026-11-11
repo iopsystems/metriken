@@ -3602,3 +3602,327 @@ impl Probe for LateNamingProbe {
         }
     }
 }
+
+// ── a source that fails alone ──────────────────────────────────────────
+
+/// A recorder config sealing every two rows, so a stream's rows meet a
+/// seal within a few ticks.
+fn sealing_often(path: &std::path::Path) -> RecorderConfig {
+    let mut cfg = RecorderConfig::new(path, INTERVAL);
+    cfg.writer = metriken_storage::WriterConfig {
+        seal: dendro::seal::SealPolicy {
+            max_rows: 2,
+            ..dendro::seal::SealPolicy::default()
+        },
+        ..metriken_storage::WriterConfig::default()
+    };
+    cfg
+}
+
+/// The events up to the first `SourceFailed`, then for `after` more, or a
+/// panic after 30 s.
+async fn until_failed(
+    rx: &mut tokio::sync::mpsc::Receiver<Event>,
+    after: Duration,
+) -> (Vec<Event>, Vec<Event>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut before = Vec::new();
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(e @ Event::SourceFailed { .. })) => {
+                before.push(e);
+                break;
+            }
+            Ok(Some(Event::Failed { error })) => panic!("the recording failed: {error}"),
+            Ok(Some(e)) => before.push(e),
+            Ok(None) | Err(_) => panic!("no SourceFailed within 30 s: {before:?}"),
+        }
+    }
+    let mut later = Vec::new();
+    let until = tokio::time::Instant::now() + after;
+    while let Ok(Some(e)) = tokio::time::timeout_at(until, rx.recv()).await {
+        later.push(e);
+    }
+    (before, later)
+}
+
+/// Whether `event` reports a frame or a commit of `source`.
+fn records(event: &Event, source: SourceId) -> bool {
+    matches!(event,
+        Event::Committed { source: s, .. } | Event::Frame { source: s, .. } if *s == source)
+}
+
+/// A streamed source whose rows its encoder cannot seal (two columns of one
+/// name) is dropped at a commit; its stream's later frames are not staged,
+/// and the local source beside it records on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streamed_source_whose_rows_cannot_be_sealed_stops_and_the_others_record_on() {
+    let fake = serve(Behaviour {
+        duplicate_column: true,
+        ..stream_only(&[("source", "svc")], &[])
+    })
+    .await;
+    let detected = detect(&client(), &detect_cfg(), vec![spec(&fake.url)], &NoProbe).await;
+    let anchor = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("streamed.dendro");
+    let (recorder, ids, mut rx) = Recorder::start(
+        sealing_often(&path),
+        client(),
+        Arc::new(NoProbe),
+        detected,
+        vec![Box::new(Counting { anchor, n: 0 })],
+    )
+    .await
+    .unwrap();
+    let (streamed, local) = (ids[0], ids[1]);
+    let (before, later) = until_failed(&mut rx, Duration::from_millis(800)).await;
+    let Some(Event::SourceFailed { source, reason }) = before.last() else {
+        unreachable!()
+    };
+    assert_eq!(*source, streamed);
+    assert!(reason.contains("fake/ops could not be encoded"), "{reason}");
+    assert!(
+        !later.iter().any(|e| records(e, streamed)),
+        "the failed stream recorded on: {later:?}"
+    );
+    assert!(later.iter().any(|e| records(e, local)), "{later:?}");
+    let summary = recorder
+        .finish(Stop::Now, CancellationToken::new())
+        .await
+        .unwrap();
+    let states: Vec<SourceState> = summary.sources.iter().map(|s| s.state).collect();
+    assert_eq!(states, [SourceState::Failed, SourceState::Active]);
+    let svc = &recordings(&path, "fake/ops")["svc"];
+    assert!(svc.complete);
+    assert_eq!(svc.rows, 0, "no row of the table was sealed: {svc:?}");
+    assert!(recordings(&path, "self/latency")["self"].complete);
+    // A reader opens both recordings.
+    let catalog = metriken_storage::DendroCatalog::open(&path).unwrap();
+    let readers = metriken_storage::ArchiveReader::from_catalog(
+        Box::new(catalog),
+        None,
+        metriken_storage::BufferPool::new(64 << 20),
+        None,
+    )
+    .unwrap();
+    assert_eq!(readers.len(), 2);
+}
+
+/// A streamed source that sealed segments and then sent rows its encoder
+/// cannot seal keeps the segments: the producer restarts (same name, a new
+/// epoch) and from then on sends the counter twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streamed_source_that_sealed_and_then_failed_keeps_its_segments() {
+    let fake = serve(Behaviour {
+        streams: Streams::Restarts(8),
+        ..stream_only(&[("source", "svc")], &[])
+    })
+    .await;
+    let detected = detect(&client(), &detect_cfg(), vec![spec(&fake.url)], &NoProbe).await;
+    let anchor = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sealed-then-failed.dendro");
+    let (recorder, ids, mut rx) = Recorder::start(
+        sealing_often(&path),
+        client(),
+        Arc::new(NoProbe),
+        detected,
+        vec![Box::new(Counting { anchor, n: 0 })],
+    )
+    .await
+    .unwrap();
+    // The reconnect after the first subscription's 8 frames sends two
+    // columns.
+    fake.set(Behaviour {
+        streams: Streams::Restarts(8),
+        duplicate_column: true,
+        ..stream_only(&[("source", "svc")], &[])
+    });
+    let (before, _) = until_failed(&mut rx, Duration::ZERO).await;
+    let committed = before
+        .iter()
+        .filter_map(|e| match e {
+            Event::Committed {
+                source,
+                passes_total,
+                ..
+            } if *source == ids[0] => Some(*passes_total),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    assert!(committed >= 4, "{before:?}");
+    recorder
+        .finish(Stop::Now, CancellationToken::new())
+        .await
+        .unwrap();
+    let svc = &recordings(&path, "fake/ops")["svc"];
+    assert!(svc.complete);
+    // Sealed two rows at a time, so at least the even part of the first
+    // subscription's frames, and none of the second's.
+    assert!(
+        (4..=8).contains(&svc.rows),
+        "the segments before the failure are kept: {svc:?}"
+    );
+    let readers = metriken_storage::ArchiveReader::from_catalog(
+        Box::new(metriken_storage::DendroCatalog::open(&path).unwrap()),
+        None,
+        metriken_storage::BufferPool::new(64 << 20),
+        None,
+    )
+    .unwrap();
+    assert_eq!(readers.len(), 2);
+}
+
+/// A reconnect that names another producer, while the old producer's rows
+/// cannot be sealed: the seal ending its recording finds the failure, the
+/// source is dropped, and no recording is added for the new producer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_producer_change_whose_last_seal_fails_drops_the_source() {
+    let fake = serve(Behaviour {
+        streams: Streams::Restarts(3),
+        restarted_labels: Some(map(&[("source", "other")])),
+        duplicate_column: true,
+        ..stream_only(&[("source", "svc")], &[])
+    })
+    .await;
+    let detected = detect(&client(), &detect_cfg(), vec![spec(&fake.url)], &NoProbe).await;
+    let anchor = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("changed.dendro");
+    // The default seal policy: the three frames meet their first seal when
+    // the recording of `svc` ends.
+    let (recorder, ids, mut rx) = Recorder::start(
+        RecorderConfig::new(&path, INTERVAL),
+        client(),
+        Arc::new(NoProbe),
+        detected,
+        vec![Box::new(Counting { anchor, n: 0 })],
+    )
+    .await
+    .unwrap();
+    let (before, later) = until_failed(&mut rx, Duration::from_millis(800)).await;
+    let Some(Event::SourceFailed { source, reason }) = before.last() else {
+        unreachable!()
+    };
+    assert_eq!(*source, ids[0]);
+    assert!(reason.contains("fake/ops could not be encoded"), "{reason}");
+    let all: Vec<&Event> = before.iter().chain(&later).collect();
+    assert!(
+        !all.iter()
+            .any(|e| matches!(e, Event::ProducerChanged { .. })),
+        "{all:?}"
+    );
+    assert!(!later.iter().any(|e| records(e, ids[0])), "{later:?}");
+    let summary = recorder
+        .finish(Stop::Now, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(summary.sources[0].state, SourceState::Failed);
+    let recordings = recordings(&path, "fake/ops");
+    assert!(!recordings.contains_key("other"), "{recordings:?}");
+    assert!(recordings["svc"].complete);
+}
+
+/// A patch to a source that failed is refused: its recording is finalized.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_patch_to_a_failed_source_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("patch.dendro");
+    let anchor = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let (recorder, ids, mut rx) = Recorder::start_local(
+        sealing_often(&path),
+        vec![
+            Box::new(Counting { anchor, n: 0 }),
+            Box::new(Duplicating { anchor, n: 0 }),
+        ],
+    )
+    .await
+    .unwrap();
+    until_failed(&mut rx, Duration::ZERO).await;
+    let refused = recorder
+        .patch_metadata(ids[1], map(&[("owner", "caller")]))
+        .await;
+    assert!(
+        matches!(&refused, Err(Error::Source(e)) if e.contains("failed")),
+        "{refused:?}"
+    );
+    recorder
+        .patch_metadata(ids[0], map(&[("owner", "caller")]))
+        .await
+        .unwrap();
+    recorder
+        .finish(Stop::Now, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(!recordings(&path, "dup")["dup"]
+        .metadata
+        .contains_key("owner"));
+    assert_eq!(
+        recordings(&path, "self/latency")["self"].metadata["owner"],
+        "caller"
+    );
+}
+
+/// A streamed frame the recorder cannot read (its rows stamped before the
+/// Unix epoch) fails that source alone, and the local source beside it
+/// records on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streamed_frame_that_cannot_be_read_fails_only_its_source() {
+    let fake = serve(Behaviour {
+        before_epoch: true,
+        ..stream_only(&[("source", "svc")], &[])
+    })
+    .await;
+    let detected = detect(&client(), &detect_cfg(), vec![spec(&fake.url)], &NoProbe).await;
+    let anchor = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unreadable.dendro");
+    let (recorder, ids, mut rx) = Recorder::start(
+        RecorderConfig::new(&path, INTERVAL),
+        client(),
+        Arc::new(NoProbe),
+        detected,
+        vec![Box::new(Counting { anchor, n: 0 })],
+    )
+    .await
+    .unwrap();
+    let (before, later) = until_failed(&mut rx, Duration::from_millis(800)).await;
+    let Some(Event::SourceFailed { source, reason }) = before.last() else {
+        unreachable!()
+    };
+    assert_eq!(*source, ids[0]);
+    assert!(reason.contains("before the epoch"), "{reason}");
+    assert!(later.iter().any(|e| records(e, ids[1])), "{later:?}");
+    let summary = recorder
+        .finish(Stop::Now, CancellationToken::new())
+        .await
+        .unwrap();
+    let states: Vec<SourceState> = summary.sources.iter().map(|s| s.state).collect();
+    assert_eq!(states, [SourceState::Failed, SourceState::Active]);
+    assert!(recordings(&path, "self/latency")["self"].complete);
+    // The failed source staged no row, and is finalized at the time it was
+    // dropped, not at 0.
+    let archive = dendro::archive::Archive::open(&path).unwrap();
+    for source in archive.read_sources().unwrap() {
+        for (ts, _) in archive.read_clock_offsets(source.id).unwrap() {
+            assert!(ts > 0, "{:?}: a clock offset at {ts}", source.meta.labels);
+        }
+    }
+}

@@ -82,6 +82,12 @@ pub struct Behaviour {
     /// Negotiate the interval, as a producer on metriken-exposition 0.23.1
     /// that opts in does; without it the offer is served as given.
     pub negotiate: bool,
+    /// Send `fake/ops`'s counter twice, as two columns of one name: rows the
+    /// recorder stages and its encoder cannot seal.
+    pub duplicate_column: bool,
+    /// Stamp each pass before the Unix epoch, which the recorder cannot
+    /// read.
+    pub before_epoch: bool,
 }
 
 impl Default for Behaviour {
@@ -101,6 +107,8 @@ impl Default for Behaviour {
             update_floor: Duration::from_millis(10),
             drop_frame_interval: false,
             negotiate: true,
+            duplicate_column: false,
+            before_epoch: false,
         }
     }
 }
@@ -341,13 +349,16 @@ fn stream(
         response = response.header(name, value);
     }
 
+    let desc = MetricDesc {
+        name: "0x0".to_string(),
+        metadata: [("metric".to_string(), "fake_ops".to_string())]
+            .into_iter()
+            .collect(),
+    };
+    let columns = if b.duplicate_column { 2 } else { 1 };
+    let before_epoch = b.before_epoch;
     let schema = Arc::new(GroupSchema {
-        counters: vec![MetricDesc {
-            name: "0x0".to_string(),
-            metadata: [("metric".to_string(), "fake_ops".to_string())]
-                .into_iter()
-                .collect(),
-        }],
+        counters: vec![desc; columns],
         gauges: Vec::new(),
         histograms: Vec::new(),
         gauge_histograms: Vec::new(),
@@ -367,7 +378,7 @@ fn stream(
             schema_hash: schema.hash(),
             schema: Some(schema.clone()),
             window: Some(metriken_types::Window::new(wall - 1_000_000, wall)),
-            counters: vec![Some(count * 10)],
+            counters: vec![Some(count * 10); columns],
             gauges: Vec::new(),
             histograms: Vec::new(),
             gauge_histograms: Vec::new(),
@@ -378,7 +389,7 @@ fn stream(
         let pass = (
             PassStamp {
                 wall_ns: wall,
-                ts: wall as i64,
+                ts: if before_epoch { -1 } else { wall as i64 },
                 wall_offset: 0,
             },
             vec![encoded],

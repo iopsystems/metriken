@@ -277,11 +277,15 @@ impl ArchiveWriter {
     /// failure is listed only once the writer has run it;
     /// [`SourceRecorder::sync`] waits for that.
     ///
-    /// [`SourceRecorder::finalize`] seals the source's streams, discards
-    /// every stream listed for it with its table or occupant stream,
-    /// and marks it complete, so a reader of the finalized archive meets no
-    /// rows it cannot decode. Until then, a reader that materializes the
-    /// live WAL tail fails on those rows.
+    /// [`SourceRecorder::finalize`] seals the source's streams, deletes the
+    /// rows of every stream listed for it after the stream's newest segment
+    /// (every row of a stream with no segment), and marks it complete, so a
+    /// reader of the finalized archive meets no rows it cannot decode. The
+    /// segments a listed stream sealed before it failed are kept. Until
+    /// finalize, a reader that materializes the live WAL tail fails on those
+    /// rows. When the listed stream is a long table's occupant stream, the
+    /// table's series for occupants first described in the deleted rows read
+    /// without their labels.
     ///
     /// A panic in the encoder is caught and recorded like an error when it
     /// unwinds. Under `panic = "abort"`, or with a panic hook that exits the
@@ -1651,20 +1655,12 @@ impl SourceRecorder {
         Ok(())
     }
 
-    /// Remove `streams` from this source: every row and segment of each,
-    /// and of its table's occupant stream (or, for an occupant stream, of
-    /// its table), and stop sealing them. Used for a stream whose rows
-    /// cannot be encoded (see [`ArchiveWriter::create_isolated`]). dendro's
-    /// eviction deletes a stream's segments and WAL rows older than a
-    /// cutoff, so the unsealed rows cannot be removed without the segments
-    /// sealed before them.
+    /// Delete the rows of `streams` after each one's newest segment (every
+    /// row of a stream with no segment) and stop sealing them; their
+    /// segments are kept. Used for a stream whose rows cannot be
+    /// encoded (see [`ArchiveWriter::create_isolated`]).
     pub(crate) fn discard_streams(&mut self, streams: &[String]) -> Result<(), Error> {
-        let mut gone: HashSet<String> = HashSet::new();
-        for stream in streams {
-            let table = occupants::table_of(stream).unwrap_or(stream).to_string();
-            gone.insert(occupants::stream_of(&table));
-            gone.insert(table);
-        }
+        let gone: HashSet<String> = streams.iter().cloned().collect();
         if gone.is_empty() {
             return Ok(());
         }
@@ -1675,17 +1671,18 @@ impl SourceRecorder {
             self.samplers.remove(stream);
         }
         self.writer
-            .evict_streams_before(i64::MAX, Box::new(move |s: &str| gone.contains(s)))
+            .discard_live_rows(Box::new(move |s: &str| gone.contains(s)))
             .map_err(boxed)?;
         Ok(())
     }
 
     /// Seal every stream's tail and mark the source complete. `last` is the
     /// last tick's `(ts, wall_offset)`. In an archive made by
-    /// [`ArchiveWriter::create_isolated`], each stream that failed to
-    /// encode, at this seal or before, is discarded first, with its table
-    /// or occupant stream and the segments it sealed before the failure,
-    /// and stays listed by [`ArchiveWriter::encode_failures`].
+    /// [`ArchiveWriter::create_isolated`], the rows after the newest segment of
+    /// each stream that failed to encode, at this seal or before, are deleted
+    /// before the source is marked complete. The segments the stream sealed
+    /// before the failure are kept, and the stream stays listed by
+    /// [`ArchiveWriter::encode_failures`].
     pub fn finalize(mut self, last: (u64, i64)) -> Result<(), Error> {
         let batch: Vec<String> = self.accounts.keys().cloned().collect();
         if !batch.is_empty() {
