@@ -936,6 +936,21 @@ fn an_exporter_name_stored_under_two_names_is_an_error() {
         "x_nanoseconds_total",
         "x_total",
     );
+    // A selector with `or` reaches the recordings its branches match: one
+    // holding one stored name reads it, and two holding both are an error.
+    reads_stored(
+        &reader,
+        "rate(x_total{source=\"b\" or source=\"zzz\"}[3s])",
+        1000.0,
+        "x_bytes_total",
+        "x_total",
+    );
+    let q = "rate(x_total{source=\"a\" or source=\"b\"}[3s])";
+    let err = reader.query_range(q, lo, hi, 1.0).expect_err(q).to_string();
+    assert!(
+        err.contains("x_nanoseconds_total") && err.contains("x_bytes_total"),
+        "{q}: {err}"
+    );
 
     // Live: one store over both endpoints.
     let store = metriken_query::MemoryStore::builder()

@@ -101,9 +101,34 @@ type Found = BTreeMap<(BTreeMap<String, String>, String, String), BTreeSet<u64>>
 pub(crate) struct Conflicts {
     rows: Mutex<HashMap<SeriesKey, Vec<(SourceName, Rows)>>>,
     found: Mutex<Found>,
+    /// The query's selectors. A read with a selector's filter can return
+    /// series its `or` branches leave out, which the query does not
+    /// answer; [`add`](Self::add) does not report their conflicts.
+    selectors: Vec<crate::promql::Selector>,
 }
 
 impl Conflicts {
+    /// Conflicts of the series `selectors` (a query's selectors) select:
+    /// a series of a metric is kept when a selector naming the metric
+    /// [keeps](crate::promql::Selection::keeps) it, and a series of a
+    /// metric no selector names is kept.
+    pub(crate) fn selecting(selectors: Vec<crate::promql::Selector>) -> Self {
+        Self {
+            selectors,
+            ..Self::default()
+        }
+    }
+
+    /// Whether a series of `metric` with `labels` is one the query selects.
+    fn selected(&self, metric: &str, labels: &BTreeMap<String, String>) -> bool {
+        let mut naming = self
+            .selectors
+            .iter()
+            .filter(|(names, _)| names.contains(metric))
+            .peekable();
+        naming.peek().is_none() || naming.any(|(_, s)| s.keeps_set(labels))
+    }
+
     fn record(&self, key: SeriesKey, source: &SourceName, rows: impl Iterator<Item = Row>) {
         let mut all = self.rows.lock().expect("not poisoned");
         let held = all.entry(key).or_default();
@@ -118,7 +143,8 @@ impl Conflicts {
     }
 
     /// A conflict at time `t` of `series` (its labels with `__name__`)
-    /// between sources `a` and `b`.
+    /// between sources `a` and `b`, unless the query selects no such series
+    /// ([`selecting`](Self::selecting)).
     pub(crate) fn add(
         &self,
         series: BTreeMap<String, String>,
@@ -127,6 +153,12 @@ impl Conflicts {
         t: u64,
     ) {
         if a.position == b.position {
+            return;
+        }
+        let metric = series.get("__name__").map_or("", String::as_str);
+        let mut labels = series.clone();
+        labels.remove("__name__");
+        if !self.selected(metric, &labels) {
             return;
         }
         let (a, b) = if a.name <= b.name { (a, b) } else { (b, a) };

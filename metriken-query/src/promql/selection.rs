@@ -10,6 +10,8 @@
 //! matcher of at least one branch. A series that two branches select is
 //! read once, so it is kept once.
 
+use std::collections::BTreeMap;
+
 use metriken_storage::PROMETHEUS_NAME_LABEL;
 use promql_parser::label::{MatchOp as PromMatchOp, Matcher, Matchers};
 
@@ -22,16 +24,16 @@ use crate::promql::extract_filter_labels;
 pub(crate) struct Selection {
     /// The filter a read takes. For a selector without `or`, its matchers
     /// other than `__name__` ([`extract_filter_labels`]). For a selector
-    /// with `or`, the matchers every branch has that pass, under
-    /// [`Labels::matches`], every series that matches them in PromQL: a
-    /// matcher that matches the empty string and is not negated (`l=""`,
-    /// `l=~".*"`) is left out, since PromQL passes a series without `l` and
-    /// [`Labels::matches`] does not.
+    /// with `or`, the matchers every branch has, less any non-negated
+    /// matcher that matches the empty string (`l=""`, `l=~".*"`): PromQL
+    /// passes a series without `l` for those, and [`Labels::matches`] does
+    /// not.
     pub(crate) filter: Labels,
     /// For a selector with `or`, its branches without `__name__` matchers;
     /// a series read with `filter` is selected when it satisfies every
-    /// matcher of one, a label it does not carry taken as the empty string,
-    /// as in PromQL. Empty when no branch can select the selector's name.
+    /// matcher of one. Each matcher is applied as Prometheus applies it, a
+    /// label a series does not carry taken as the empty string. Empty when
+    /// no branch can select the selector's name.
     /// `None` for a selector without `or`, whose series are those `filter`
     /// reads.
     branches: Option<Vec<Vec<Matcher>>>,
@@ -77,10 +79,7 @@ impl Selection {
             Some((first, rest)) => first
                 .iter()
                 .filter(|m| rest.iter().all(|branch| branch.contains(m)))
-                .filter(|m| {
-                    let negated = matches!(m.op, PromMatchOp::NotEqual | PromMatchOp::NotRe(_));
-                    negated || !m.is_match("")
-                })
+                .filter(|m| filters_alike(m))
                 .cloned()
                 .collect(),
             None => Vec::new(),
@@ -106,16 +105,44 @@ impl Selection {
         self.branches.is_some()
     }
 
+    /// A filter for each branch, of its matchers that
+    /// [`Labels::matches`] applies as PromQL does or more loosely (as
+    /// [`filter`](Self::filter) is chosen): a series a branch selects
+    /// passes that branch's filter. For a selector without `or`, `filter`
+    /// alone. Empty when no branch can select the selector's name.
+    #[cfg_attr(not(feature = "archive"), allow(dead_code))]
+    pub(crate) fn branch_filters(&self) -> Vec<Labels> {
+        match &self.branches {
+            None => vec![self.filter.clone()],
+            Some(branches) => branches
+                .iter()
+                .map(|branch| {
+                    let alike: Vec<Matcher> = branch
+                        .iter()
+                        .filter(|m| filters_alike(m))
+                        .cloned()
+                        .collect();
+                    extract_filter_labels(&alike)
+                })
+                .collect(),
+        }
+    }
+
     /// Whether a series with `labels`, read with [`filter`](Self::filter),
     /// is selected: always for a selector without `or`, else when it
     /// satisfies every matcher of a branch.
     pub(crate) fn keeps(&self, labels: &Labels) -> bool {
+        self.keeps_set(&labels.inner)
+    }
+
+    /// [`keeps`](Self::keeps) for a label set held as a map.
+    pub(crate) fn keeps_set(&self, labels: &BTreeMap<String, String>) -> bool {
         let Some(branches) = &self.branches else {
             return true;
         };
         branches.iter().any(|branch| {
             branch.iter().all(|m| {
-                let value = labels.inner.get(&m.name).map_or("", String::as_str);
+                let value = labels.get(&m.name).map_or("", String::as_str);
                 m.is_match(value)
             })
         })
@@ -181,4 +208,12 @@ impl Selection {
         }
         self
     }
+}
+
+/// Whether [`Labels::matches`] passes every series `m` passes in PromQL:
+/// false for a non-negated matcher that matches the empty string, which
+/// PromQL passes for a series without the label and `Labels::matches`
+/// does not.
+fn filters_alike(m: &Matcher) -> bool {
+    matches!(m.op, PromMatchOp::NotEqual | PromMatchOp::NotRe(_)) || !m.is_match("")
 }

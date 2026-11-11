@@ -14,7 +14,6 @@ mod columns;
 pub(crate) mod json_f64;
 pub(crate) mod prometheus_names;
 mod selection;
-#[cfg(feature = "archive")]
 pub(crate) use columns::Selector;
 pub use columns::{referenced_metrics, selector_filter};
 #[cfg(feature = "archive")]

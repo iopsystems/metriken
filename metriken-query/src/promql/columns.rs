@@ -63,10 +63,9 @@ pub fn referenced_metrics(query: &str) -> Result<HashSet<String>, QueryError> {
 }
 
 /// Each selector of a query: the metric names it can select (one, or none
-/// for a selector with no name) and the filter its read takes
-/// (`Selection::filter`). Like [`referenced_metrics`], needs no source;
-/// a reader uses it to leave out tables whose fixed labels no selector can
-/// match.
+/// for a selector with no name) and the series its matchers select. Like
+/// [`referenced_metrics`], needs no source; a reader uses it to leave out
+/// tables whose fixed labels no selector can match.
 pub(crate) fn selectors(query: &str) -> Result<Vec<Selector>, QueryError> {
     let expr = parse_selector_expr(query)?;
     let mut out = Vec::new();
@@ -74,11 +73,12 @@ pub(crate) fn selectors(query: &str) -> Result<Vec<Selector>, QueryError> {
     Ok(out)
 }
 
-/// A selector: the metric names it can select and its matchers as a filter.
-pub(crate) type Selector = (HashSet<String>, Labels);
+/// A selector: the metric names it can select and the series its matchers
+/// select.
+pub(crate) type Selector = (HashSet<String>, Selection);
 
 /// Mirror of [`walk_names`], collecting each selector whole.
-fn walk_selectors(expr: &Expr, out: &mut Vec<(HashSet<String>, Labels)>) {
+fn walk_selectors(expr: &Expr, out: &mut Vec<Selector>) {
     match expr {
         Expr::Aggregate(agg) => walk_selectors(&agg.expr, out),
         Expr::Unary(u) => walk_selectors(&u.expr, out),
@@ -185,11 +185,10 @@ fn walk_vector_selectors(expr: &Expr, f: &mut dyn FnMut(&parser::VectorSelector)
     }
 }
 
-fn selector(sel: &parser::VectorSelector) -> (HashSet<String>, Labels) {
+fn selector(sel: &parser::VectorSelector) -> Selector {
     let mut names = HashSet::new();
     collect_selector_names(sel, &mut names);
-    let filter = Selection::new(sel.name.as_deref(), &sel.matchers).filter;
-    (names, filter)
+    (names, Selection::new(sel.name.as_deref(), &sel.matchers))
 }
 
 /// Mirror of [`walk`] that collects selector names instead of columns. Kept

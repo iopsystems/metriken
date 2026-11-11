@@ -3,9 +3,11 @@
 //! into an archive, read back by `ArchiveReader` and queried through
 //! metriken-query, and ingested into a live `MemoryStore`.
 //!
-//! promql-parser puts every matcher of such a selector into its branches.
-//! A series is selected when it satisfies every matcher of one branch, a
-//! label it does not carry taken as the empty string, as in Prometheus.
+//! promql-parser puts every matcher of such a selector into its branches
+//! (its `or` between label matchers). A series is selected when it
+//! satisfies every matcher of at least one branch; each matcher is applied
+//! as Prometheus applies it, a label a series does not carry taken as the
+//! empty string.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

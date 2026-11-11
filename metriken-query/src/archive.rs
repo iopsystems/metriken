@@ -16,7 +16,7 @@ use metriken_storage::{table_sampler, ArchiveReader, DataSource, UnionChild, Uni
 use crate::promql::prometheus_names::NameResolution;
 use crate::promql::streaming::conflicts::{Recorded, SourceName};
 use crate::promql::streaming::per_source::{GroupSource, Member, Part, SourceGroups, Tap};
-use crate::promql::QueryEngine;
+use crate::promql::{QueryEngine, Selection};
 use crate::{MetricsSource, QueryError, QueryOptions, QueryResult, RateMode};
 
 /// The evaluation timestamps a composed query needs to stay faithful to
@@ -149,7 +149,7 @@ impl<'a> Plan<'a> {
                     .into_iter()
                     .map(|n| {
                         names
-                            .get(&(n.clone(), filter.clone()))
+                            .get(&(n.clone(), filter.filter.clone()))
                             .cloned()
                             .unwrap_or(n)
                     })
@@ -180,8 +180,7 @@ impl<'a> Plan<'a> {
         for t in &all {
             let extra = labels.of(t);
             let pass = selectors.iter().any(|(names, filter)| {
-                names.iter().any(|n| t.holds(n))
-                    && translate_filter_with(extra, filter, precedence).is_some()
+                names.iter().any(|n| t.holds(n)) && reaches(extra, filter, precedence)
             });
             if pass && !passing.iter().any(|r| r.same_recording(t)) {
                 passing.push(t);
@@ -478,7 +477,9 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
     let mut parts: Vec<Result<Arc<dyn DataSource>, Grouped>> = Vec::new();
     // The rows the query reads of its groups' sources, and the conflicts
     // found in them (S4).
-    let conflicts: Arc<crate::promql::streaming::conflicts::Conflicts> = Default::default();
+    let conflicts = Arc::new(crate::promql::streaming::conflicts::Conflicts::selecting(
+        plan.selectors.clone(),
+    ));
     for (group, unit) in units {
         // A source whose process group has other sources is read by the
         // group's rules even where it alone holds the metric, so a series
@@ -669,7 +670,7 @@ fn resolve_names(
     let mut names = NameResolution::new();
     for (given, filter) in written {
         for name in given {
-            let key = (name.clone(), filter.clone());
+            let key = (name.clone(), filter.filter.clone());
             if names.contains_key(&key) {
                 continue;
             }
@@ -685,7 +686,7 @@ fn resolve_names(
                     Some(scope) => scope_span(reader, scope, t)?.is_some(),
                     None => true,
                 };
-                if in_scope && translate_filter_with(labels.of(t), filter, precedence).is_some() {
+                if in_scope && reaches(labels.of(t), filter, precedence) {
                     reach.push(t);
                 }
             }
@@ -725,6 +726,20 @@ fn resolve_names(
         }
     }
     Ok(names)
+}
+
+/// Whether a recording with labels `extra` can hold a series `selection`
+/// selects: the filter of one of its branches can match them
+/// (`translate_filter_with`).
+fn reaches(
+    extra: &metriken_storage::Labels,
+    selection: &Selection,
+    precedence: Precedence,
+) -> bool {
+    selection
+        .branch_filters()
+        .iter()
+        .any(|filter| translate_filter_with(extra, filter, precedence).is_some())
 }
 
 /// A recording label whose values tell apart the recordings holding each
@@ -879,9 +894,7 @@ fn refuse_kinds_across_recordings(
         // y` reads `m` in recording a only, whatever `y` reaches.
         let reads = |tables: &[&SamplerReader]| {
             selectors.iter().any(|(names, filter)| {
-                names.contains(name)
-                    && translate_filter_with(plan.labels.of(tables[0]), filter, plan.precedence)
-                        .is_some()
+                names.contains(name) && reaches(plan.labels.of(tables[0]), filter, plan.precedence)
             })
         };
         let kinds: Vec<(usize, &'static str)> = recordings
@@ -1956,6 +1969,22 @@ mod tests {
                 8.0
             )]
         );
+        // A branch of a selector with `or` matches a series' own value, as a
+        // matcher without `or` does.
+        for opts in [scoped(0), scoped(1), unscoped.clone()] {
+            for (or, one) in [
+                (
+                    r#"rate(requests{instance="api:9090" or instance="zzz"}[3s])"#,
+                    r#"rate(requests{instance="api:9090"}[3s])"#,
+                ),
+                (
+                    r#"rate(requests{instance="zzz" or instance="rec-b"}[3s])"#,
+                    r#"rate(requests{instance="rec-b"}[3s])"#,
+                ),
+            ] {
+                assert_eq!(run(or, &opts), run(one, &opts), "{or}");
+            }
+        }
         // An operator pairs a series that kept its own `instance` with its
         // recording's series: scoped, and over both recordings by the mark.
         let paired = |r: Vec<(BTreeMap<String, String>, f64)>| -> Vec<BTreeMap<String, String>> {
@@ -2438,6 +2467,44 @@ mod tests {
         assert!(at(r#"fast_ops{source="a"} + slow_ops{source="a"}"#).is_some());
         // A selector that matches no recording still answers, empty.
         assert!(series(&reader, r#"rate(fast_ops{source="c"}[3s])"#).is_empty());
+    }
+
+    /// A selector with `or` reads the recordings one of its branches can
+    /// match: branches on a recording label that select one recording keep
+    /// its cross-cadence alignment and give the single-recording selector's
+    /// answer, and branches selecting two recordings read both.
+    #[test]
+    fn an_or_selector_reads_the_recordings_its_branches_match() {
+        let reader = archive(vec![
+            recording(
+                &[("source", "a")],
+                vec![
+                    ("fast", counter_table("fast_ops", &[(&[], 1)], 50)),
+                    ("slow", sparse_counter("slow_ops")),
+                ],
+            ),
+            recording(
+                &[("source", "b")],
+                vec![
+                    ("fast", explicit_table("fast_ops", "counter", &late_rows())),
+                    ("slow", explicit_table("slow_ops", "counter", &late_rows())),
+                ],
+            ),
+        ]);
+        let at = |q: &str| eval_timestamps_for(&reader, q, 1.0, RateMode::default());
+        let one = r#"fast_ops{source="a"} + slow_ops{source="a"}"#;
+        let or = r#"fast_ops{source="a" or source="c"} + slow_ops{source="c" or source="a"}"#;
+        assert!(at(one).is_some());
+        assert_eq!(at(or), at(one));
+        let one = r#"rate(fast_ops{source="a"}[10s]) + rate(slow_ops{source="a"}[20s])"#;
+        let or = r#"rate(fast_ops{source="a" or source="c"}[10s]) + rate(slow_ops{source="c" or source="a"}[20s])"#;
+        for mode in [RateMode::Grid, RateMode::Raw] {
+            let want = values(&reader, one, mode).unwrap();
+            assert!(!want.is_empty() && !want[0].is_empty(), "{want:?}");
+            assert_eq!(values(&reader, or, mode).unwrap(), want, "{mode:?}");
+        }
+        assert!(at(r#"fast_ops{source="a" or source="b"} + slow_ops"#).is_none());
+        assert!(series(&reader, r#"rate(fast_ops{source="c" or source="d"}[3s])"#).is_empty());
     }
 
     /// A histogram in two recordings is pooled on the slower recording's
