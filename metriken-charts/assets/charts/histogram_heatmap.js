@@ -3,6 +3,7 @@ import {
 } from './util/utils.js';
 import {
     createAxisLabelFormatter,
+    resolveUnit,
 } from './util/units.js';
 import {
     getBaseOption,
@@ -18,8 +19,14 @@ import {
 } from './base.js';
 import { infernoColor } from './util/colormap.js';
 
-// Reuse the shared time formatter for latency bucket labels
-const formatLatencyBucket = createAxisLabelFormatter('time');
+// Bucket bounds are latencies in nanoseconds unless the spec names the unit
+// the histogram is stored in (`format.unit`, with `format.unit_scale`).
+// `unit_system` is not read: the bounds are the stored values whatever the
+// chart's query does with them.
+function bucketBoundFormatter(format) {
+    const { unitSystem, factor } = resolveUnit({ unit: format.unit, unit_scale: format.unit_scale });
+    return createAxisLabelFormatter(unitSystem || 'time', 2, factor);
+}
 
 import {
     buildGradientCanvas,
@@ -51,6 +58,7 @@ export function configureHistogramHeatmap(chart) {
     // Access format properties using snake_case naming to match Rust serialization
     const format = opts.format || {};
     const range = format.range;
+    const formatLatencyBucket = bucketBoundFormatter(format);
 
     // Find the range of buckets that actually have data
     let minBucketIdx = Infinity;

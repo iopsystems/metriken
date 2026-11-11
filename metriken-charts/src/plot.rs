@@ -171,6 +171,37 @@ impl PlotBuilder {
         self
     }
 
+    /// The unit the values the chart is given are in, as the storage key
+    /// `unit` names it (`seconds`, `kibibytes`, `percent`, ...). When the
+    /// plot's [`Unit`] measures the same quantity, the charts multiply each
+    /// value into that system's base before formatting it: a `seconds` value
+    /// by 1e9 for [`Unit::Time`], which counts nanoseconds, and a `percent`
+    /// value by 0.01 for [`Unit::Percentage`], which counts fractions. When it
+    /// does not, as with [`Unit::Percentage`] for a `nanoseconds` counter the
+    /// query divides by 1e9, the unit is ignored and the values are formatted
+    /// as they are. The charts also ignore a unit they do not know;
+    /// `STORED_UNITS` and `resolveUnit` in `charts/util/units.js` list the
+    /// ones they do and the [`Unit`]s each applies to.
+    ///
+    /// Set it only when the query keeps the values in the stored unit (a
+    /// selector, `irate()`, `sum()`, a quantile), not when it rescales them.
+    /// `range` and `with_min_y_span` stay in the stored unit.
+    pub fn with_stored_unit<T: Into<String>>(mut self, unit: T) -> Self {
+        self.opts.format.unit = Some(unit.into());
+        self
+    }
+
+    /// The factor a histogram's values were stored multiplied by, from the
+    /// column's storage key `scale`. metriken-query does not divide it out
+    /// of bucket bounds or quantiles, so the charts divide the
+    /// [`with_stored_unit`](Self::with_stored_unit) factor by it. Ignored
+    /// without a stored unit the charts apply, and when not positive and
+    /// finite.
+    pub fn with_stored_scale(mut self, scale: f64) -> Self {
+        self.opts.format.unit_scale = Some(scale);
+        self
+    }
+
     /// A subtitle for the chart. The chart modules do not draw it; the page
     /// does.
     pub fn with_description<T: Into<String>>(mut self, text: T) -> Self {
@@ -426,7 +457,17 @@ struct FormatConfig {
     y_axis_label: Option<String>,
 
     unit_system: Option<String>, // e.g., "percentage", "time", "bitrate"
-    precision: Option<u8>,       // decimal places
+
+    // The unit the values are stored in, e.g. "seconds"; see
+    // `PlotBuilder::with_stored_unit`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unit: Option<String>,
+
+    // The factor the values were stored multiplied by; see
+    // `PlotBuilder::with_stored_scale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unit_scale: Option<f64>,
+    precision: Option<u8>, // decimal places
 
     log_scale: Option<bool>,
 
@@ -452,6 +493,8 @@ impl FormatConfig {
             x_axis_label: None,
             y_axis_label: None,
             unit_system: Some(unit.to_string()),
+            unit: None,
+            unit_scale: None,
             precision: Some(2),
             log_scale: None,
             range: None,
@@ -477,6 +520,8 @@ pub enum Unit {
     Percentage,
     Frequency,
     Power,
+    Temperature,
+    Cores,
 }
 
 impl std::fmt::Display for Unit {
@@ -491,6 +536,8 @@ impl std::fmt::Display for Unit {
             Self::Percentage => "percentage",
             Self::Frequency => "frequency",
             Self::Power => "power",
+            Self::Temperature => "temperature",
+            Self::Cores => "cores",
         };
 
         write!(f, "{s}")
@@ -509,6 +556,8 @@ impl Unit {
         Self::Power,
         Self::Count,
         Self::Rate,
+        Self::Temperature,
+        Self::Cores,
     ];
 }
 
@@ -550,6 +599,23 @@ mod tests {
         for name in &ours {
             assert_eq!(name.parse::<Unit>().unwrap().to_string(), *name);
         }
+    }
+
+    #[test]
+    fn stored_unit_is_in_the_format_only_when_set() {
+        let format =
+            |b: PlotBuilder| serde_json::to_value(b.build("q")).unwrap()["opts"]["format"].clone();
+        let plain = format(Plot::gauge("t", "id", Unit::Time));
+        assert!(plain.get("unit").is_none(), "{plain}");
+        assert!(plain.get("unit_scale").is_none(), "{plain}");
+        let stored = format(
+            Plot::histogram("t", "id", Unit::Time, HistogramView::Buckets)
+                .with_stored_unit("seconds")
+                .with_stored_scale(1e6),
+        );
+        assert_eq!(stored["unit"], "seconds");
+        assert_eq!(stored["unit_scale"], 1e6);
+        assert_eq!(stored["unit_system"], "time");
     }
 
     #[test]

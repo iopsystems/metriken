@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-charts (unreleased)
+
+Additive (0.1.5): a spec without `format.unit` formats as before.
+
+- **Added:** `format.unit`, the unit a series is stored in (`seconds`,
+  `milliseconds`, `microseconds`, `nanoseconds`, `bytes`, `kilobytes`,
+  `kibibytes`, `megabytes`, `mebibytes`, `gigabytes`, `gibibytes`, `bits`,
+  `percent`, `ratio`, `celsius`, `hertz`, `cores`). A chart multiplies each
+  value into its unit system's base before scaling and suffixing it: a
+  `seconds` value by 1e9 for `time`, a `kibibytes` value by 1024 for
+  `bytes` or `datarate`, a `percent` value by 0.01 for `percentage`. With no
+  `unit_system` the unit's own system is used; with a `unit_system` of
+  another quantity (a `nanoseconds` counter divided by 1e9 and charted as
+  `percentage`) the unit is ignored. `percentage` is read as `percent`, the
+  name metriken-recorder 0.14 stored a percent series under. Line,
+  multi-series, percentile (dots and decimated bands) and heatmap axes,
+  tooltips and legends, and quantile heatmap tooltips and legends, all
+  apply it. A histogram heatmap labels its bucket bounds in the unit, and
+  in nanoseconds without one, as before.
+- **Added:** `format.unit_scale`, a histogram column's `scale` storage
+  key, which metriken-query leaves in bounds and quantiles; the unit's
+  factor is divided by it.
+- **Added:** `resolveUnit(format)` and `STORED_UNITS` in `util/units.js`;
+  `formatWithUnit`, `createAxisLabelFormatter` and `getBaseYAxisOption`
+  take an optional factor.
+- **Added:** the unit systems `temperature` (°C) and `cores`, and
+  `Unit::Temperature` and `Unit::Cores`.
+- **Added:** `PlotBuilder::with_stored_unit` and
+  `PlotBuilder::with_stored_scale`, which set `format.unit` and
+  `format.unit_scale`.
+- **Added:** `specForSourceMetric` sets `format.unit` from a catalog
+  entry's `unit`, and draws a counter in a unit of bytes as `datarate`. A
+  catalog entry without `unit` gives the spec it gave before.
+
 ### metriken-storage 0.12.0
 
 - **Breaking:** `Labels::matches` takes a label the series does not carry

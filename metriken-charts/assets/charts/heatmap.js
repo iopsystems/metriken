@@ -1,6 +1,7 @@
 import {
     createAxisLabelFormatter,
     infinityLabel,
+    resolveUnit,
 } from './util/units.js';
 import {
     formatDateTime,
@@ -115,7 +116,7 @@ export function configureHeatmap(chart) {
 
     // Access format properties using snake_case naming to match Rust serialization
     const format = opts.format || {};
-    const unitSystem = format.unit_system;
+    const { unitSystem, factor: unitFactor } = resolveUnit(format);
     const range = format.range;
     const yAxisLabel = format.y_axis_label || format.axis_label;
     const valueLabel = format.value_label;
@@ -173,7 +174,7 @@ export function configureHeatmap(chart) {
 
         // Escaped: an unknown `unit_system` is returned verbatim as the unit.
         const unitFmt = unitSystem
-            ? createAxisLabelFormatter(unitSystem)
+            ? createAxisLabelFormatter(unitSystem, 2, unitFactor)
             : (v) => infinityLabel(v) ?? v.toFixed(6);
         const fmt = (v) => escapeHtml(unitFmt(v));
 
@@ -369,7 +370,7 @@ export function configureHeatmap(chart) {
     // DOM legend bar: vertical gradient with tick marks and labels to
     // the right of the chart canvas. Mounted inside chart.domNode (the
     // Chart's own element) so the legend is removed with that element.
-    const formatter = createAxisLabelFormatter(unitSystem || 'count');
+    const formatter = createAxisLabelFormatter(unitSystem || 'count', 2, unitFactor);
     const legendColorFn = chart.spec.colormap
         ? buildRampColorFn(chart.spec.colormap)
         : viridisColor;

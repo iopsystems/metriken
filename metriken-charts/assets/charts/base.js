@@ -303,7 +303,12 @@ export function defaultYAxisBounds(logScale, format) {
     };
 }
 
-export function getBaseYAxisOption(logScale, unitSystem, format = {}) {
+/**
+ * The y-axis of a line, multi-series or percentile chart. `factor` is what a
+ * value is multiplied by to be in `unitSystem`'s base (`resolveUnit` in
+ * `util/units.js`).
+ */
+export function getBaseYAxisOption(logScale, unitSystem, format = {}, factor = 1) {
     return {
         type: logScale ? 'log' : 'value',
         logBase: 10,
@@ -316,7 +321,7 @@ export function getBaseYAxisOption(logScale, unitSystem, format = {}) {
             ...FONTS.axisLabel,
             margin: 12,
             formatter: unitSystem ?
-                createAxisLabelFormatter(unitSystem) :
+                createAxisLabelFormatter(unitSystem, 2, factor) :
                 function (value) {
                     const inf = infinityLabel(value);
                     if (inf) return inf;

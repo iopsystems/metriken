@@ -138,6 +138,31 @@ struct that holds the `Plot` under `#[serde(flatten)]` beside them.
 `charts/source_metric.js` sets `width: 'full'` in the spec it builds, for a
 page whose layout reads it.
 
+## Stored units
+
+Each unit system formats values in one base: `time` in nanoseconds, `bytes`
+and `datarate` in bytes, `percentage` as a fraction from 0 to 1. A series
+stored in another unit names it in `opts.format.unit`, as the storage key
+`unit` spells it (`seconds`, `kibibytes`, `percent`; `STORED_UNITS` in
+`charts/util/units.js` lists them). The chart multiplies each value into the
+base before formatting it, on the axis, in tooltips and in heatmap legends:
+
+| `format` | value | shown |
+| --- | --- | --- |
+| `{ unit_system: 'time' }` | `250000000` | `250 ms` |
+| `{ unit: 'seconds' }` | `0.25` | `250 ms` |
+| `{ unit: 'kibibytes' }` | `4` | `4 KB` |
+| `{ unit: 'percent' }` | `45` | `45 %` |
+| `{ unit: 'nanoseconds', unit_system: 'percentage' }` | `0.45` | `45 %` |
+
+With no `unit_system`, the unit's own system is used. A `unit_system` for
+another quantity, as in the last row, where the query has divided a
+nanosecond counter by 1e9, leaves the values as they are. `unit` describes
+the values the chart is given, so set it only when the query keeps the
+stored unit. `range` and `min_y_span` stay in that unit. For a histogram
+stored with a `scale` key, `format.unit_scale` divides the factor by it.
+In Rust, `PlotBuilder::with_stored_unit` and `with_stored_scale` set them.
+
 ## Display mode
 
 `charts/display.js` decodes the binary bodies that rezolus's `display_wire`

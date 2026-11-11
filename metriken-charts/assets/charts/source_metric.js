@@ -9,6 +9,7 @@
 // the type→query mapping can't drift.
 
 import { buildDefaultQuery } from './metric_types.js';
+import { STORED_UNITS } from './util/units.js';
 
 /** Deterministic chart id for a source metric — the round-trip handle. */
 export const sourceMetricChartId = (name) => `source-metric-${name}`;
@@ -22,6 +23,12 @@ export const sourceMetricChartId = (name) => `source-metric-${name}`;
  * `histogram_quantiles(...)` would double-wrap and return no data.
  * Counters/gauges are not re-wrapped, so they carry their buildDefaultQuery
  * form (irate(...) / raw).
+ *
+ * `info.unit`, the unit the metric is stored in, becomes `opts.format.unit`,
+ * so the chart scales and labels the values from it (`resolveUnit` in
+ * `util/units.js`). A counter in a unit of bytes is drawn as `datarate`,
+ * since its query is a per-second rate. Without `info.unit` the spec has no
+ * `format`.
  */
 export const specForSourceMetric = (info) => {
     const opts = {
@@ -30,6 +37,13 @@ export const specForSourceMetric = (info) => {
         description: info.description || '',
         type: info.metric_type,
     };
+    if (info.unit) {
+        opts.format = { unit: info.unit };
+        if (info.metric_type === 'counter'
+            && STORED_UNITS[info.unit]?.dimension === 'bytes') {
+            opts.format.unit_system = 'datarate';
+        }
+    }
     let promql_query;
     if (info.metric_type === 'histogram') {
         opts.subtype = 'percentiles';

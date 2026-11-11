@@ -1,6 +1,7 @@
 import {
     createAxisLabelFormatter,
     plainValue,
+    resolveUnit,
 } from './util/units.js';
 import {
     insertGapNulls,
@@ -86,7 +87,7 @@ export function configureMultiSeriesChart(chart) {
 
     // Access format properties using snake_case naming to match Rust serialization
     const format = opts.format || {};
-    const unitSystem = format.unit_system;
+    const { unitSystem, factor: unitFactor } = resolveUnit(format);
     const logScale = format.log_scale;
     const range = format.range;
 
@@ -235,11 +236,11 @@ export function configureMultiSeriesChart(chart) {
     // at the cursor.
     const option = {
         ...baseOption,
-        yAxis: getBaseYAxisOption(logScale, unitSystem, format),
+        yAxis: getBaseYAxisOption(logScale, unitSystem, format, unitFactor),
         tooltip: {
             ...baseOption.tooltip,
             formatter: getTooltipFormatter(unitSystem ?
-                createAxisLabelFormatter(unitSystem) :
+                createAxisLabelFormatter(unitSystem, 2, unitFactor) :
                 plainValue, null, chart),
         },
         // Bands first so they sit behind the lines (z also enforces this).
