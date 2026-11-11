@@ -33,6 +33,13 @@
 //! handler; it reports [`Event`]s and returns a [`Summary`], and the caller
 //! decides what each means.
 //!
+//! A source whose rows cannot be recorded fails alone
+//! ([`Event::SourceFailed`]). When every source has failed or been refused,
+//! the recorder reports [`Event::NoneRecording`] and keeps the archive open;
+//! [`Recorder::finish`] finalizes it and returns `Ok`. Only an archive error,
+//! or a panic in a local source's pass, fails the recording
+//! ([`Event::Failed`], [`Error::Archive`]).
+//!
 //! # Features
 //!
 //! - `http` (default): [`detect`], [`Subscription`], [`pump`], scraping and

@@ -180,7 +180,8 @@ pub enum SourceState {
     Refused,
     /// Its rows could not be recorded ([`Event::SourceFailed`]): it stopped
     /// recording, and its recording is finalized without the rows that
-    /// failed.
+    /// failed. Never retried. The recording does not fail with it, even when
+    /// it was the last source recording.
     Failed,
 }
 
@@ -219,7 +220,8 @@ pub enum Stop {
 /// emits without limit, are counted in `Lagged` instead once 1,024 events
 /// are queued (a restart or a producer change is still written into the
 /// archive). The others (`Active`, `Pending`, `Refused`, `LabelsNotApplied`,
-/// `SourceFailed`, `Failed`) come at most a few per source, so the queue
+/// `SourceFailed`, `NoneRecording`, `Failed`) come at most a few per source
+/// or once per recording, so the queue
 /// stays bounded. Events still queued when the recorder stops are sent from
 /// a task of their own until the receiver is dropped. A caller that ignores
 /// events drops the receiver.
@@ -308,19 +310,29 @@ pub enum Event {
     /// each failed table's rows after its newest segment are deleted and its
     /// segments are kept; rows that could not be staged, read or decoded were
     /// never written. The recording is then finalized. The other sources keep
-    /// recording. When no source is `Pending`, `Activating` or `Active`, the
-    /// recording fails ([`Event::Failed`], after this event); the check runs
-    /// again when a source is refused, so a refusal that leaves none `Pending`,
-    /// `Activating` or `Active` ends it too. `reason` names each failed table
-    /// and the encoder's error, or what could not be staged or read. At most
-    /// once per source; its state is then [`SourceState::Failed`].
+    /// recording, and the recording does not fail, even when this was the
+    /// last source recording ([`Event::NoneRecording`] follows then).
+    /// `reason` names each failed table and the encoder's error, or what
+    /// could not be staged or read. At most once per source; its state is
+    /// then [`SourceState::Failed`].
     SourceFailed { source: SourceId, reason: String },
-    /// The archive failed, or a source failed ([`Event::SourceFailed`]) and
-    /// no source is left `Pending`, `Activating` or `Active`. The recorder
-    /// has stopped ticking; what is on disk holds every tick committed before
-    /// the failure. In the second case the recordings still open, of sources
-    /// refused on a reconnect, are finalized first. [`Recorder::finish`]
-    /// returns this error.
+    /// No source is `Pending`, `Activating` or `Active`: each was refused or
+    /// failed ([`Event::Refused`], [`Event::SourceFailed`]), or none was
+    /// given. Emitted once, when the recorder starts with none or after the
+    /// event that left none; a `Refused` or `Failed` source never records
+    /// again, so the count cannot rise after it. Not emitted once
+    /// [`Recorder::finish`] has begun. The recording has not failed: the
+    /// recorder keeps ticking with nothing to record, and
+    /// [`Recorder::finish`] finalizes the archive with the rows committed
+    /// so far and returns each source's state. A caller with no other reason
+    /// to stop can finish on this event.
+    NoneRecording,
+    /// The recording failed: a commit, a seal, retention, a metadata write
+    /// or adding a recording failed, the writer task stopped, or a local
+    /// source's pass panicked. A source that fails ([`Event::SourceFailed`])
+    /// does not cause this, even the last. The recorder has stopped ticking;
+    /// what is on disk holds every tick committed before the failure.
+    /// [`Recorder::finish`] returns this error.
     Failed { error: String },
     /// A streamed frame was staged. `seq` counts this source's frames,
     /// across reconnects; `stamp` is its newest pass, `None` for an empty
@@ -443,8 +455,9 @@ pub fn default_timeout(interval: Duration) -> Duration {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
-    /// The archive failed mid-run ([`Event::Failed`]), or at finalize; or a
-    /// source failed and no source was left recording.
+    /// The archive failed mid-run ([`Event::Failed`]), or at finalize or
+    /// when the writer was joined. A source that failed
+    /// ([`Event::SourceFailed`]) is not one, even the last.
     Archive(String),
     /// No such source, one that was refused before it was recorded, or one
     /// that failed ([`Event::SourceFailed`]).
@@ -655,7 +668,7 @@ impl Recorder {
             last_pass: None,
             failed: None,
             failure_reported: false,
-            last_source_failure: None,
+            none_reported: false,
             stopping: false,
             seen_labels: BTreeMap::new(),
             seen_by: BTreeMap::new(),
@@ -733,6 +746,11 @@ impl Recorder {
     /// The tick stops first, so no pass is taken while this waits.
     /// Cancelling `cancel` ends the `AfterExit` wait or the `Grace` sleep
     /// and goes on to finalize.
+    ///
+    /// Returns `Ok` with each source's state when every source failed or was
+    /// refused ([`Event::NoneRecording`]): the rows committed before the
+    /// failures are finalized as any others. `Err` is the archive's
+    /// ([`Error::Archive`]).
     ///
     /// When no source delivered a frame, a scrape or a pass, the archive is
     /// removed instead and [`Summary::discarded`] says so.
@@ -1328,11 +1346,10 @@ struct Driver {
     failed: Option<String>,
     /// `fail` has reported the failure: a second call reports nothing.
     failure_reported: bool,
-    /// The latest [`Event::SourceFailed`]'s source and reason, for the
-    /// error when no source is left recording.
-    last_source_failure: Option<String>,
+    /// [`Event::NoneRecording`] has been emitted.
+    none_reported: bool,
     /// `finish` has begun: a producer change no longer starts a new
-    /// recording.
+    /// recording, and [`Event::NoneRecording`] is not emitted.
     stopping: bool,
     /// Each added recording's label set, for the identical-labels warning.
     seen_labels: BTreeMap<BTreeMap<String, String>, String>,
@@ -1394,6 +1411,7 @@ impl Driver {
                 self.emitter.must(event);
             }
         }
+        self.note_if_none_left();
 
         let interval = self.settings.interval;
         let start = Instant::now() + align_wait(wall_now_ns(), interval);
@@ -1513,8 +1531,8 @@ impl Driver {
         self.last_pass = Some(wall);
     }
 
-    /// The recording failed (the archive, or no source left recording):
-    /// report it, stop ticking, and leave what is on disk as it is.
+    /// The archive failed: report it, stop ticking, and leave what is on
+    /// disk as it is.
     async fn fail(&mut self, error: String) {
         if self.failure_reported {
             self.failed.get_or_insert(error);
@@ -1606,10 +1624,7 @@ impl Driver {
             .await;
         match result {
             Some(Ok(dropped)) => {
-                self.drop_failed(dropped).await;
-                if self.failed.is_some() {
-                    return;
-                }
+                self.drop_failed(dropped);
             }
             Some(Err(e)) => return self.fail(e).await,
             None => {
@@ -1648,9 +1663,9 @@ impl Driver {
 
     /// Each `(slot, reason)`'s recording was finalized after its rows could
     /// not be encoded, staged, read or decoded ([`drop_unencodable`]): stop
-    /// recording the slot, and emit [`Event::SourceFailed`]. Then fail the recording
-    /// when none is left ([`fail_if_none_left`](Self::fail_if_none_left)).
-    async fn drop_failed(&mut self, dropped: Vec<(usize, String)>) {
+    /// recording the slot, and emit [`Event::SourceFailed`]. Then report when
+    /// none is left ([`note_if_none_left`](Self::note_if_none_left)).
+    fn drop_failed(&mut self, dropped: Vec<(usize, String)>) {
         if dropped.is_empty() {
             return;
         }
@@ -1665,22 +1680,20 @@ impl Driver {
                 ep.abort_tasks();
             }
             let source = slot.id;
-            self.last_source_failure = Some(format!("{label}: {reason}"));
             self.emitter.must(Event::SourceFailed { source, reason });
         }
-        self.fail_if_none_left().await;
+        self.note_if_none_left();
     }
 
-    /// Fail the recording when a source has failed and no source is
-    /// `Pending`, `Activating` or `Active`: nothing is left to record. The
-    /// recordings still open (sources refused on a reconnect keep theirs)
-    /// are finalized first, after the rows staged since the last commit are
-    /// committed, as `finish` would. A refusal alone never fails the
-    /// recording.
-    async fn fail_if_none_left(&mut self) {
-        let Some(last) = self.last_source_failure.clone() else {
+    /// Emit [`Event::NoneRecording`] the first time no source is `Pending`,
+    /// `Activating` or `Active`, unless `finish` has begun. Nothing else
+    /// changes: the archive stays open, the tick goes on, and the recordings
+    /// still open (sources refused on a reconnect keep theirs) are finalized
+    /// by `finish`.
+    fn note_if_none_left(&mut self) {
+        if self.none_reported || self.stopping {
             return;
-        };
+        }
         let recording = self.slots.iter().any(|s| {
             matches!(
                 s.state,
@@ -1690,33 +1703,8 @@ impl Driver {
         if recording {
             return;
         }
-        let (_, ts, wall_offset) = self.stamp_now();
-        let fallback = (ts, wall_offset);
-        let lasts = self.lasts();
-        let finalized = self
-            .blocking(move |a| -> Result<(), String> {
-                // A streamed frame staged since the last commit, which
-                // `lasts` already counts.
-                if let Err(e) = a.writer.commit(std::mem::take(&mut a.staged)) {
-                    warn!("committing the rows staged before the recording failed: {e}");
-                }
-                let mut first_err = None;
-                for (i, rec) in std::mem::take(&mut a.recs) {
-                    let last = lasts.get(&i).copied().unwrap_or(fallback);
-                    if let Err(e) = rec.finalize(last) {
-                        first_err.get_or_insert(e.to_string());
-                    }
-                }
-                first_err.map_or(Ok(()), Err)
-            })
-            .await;
-        if let Some(Err(e)) = finalized {
-            warn!("finalizing the recordings still open failed: {e}");
-        }
-        self.fail(format!(
-            "no source is left recording; the last to fail: {last}"
-        ))
-        .await;
+        self.none_reported = true;
+        self.emitter.must(Event::NoneRecording);
     }
 
     /// Stage `snapshot` for slot `i`. Rows that cannot be staged fail the
@@ -2082,8 +2070,7 @@ impl Driver {
         if !unencodable.is_empty() {
             // A failure found one tick earlier would have dropped the
             // source; one found at this seal drops it the same way.
-            self.drop_failed(vec![(i, unencodable_reason(&unencodable))])
-                .await;
+            self.drop_failed(vec![(i, unencodable_reason(&unencodable))]);
             return Ok(false);
         }
         let old = std::mem::take(&mut self.slots[i].maps);
@@ -2285,10 +2272,7 @@ impl Driver {
         self.drop_archive().await;
         match finalized {
             Some(Ok(dropped)) => {
-                self.drop_failed(dropped).await;
-                if let Some(e) = &self.failed {
-                    return Err(Error::Archive(e.clone()));
-                }
+                self.drop_failed(dropped);
                 Ok(Summary {
                     sources: self.slots.iter().map(Slot::summary).collect(),
                     discarded: false,
@@ -2784,13 +2768,13 @@ impl Driver {
                     }
                     None => format!("{refusal}. {RECONNECT_REFUSED}"),
                 };
-                self.refuse(i, reason).await;
+                self.refuse(i, reason);
             }
         }
         Ok(())
     }
 
-    async fn refuse(&mut self, i: usize, reason: String) {
+    fn refuse(&mut self, i: usize, reason: String) {
         // A slot whose rows could not be staged fails at the next commit,
         // and is reported once, as failed.
         if self.is_unstageable(i) {
@@ -2804,7 +2788,7 @@ impl Driver {
         }
         let source = slot.id;
         self.emitter.must(Event::Refused { source, reason });
-        self.fail_if_none_left().await;
+        self.note_if_none_left();
     }
 
     /// Write each restart into its recording's identity layers once a row from
@@ -3132,7 +3116,7 @@ impl Driver {
                             ep.detecting = Some(spawn());
                         }
                         Outcome::Refused(reason) => {
-                            self.refuse(i, reason).await;
+                            self.refuse(i, reason);
                         }
                         Outcome::Streamed(sub) => {
                             info!(
