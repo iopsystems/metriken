@@ -26,9 +26,12 @@ export const sourceMetricChartId = (name) => `source-metric-${name}`;
  *
  * `info.unit`, the unit the metric is stored in, becomes `opts.format.unit`,
  * so the chart scales and labels the values from it (`resolveUnit` in
- * `util/units.js`). A counter in a unit of bytes is drawn as `datarate`,
- * since its query is a per-second rate. Without `info.unit` the spec has no
- * `format`.
+ * `util/units.js`), and a histogram's `info.scale` (its `scale` storage key)
+ * becomes `opts.format.unit_scale`. A counter's query is a per-second rate,
+ * so a counter in a unit of bytes is drawn as `datarate`, and one in a unit
+ * of time as `percentage` (seconds per second is a fraction). A `bits` gauge
+ * is drawn as `count`, since the only bits system, `bitrate`, is a rate.
+ * Without `info.unit` the spec has no `format`.
  */
 export const specForSourceMetric = (info) => {
     const opts = {
@@ -39,9 +42,18 @@ export const specForSourceMetric = (info) => {
     };
     if (info.unit) {
         opts.format = { unit: info.unit };
-        if (info.metric_type === 'counter'
-            && STORED_UNITS[info.unit]?.dimension === 'bytes') {
+        const dimension = Object.hasOwn(STORED_UNITS, info.unit)
+            ? STORED_UNITS[info.unit].dimension
+            : null;
+        if (info.metric_type === 'counter' && dimension === 'bytes') {
             opts.format.unit_system = 'datarate';
+        } else if (info.metric_type === 'counter' && dimension === 'time') {
+            opts.format.unit_system = 'percentage';
+        } else if (info.metric_type === 'gauge' && dimension === 'bits') {
+            opts.format.unit_system = 'count';
+        }
+        if (info.metric_type === 'histogram' && info.scale != null) {
+            opts.format.unit_scale = info.scale;
         }
     }
     let promql_query;

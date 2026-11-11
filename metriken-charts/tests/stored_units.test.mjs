@@ -5,8 +5,9 @@ import { createRequire } from 'node:module';
 // A series stored in seconds, milliseconds, KiB or percent is formatted from
 // `format.unit`: each value is multiplied into the base of its unit system
 // (nanoseconds, bytes, a 0..1 fraction) before it is scaled and suffixed. A
-// spec with no `unit` formats exactly as before. Every chart type is drawn
-// by its real module and its axis, tooltip and legend labels are read back.
+// spec with no `unit` formats from `unit_system` alone. Every chart type is
+// drawn by its real module and its axis, tooltip and legend labels are read
+// back.
 
 // Every element the modules create, so the heatmaps' DOM legend can be read.
 const created = [];
@@ -108,7 +109,8 @@ test('a percent series formats as a percentage without the x100', () => {
     assert.equal(pct(45), '45 %');
     assert.equal(pct(99.5), '99.5 %');
     assert.equal(fmt({ unit: 'percent', unit_system: 'percentage' })(45), '45 %');
-    // metriken-recorder 0.14 stored a `percent` series as `percentage`.
+    // `percentage` is read as `percent` (0 to 100): rezolus samplers and
+    // metriken-recorder 0.12–0.14 write that name.
     assert.equal(fmt({ unit: 'percentage' })(45), '45 %');
     assert.equal(fmt({ unit: 'ratio' })(0.45), '45 %');
 });
@@ -120,7 +122,7 @@ test('bits, hertz, celsius and cores have a system each', () => {
     assert.equal(fmt({ unit: 'cores' })(3.25), '3.25 cores');
 });
 
-test('an unset or unknown unit formats as before', () => {
+test('an unset or unknown unit formats from unit_system alone', () => {
     for (const format of [{ unit_system: 'time' }, { unit_system: 'time', unit: 'fortnights' },
         { unit_system: 'time', unit: 'constructor' }, { unit_system: 'time', unit: null }]) {
         assert.deepEqual(resolveUnit(format), { unitSystem: 'time', factor: 1 }, JSON.stringify(format));
@@ -132,20 +134,44 @@ test('an unset or unknown unit formats as before', () => {
     assert.equal(fmt({ unit_system: 'bytes' })(4096), '4 KB');
 });
 
-test('a unit of another dimension than the unit system is ignored', () => {
-    // A nanoseconds counter divided by 1e9 and charted as a percentage.
-    assert.deepEqual(resolveUnit({ unit: 'nanoseconds', unit_system: 'percentage' }),
+test('a unit of another dimension with no conversion is ignored', () => {
+    for (const [unit, unit_system] of [['seconds', 'count'], ['bytes', 'time'], ['bits', 'count'],
+        ['percent', 'time'], ['celsius', 'percentage'], ['kibibytes', 'rate']]) {
+        assert.deepEqual(resolveUnit({ unit, unit_system }), { unitSystem: unit_system, factor: 1 },
+            `${unit} as ${unit_system}`);
+    }
+});
+
+test('bytes convert into bitrate (x8)', () => {
+    assert.deepEqual(resolveUnit({ unit: 'bytes', unit_system: 'bitrate' }), { unitSystem: 'bitrate', factor: 8 });
+    assert.deepEqual(resolveUnit({ unit: 'kibibytes', unit_system: 'bitrate' }),
+        { unitSystem: 'bitrate', factor: 8192 });
+    assert.equal(fmt({ unit: 'bytes', unit_system: 'bitrate' })(125000), '1 Mbps');
+});
+
+test('bits convert into bytes and datarate (/8)', () => {
+    assert.deepEqual(resolveUnit({ unit: 'bits', unit_system: 'bytes' }), { unitSystem: 'bytes', factor: 0.125 });
+    assert.equal(fmt({ unit: 'bits', unit_system: 'bytes' })(8192), '1 KB');
+    assert.equal(fmt({ unit: 'bits', unit_system: 'datarate' })(8e6), '1 MB/s');
+});
+
+test('a time counter\'s rate converts into percentage (/1e9)', () => {
+    // irate() of a seconds counter is seconds per second: 0.5 is half a core.
+    assert.deepEqual(resolveUnit({ unit: 'seconds', unit_system: 'percentage' }),
         { unitSystem: 'percentage', factor: 1 });
-    assert.deepEqual(resolveUnit({ unit: 'seconds', unit_system: 'count' }),
-        { unitSystem: 'count', factor: 1 });
-    assert.deepEqual(resolveUnit({ unit: 'bytes', unit_system: 'bitrate' }),
-        { unitSystem: 'bitrate', factor: 1 });
+    assert.equal(fmt({ unit: 'seconds', unit_system: 'percentage' })(0.5), '50 %');
+    // irate() of a nanoseconds counter is nanoseconds per second.
+    assert.equal(fmt({ unit: 'nanoseconds', unit_system: 'percentage' })(250000000), '25 %');
+    assert.equal(fmt({ unit: 'milliseconds', unit_system: 'percentage' })(750), '75 %');
 });
 
 test('unit_scale divides the factor, and only with a unit that applies', () => {
     assert.deepEqual(resolveUnit({ unit: 'seconds', unit_scale: 1e6 }), { unitSystem: 'time', factor: 1e3 });
     assert.equal(fmt({ unit: 'seconds', unit_scale: 1e6 })(5000), '5 ms');
-    for (const unit_scale of [0, -1, NaN, Infinity, '1e6']) {
+    // Column metadata holds the scale as a string.
+    assert.equal(resolveUnit({ unit: 'seconds', unit_scale: '1e6' }).factor, 1e3);
+    assert.equal(resolveUnit({ unit: 'ratio', unit_scale: '10' }).factor, 0.1);
+    for (const unit_scale of [0, -1, NaN, Infinity, 'x', '', null]) {
         assert.equal(resolveUnit({ unit: 'seconds', unit_scale }).factor, 1e9, String(unit_scale));
     }
     assert.equal(resolveUnit({ unit_system: 'time', unit_scale: 1e6 }).factor, 1);
@@ -206,8 +232,8 @@ const legendLabels = () => created
     .filter((el) => el.className === 'heatmap-legend-tick-label')
     .map((el) => el.textContent);
 
-// The same quantity three ways: nanoseconds as rezolus stores it, and
-// seconds and milliseconds with the unit named. Each must read the same.
+// The same quantity three ways: nanoseconds with only `unit_system: 'time'`,
+// and seconds and milliseconds with the unit named. Each reads the same.
 const SAME_QUANTITY = [
     { format: { unit_system: 'time' }, scale: 1e9 },
     { format: { unit: 'seconds' }, scale: 1 },
@@ -349,4 +375,31 @@ test('a source metric spec carries the catalog unit', () => {
         specForSourceMetric({ name: 'lat', metric_type: 'histogram', unit: 'seconds' }).opts.format,
         { unit: 'seconds' });
     assert.equal(specForSourceMetric({ name: 'up', metric_type: 'gauge' }).opts.format, undefined);
+});
+
+test('a source time counter is drawn as a percentage, not a duration', () => {
+    const format = specForSourceMetric(
+        { name: 'process_cpu_seconds_total', metric_type: 'counter', unit: 'seconds' }).opts.format;
+    assert.deepEqual(format, { unit: 'seconds', unit_system: 'percentage' });
+    assert.equal(fmt(format)(0.5), '50 %');
+    const ns = specForSourceMetric({ name: 'cpu_usage', metric_type: 'counter', unit: 'nanoseconds' }).opts.format;
+    assert.equal(fmt(ns)(5e8), '50 %');
+});
+
+test('a source bits gauge is drawn as a count, not a rate', () => {
+    const format = specForSourceMetric({ name: 'link_bits', metric_type: 'gauge', unit: 'bits' }).opts.format;
+    assert.deepEqual(format, { unit: 'bits', unit_system: 'count' });
+    assert.equal(fmt(format)(2500), '2.5 K');
+    const counter = specForSourceMetric({ name: 'rx_bits_total', metric_type: 'counter', unit: 'bits' }).opts.format;
+    assert.equal(fmt(counter)(2500), '2.5 Kbps');
+});
+
+test('a source histogram carries its scale', () => {
+    // A `_ratio` histogram stored with bounds multiplied by 10.
+    const format = specForSourceMetric(
+        { name: 'hit_ratio', metric_type: 'histogram', unit: 'ratio', scale: '10' }).opts.format;
+    assert.deepEqual(format, { unit: 'ratio', unit_scale: '10' });
+    assert.equal(fmt(format)(5), '50 %');
+    assert.equal(specForSourceMetric(
+        { name: 'g', metric_type: 'gauge', unit: 'ratio', scale: '10' }).opts.format.unit_scale, undefined);
 });

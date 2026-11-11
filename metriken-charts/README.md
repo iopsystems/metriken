@@ -145,7 +145,9 @@ and `datarate` in bytes, `percentage` as a fraction from 0 to 1. A series
 stored in another unit names it in `opts.format.unit`, as the storage key
 `unit` spells it (`seconds`, `kibibytes`, `percent`; `STORED_UNITS` in
 `charts/util/units.js` lists them). The chart multiplies each value into the
-base before formatting it, on the axis, in tooltips and in heatmap legends:
+base before formatting it. Line, multi-series and percentile (dots and
+decimated bands) axes and tooltips, and heatmap and quantile heatmap
+tooltips and colour legends, apply it:
 
 | `format` | value | shown |
 | --- | --- | --- |
@@ -153,15 +155,26 @@ base before formatting it, on the axis, in tooltips and in heatmap legends:
 | `{ unit: 'seconds' }` | `0.25` | `250 ms` |
 | `{ unit: 'kibibytes' }` | `4` | `4 KB` |
 | `{ unit: 'percent' }` | `45` | `45 %` |
-| `{ unit: 'nanoseconds', unit_system: 'percentage' }` | `0.45` | `45 %` |
+| `{ unit: 'bytes', unit_system: 'bitrate' }` | `125000` | `1 Mbps` |
+| `{ unit: 'seconds', unit_system: 'percentage' }` | `0.5` | `50 %` |
+| `{ unit: 'seconds', unit_system: 'count' }` | `0.5` | `0.5` |
 
-With no `unit_system`, the unit's own system is used. A `unit_system` for
-another quantity, as in the last row, where the query has divided a
-nanosecond counter by 1e9, leaves the values as they are. `unit` describes
-the values the chart is given, so set it only when the query keeps the
-stored unit. `range` and `min_y_span` stay in that unit. For a histogram
-stored with a `scale` key, `format.unit_scale` divides the factor by it.
-In Rust, `PlotBuilder::with_stored_unit` and `with_stored_scale` set them.
+With no `unit_system`, the unit's own system is used. Three conversions
+cross dimensions: bytes into `bitrate` (×8), bits into `bytes` or
+`datarate` (÷8), and a time unit into `percentage` (÷1e9 from nanoseconds,
+for the per-second rate of a time counter, which is a fraction). With a
+`unit_system` of another dimension that has no conversion, `unit` is
+ignored; the query must already be in that system's base, as in the last
+row. `unit` describes the values the chart is given, so set it only when
+the query keeps the stored unit. `range` and `min_y_span` stay in that unit
+(for a histogram with `unit_scale`, in the stored unit times the scale).
+For a histogram stored with a `scale` key, `format.unit_scale` (a number
+or a numeric string) divides the factor by it. In Rust,
+`PlotBuilder::with_stored_unit` and `with_stored_scale` set them.
+
+`specForSourceMetric` draws a counter in a bytes unit as `datarate`, a
+counter in a time unit as `percentage`, and a `bits` gauge as `count`,
+since the only bits system, `bitrate`, is a rate.
 
 ## Display mode
 

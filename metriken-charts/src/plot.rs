@@ -172,20 +172,24 @@ impl PlotBuilder {
     }
 
     /// The unit the values the chart is given are in, as the storage key
-    /// `unit` names it (`seconds`, `kibibytes`, `percent`, ...). When the
-    /// plot's [`Unit`] measures the same quantity, the charts multiply each
-    /// value into that system's base before formatting it: a `seconds` value
-    /// by 1e9 for [`Unit::Time`], which counts nanoseconds, and a `percent`
-    /// value by 0.01 for [`Unit::Percentage`], which counts fractions. When it
-    /// does not, as with [`Unit::Percentage`] for a `nanoseconds` counter the
-    /// query divides by 1e9, the unit is ignored and the values are formatted
-    /// as they are. The charts also ignore a unit they do not know;
-    /// `STORED_UNITS` and `resolveUnit` in `charts/util/units.js` list the
-    /// ones they do and the [`Unit`]s each applies to.
+    /// `unit` names it (`seconds`, `kibibytes`, `percent`, ...). The charts
+    /// multiply each value into the base of the plot's [`Unit`] before
+    /// formatting it: a `seconds` value by 1e9 for [`Unit::Time`], which
+    /// counts nanoseconds, a `percent` value by 0.01 for
+    /// [`Unit::Percentage`], which counts fractions. A few conversions cross
+    /// quantities: bytes into [`Unit::Bitrate`] (×8), bits into
+    /// [`Unit::Bytes`] or [`Unit::Datarate`] (÷8), and a time unit into
+    /// [`Unit::Percentage`] (÷1e9, for the rate of a time counter). With a
+    /// [`Unit`] of another dimension that has no conversion, the unit is
+    /// ignored; the query must already be in that system's base. The charts
+    /// also ignore a unit they do not know. `STORED_UNITS` in
+    /// `charts/util/units.js` lists them; `resolveUnit` documents which
+    /// `Unit`s each applies to.
     ///
     /// Set it only when the query keeps the values in the stored unit (a
-    /// selector, `irate()`, `sum()`, a quantile), not when it rescales them.
-    /// `range` and `with_min_y_span` stay in the stored unit.
+    /// selector, `irate()` of a bytes or bits counter, `sum()`, a quantile),
+    /// not when it rescales them. `range` and `with_min_y_span` stay in the
+    /// stored unit.
     pub fn with_stored_unit<T: Into<String>>(mut self, unit: T) -> Self {
         self.opts.format.unit = Some(unit.into());
         self

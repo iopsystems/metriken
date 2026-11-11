@@ -18,17 +18,20 @@ Additive (0.1.5): a spec without `format.unit` formats as before.
   value into its unit system's base before scaling and suffixing it: a
   `seconds` value by 1e9 for `time`, a `kibibytes` value by 1024 for
   `bytes` or `datarate`, a `percent` value by 0.01 for `percentage`. With no
-  `unit_system` the unit's own system is used; with a `unit_system` of
-  another quantity (a `nanoseconds` counter divided by 1e9 and charted as
-  `percentage`) the unit is ignored. `percentage` is read as `percent`, the
-  name metriken-recorder 0.14 stored a percent series under. Line,
-  multi-series, percentile (dots and decimated bands) and heatmap axes,
-  tooltips and legends, and quantile heatmap tooltips and legends, all
+  `unit_system` the unit's own system is used. Three conversions cross
+  dimensions: bytes into `bitrate` (×8), bits into `bytes` or `datarate`
+  (÷8), and a time unit into `percentage` (÷1e9 from nanoseconds, for a
+  time counter's rate). With a `unit_system` of another dimension that has
+  no conversion, `unit` is ignored; the query must already be in that
+  system's base. `percentage` is read as `percent` (0 to 100): rezolus
+  samplers and metriken-recorder 0.12–0.14 write that name. Line,
+  multi-series and percentile (dots and decimated bands) axes and
+  tooltips, and heatmap and quantile heatmap tooltips and colour legends,
   apply it. A histogram heatmap labels its bucket bounds in the unit, and
   in nanoseconds without one, as before.
 - **Added:** `format.unit_scale`, a histogram column's `scale` storage
-  key, which metriken-query leaves in bounds and quantiles; the unit's
-  factor is divided by it.
+  key (a number or a numeric string), which metriken-query leaves in
+  bounds and quantiles; the unit's factor is divided by it.
 - **Added:** `resolveUnit(format)` and `STORED_UNITS` in `util/units.js`;
   `formatWithUnit`, `createAxisLabelFormatter` and `getBaseYAxisOption`
   take an optional factor.
@@ -38,8 +41,10 @@ Additive (0.1.5): a spec without `format.unit` formats as before.
   `PlotBuilder::with_stored_scale`, which set `format.unit` and
   `format.unit_scale`.
 - **Added:** `specForSourceMetric` sets `format.unit` from a catalog
-  entry's `unit`, and draws a counter in a unit of bytes as `datarate`. A
-  catalog entry without `unit` gives the spec it gave before.
+  entry's `unit` and, for a histogram, `format.unit_scale` from its
+  `scale`. It draws a counter in a bytes unit as `datarate`, a counter in a
+  time unit as `percentage`, and a `bits` gauge as `count`. A catalog entry
+  without `unit` gives the spec it gave before.
 
 ### metriken-storage 0.12.0
 

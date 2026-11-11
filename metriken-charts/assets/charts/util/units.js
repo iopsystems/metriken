@@ -244,9 +244,8 @@ const UNIT_SYSTEMS = {
  * dimension's base: nanoseconds, bytes, bits, a ratio (0 to 1), degrees
  * Celsius, hertz or cores.
  *
- * `percentage` is the name metriken-recorder 0.14 stored an exporter's
- * `percent` series under, with its values unchanged (0 to 100), so it is
- * read as `percent`.
+ * `percentage` is read as `percent` (0 to 100): rezolus samplers and
+ * metriken-recorder 0.12–0.14 write that name.
  */
 const STORED_UNITS = {
     nanoseconds: { dimension: 'time', factor: 1 },
@@ -270,17 +269,32 @@ const STORED_UNITS = {
 };
 
 /**
- * The unit systems whose base is each dimension's base, the first being
- * the one a chart uses when its spec names a stored unit and no system.
+ * The unit systems a value of each dimension can be formatted in, with
+ * what a value in the dimension's base is multiplied by (`mul`) and divided
+ * by (`div`) to be in the system's base. The first is the system a chart
+ * uses when its spec names a stored unit and no system.
+ *
+ * - bytes into `bitrate`: ×8.
+ * - bits into `bytes` or `datarate`: ÷8.
+ * - time into `percentage`: ÷1e9, for the per-second rate of a time
+ *   counter, which is seconds per second (a fraction) once in seconds.
  */
 const DIMENSION_SYSTEMS = {
-    time: ['time'],
-    bytes: ['bytes', 'datarate'],
-    bits: ['bitrate'],
-    ratio: ['percentage'],
-    temperature: ['temperature'],
-    frequency: ['frequency'],
-    cores: ['cores'],
+    time: { time: { mul: 1, div: 1 }, percentage: { mul: 1, div: 1e9 } },
+    bytes: {
+        bytes: { mul: 1, div: 1 },
+        datarate: { mul: 1, div: 1 },
+        bitrate: { mul: 8, div: 1 },
+    },
+    bits: {
+        bitrate: { mul: 1, div: 1 },
+        bytes: { mul: 1, div: 8 },
+        datarate: { mul: 1, div: 8 },
+    },
+    ratio: { percentage: { mul: 1, div: 1 } },
+    temperature: { temperature: { mul: 1, div: 1 } },
+    frequency: { frequency: { mul: 1, div: 1 } },
+    cores: { cores: { mul: 1, div: 1 } },
 };
 
 /**
@@ -289,23 +303,28 @@ const DIMENSION_SYSTEMS = {
  *
  * - `format.unit_system` alone: that system, factor 1 (unchanged).
  * - `format.unit`, a stored unit (`STORED_UNITS`), alone: the first system
- *   of the unit's dimension, and the unit's factor. A `seconds` series is
- *   formatted as `time` with factor 1e9, since `time` counts nanoseconds.
- * - both, where `unit_system` is a system of the unit's dimension: that
- *   system and the unit's factor, so a `kibibytes` counter charted as
- *   `datarate` reads in bytes per second.
- * - both, where it is not (a `nanoseconds` counter divided by 1e9 and
- *   charted as `percentage`): `unit_system`, factor 1. The query has
- *   already put its result in the system's base.
+ *   of the unit's dimension (`DIMENSION_SYSTEMS`), and the unit's factor. A
+ *   `seconds` series is formatted as `time` with factor 1e9, since `time`
+ *   counts nanoseconds.
+ * - both, where `DIMENSION_SYSTEMS` has a conversion from the unit's
+ *   dimension to `unit_system`: that system, and the unit's factor
+ *   converted. A `kibibytes` counter charted as `datarate` reads in bytes
+ *   per second (×1024), as `bitrate` in bits per second (×8192), and a
+ *   `seconds` counter's rate charted as `percentage` as a fraction (×1).
+ * - with a `unit_system` of another dimension that has no conversion,
+ *   `unit` is ignored (factor 1); the query must already be in that
+ *   system's base.
  *
  * An unknown `unit` is ignored. `unit` describes the values the chart is
  * given, so a page sets it only when the query keeps the stored unit
- * (`irate()`, `sum()`, a quantile), not when it rescales the values.
+ * (`irate()` of a bytes or bits counter, `sum()`, a quantile), not when it
+ * rescales the values.
  *
  * `format.unit_scale`, with `unit`, is the factor the values were stored
  * multiplied by: a histogram column's storage key `scale`, which
  * metriken-query does not divide out of its bounds or quantiles. The factor
- * is divided by it. It is ignored without a `unit` that applies, and when
+ * is divided by it. It may be a number or a numeric string, as column
+ * metadata holds it. It is ignored without a `unit` that applies, and when
  * it is not a positive finite number.
  *
  * @param {object} [format] - the spec's `opts.format`
@@ -318,10 +337,12 @@ function resolveUnit(format = {}) {
         : null;
     if (!stored) return { unitSystem, factor: 1 };
     const systems = DIMENSION_SYSTEMS[stored.dimension];
-    if (unitSystem && !systems.includes(unitSystem)) return { unitSystem, factor: 1 };
-    const scale = format.unit_scale;
-    const factor = Number.isFinite(scale) && scale > 0 ? stored.factor / scale : stored.factor;
-    return { unitSystem: unitSystem || systems[0], factor };
+    const system = unitSystem || Object.keys(systems)[0];
+    if (!Object.hasOwn(systems, system)) return { unitSystem, factor: 1 };
+    const { mul, div } = systems[system];
+    const scale = Number(format.unit_scale);
+    const unscaled = Number.isFinite(scale) && scale > 0 ? stored.factor / scale : stored.factor;
+    return { unitSystem: system, factor: (unscaled * mul) / div };
 }
 
 /**
