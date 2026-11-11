@@ -27,8 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   debug builds. A histogram read across recordings whose coarsest interval
   exceeds `u64::MAX / 3` nanoseconds reads each member to its end instead
   of overflowing.
-- **Fixed:** a selector with `or` between label matchers (`x{job="a" or
-  job="b"}`, promql-parser syntax) read every series of its name:
+- **Fixed:** a selector with `or` between label matchers
+  (`x{job="a" or job="b"}`, promql-parser syntax) read every series of its
+  name:
   promql-parser 0.8 puts all of its matchers in the branches, and the
   readers did not apply them. It now selects a series that satisfies every
   matcher of at least one branch, with a label the series does not carry
