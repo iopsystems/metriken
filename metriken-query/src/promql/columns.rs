@@ -18,7 +18,7 @@ use promql_parser::parser::{self, Expr};
 use crate::labels::Labels;
 use crate::promql::{
     extract_filter_labels, parse_histogram_call, parse_optional_stride,
-    unwrap_sum_around_histogram, QueryEngine, QueryError,
+    unwrap_sum_around_histogram, QueryEngine, QueryError, Selection,
 };
 
 impl QueryEngine {
@@ -63,8 +63,8 @@ pub fn referenced_metrics(query: &str) -> Result<HashSet<String>, QueryError> {
 }
 
 /// Each selector of a query: the metric names it can select (one, or none
-/// for a selector with no name) and its label matchers as a filter
-/// (`extract_filter_labels`). Like [`referenced_metrics`], needs no source;
+/// for a selector with no name) and the filter its read takes
+/// (`Selection::filter`). Like [`referenced_metrics`], needs no source;
 /// a reader uses it to leave out tables whose fixed labels no selector can
 /// match.
 pub(crate) fn selectors(query: &str) -> Result<Vec<Selector>, QueryError> {
@@ -107,8 +107,10 @@ fn walk_selectors(expr: &Expr, out: &mut Vec<(HashSet<String>, Labels)>) {
 /// matches the empty string (`{source!="a"}`, `{}`), which PromQL refuses;
 /// a `__name__` matcher among them (`{__name__!="x"}`) is still refused.
 /// An `offset` or `@` modifier is accepted and has no effect. An error for
-/// anything but one vector selector, and for a selector that matches one
-/// label more than once, since the filter holds one matcher per label.
+/// anything but one vector selector, for a selector that matches one label
+/// more than once, since the filter holds one matcher per label, and for a
+/// selector with `or` (`{a="1" or a="2"}`), whose union of branches one
+/// filter cannot hold.
 pub fn selector_filter(selector: &str) -> Result<Labels, QueryError> {
     // A nameless selector PromQL refuses is parsed again with a name, which
     // is not part of the filter.
@@ -131,6 +133,11 @@ pub fn selector_filter(selector: &str) -> Result<Labels, QueryError> {
             "{selector} is not a vector selector"
         )));
     };
+    if !sel.matchers.or_matchers.is_empty() {
+        return Err(QueryError::ParseError(format!(
+            "selector {selector} has `or` branches, and a filter holds one set of matchers"
+        )));
+    }
     if let Some(label) = repeated_matcher(&named)? {
         return Err(QueryError::ParseError(format!(
             "selector {selector} matches label {label} more than once, and a filter holds \
@@ -181,7 +188,8 @@ fn walk_vector_selectors(expr: &Expr, f: &mut dyn FnMut(&parser::VectorSelector)
 fn selector(sel: &parser::VectorSelector) -> (HashSet<String>, Labels) {
     let mut names = HashSet::new();
     collect_selector_names(sel, &mut names);
-    (names, extract_filter_labels(&sel.matchers.matchers))
+    let filter = Selection::new(sel.name.as_deref(), &sel.matchers).filter;
+    (names, filter)
 }
 
 /// Mirror of [`walk`] that collects selector names instead of columns. Kept
@@ -312,7 +320,6 @@ fn collect_selector(
     sel: &parser::VectorSelector,
     out: &mut HashSet<String>,
 ) {
-    let label_filter = extract_filter_labels(&sel.matchers.matchers);
     let name_matchers: Vec<&Matcher> = sel
         .matchers
         .matchers
@@ -327,8 +334,9 @@ fn collect_selector(
         if !name_matchers.iter().all(|m| m.is_match(n)) {
             return;
         }
+        let selection = Selection::new(Some(n), &sel.matchers);
         for (labels, col) in labels_map {
-            if labels.matches(&label_filter) {
+            if selection.selects(labels) {
                 out.insert(col.clone());
             }
         }
@@ -339,8 +347,9 @@ fn collect_selector(
         if !name_matchers.iter().all(|m| m.is_match(metric_name)) {
             continue;
         }
+        let selection = Selection::new(Some(metric_name), &sel.matchers);
         for (labels, col) in labels_map {
-            if labels.matches(&label_filter) {
+            if selection.selects(labels) {
                 out.insert(col.clone());
             }
         }

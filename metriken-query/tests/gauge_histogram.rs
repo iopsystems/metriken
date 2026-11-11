@@ -120,6 +120,43 @@ fn histogram_count_is_the_state_at_each_step() {
     assert_eq!(got, [[(1003.0, 70.0)]]);
 }
 
+/// A selector with `or` reads the devices its branches select, through the
+/// histogram functions and `histogram_quantile`.
+#[test]
+fn a_selector_with_or_reads_the_selected_devices() {
+    let store = store();
+    for q in [
+        "histogram_count(free{dev=\"sdb\" or dev=\"zzz\"})",
+        "histogram_count(free{dev=\"zzz\" or dev=~\"sd[b-c]\"})",
+    ] {
+        assert_eq!(
+            matrix(&store, q, 1003.0, 1003.0, 1.0),
+            [[(1003.0, 70.0)]],
+            "{q}"
+        );
+    }
+    let q = "histogram_count(free{dev=\"zzz\" or dev=\"yyy\"})";
+    assert!(matrix(&store, q, 1003.0, 1003.0, 1.0).is_empty(), "{q}");
+    // At 1000 s the 0.9 quantile of sda (100 of its 110 items in bucket 1)
+    // is in bucket 1, and of sdb (50 of 70) in bucket 3.
+    for (q, want) in [
+        (
+            "histogram_quantile(0.9, free{dev=\"sda\" or dev=\"zzz\"})",
+            1.0,
+        ),
+        (
+            "histogram_quantile(0.9, free{dev=\"zzz\" or dev=\"sdb\"})",
+            7.0,
+        ),
+    ] {
+        assert_eq!(
+            matrix(&store, q, 1000.0, 1000.0, 1.0),
+            [[(1000.0, want)]],
+            "{q}"
+        );
+    }
+}
+
 /// Points fall on the step grid, not at the rows, and a series is held a
 /// step (or its interval when longer) past its latest row.
 #[test]

@@ -24,13 +24,13 @@ use metriken_storage::PROMETHEUS_NAME_LABEL;
 use promql_parser::label::{MatchOp as PromMatchOp, Matcher};
 use promql_parser::parser::{self, Expr};
 
-use crate::labels::{Labels, MatchOp};
-use crate::promql::{extract_filter_labels, QueryError};
+use crate::labels::Labels;
+use crate::promql::{QueryError, Selection};
 use crate::DataSource;
 
 /// The stored name each selector reads instead of the name it gives, keyed
-/// by that name and the selector's filter (`extract_filter_labels` of its
-/// matchers). A selector that is not a key reads its own name.
+/// by that name and the filter its read takes (`Selection::filter`). A
+/// selector that is not a key reads its own name.
 pub(crate) type NameResolution = HashMap<(String, Labels), String>;
 
 /// Every name `source` holds, of any kind: read once per engine, so a
@@ -117,37 +117,16 @@ pub(crate) fn ambiguous(
     ))
 }
 
-/// `filter` with the matcher selecting the series renamed from `original`.
-pub(crate) fn renamed_filter(mut filter: Labels, original: &str) -> Labels {
-    filter.inner.insert(
-        PROMETHEUS_NAME_LABEL.to_string(),
-        MatchOp::Equal.encode(original),
-    );
-    filter
-}
-
-/// The resolver [`resolve_selectors`] takes: a selector's name and
-/// filter to the stored name it reads, if any.
-pub(crate) type Resolve<'a> = dyn Fn(&str, &Labels) -> Result<Option<String>, QueryError> + 'a;
-
-/// The check [`resolve_selectors`] runs on a selector it does not resolve
-/// (one with `or` matchers): its name and an empty filter, every series of
-/// the name, which is what such a selector reads.
-pub(crate) type Check<'a> = dyn Fn(&str, &Labels) -> Result<(), QueryError> + 'a;
+/// The resolver [`resolve_selectors`] takes: a selector's name and the
+/// series it selects to the stored name it reads, if any.
+pub(crate) type Resolve<'a> = dyn Fn(&str, &Selection) -> Result<Option<String>, QueryError> + 'a;
 
 /// Point each named selector of `expr` that `resolve` resolves at the
-/// stored name, adding the `__prometheus_name__` matcher. `resolve` takes
-/// the selector's name and filter. A selector with `or` matchers is not
-/// resolved; `check` is run on its name with the filter its read applies:
-/// every series of the name, which is what such a selector reads (the
-/// parser moves every matcher into the `or` branches, and the readers do
-/// not apply them). The first error either returns is returned.
-pub(crate) fn resolve_selectors(
-    expr: &mut Expr,
-    resolve: &Resolve,
-    check: &Check,
-) -> Result<(), QueryError> {
-    let each = |e: &mut Expr| resolve_selectors(e, resolve, check);
+/// stored name, adding the `__prometheus_name__` matcher (to each branch of
+/// a selector with `or`). `resolve` takes the selector's name and the
+/// series it selects. The first error it returns is returned.
+pub(crate) fn resolve_selectors(expr: &mut Expr, resolve: &Resolve) -> Result<(), QueryError> {
+    let each = |e: &mut Expr| resolve_selectors(e, resolve);
     match expr {
         Expr::Aggregate(agg) => {
             each(&mut agg.expr)?;
@@ -168,36 +147,46 @@ pub(crate) fn resolve_selectors(
             }
             Ok(())
         }
-        Expr::VectorSelector(sel) => resolve_selector(sel, resolve, check),
-        Expr::MatrixSelector(sel) => resolve_selector(&mut sel.vs, resolve, check),
+        Expr::VectorSelector(sel) => resolve_selector(sel, resolve),
+        Expr::MatrixSelector(sel) => resolve_selector(&mut sel.vs, resolve),
         Expr::Subquery(s) => each(&mut s.expr),
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => Ok(()),
     }
 }
 
-fn resolve_selector(
-    sel: &mut parser::VectorSelector,
-    resolve: &Resolve,
-    check: &Check,
-) -> Result<(), QueryError> {
+fn resolve_selector(sel: &mut parser::VectorSelector, resolve: &Resolve) -> Result<(), QueryError> {
     let Some(name) = sel.name.clone() else {
         return Ok(());
     };
-    if !sel.matchers.or_matchers.is_empty() {
-        return check(&name, &Labels::default());
-    }
-    let filter = extract_filter_labels(&sel.matchers.matchers);
-    let Some(stored) = resolve(&name, &filter)? else {
+    let Some(stored) = resolve(&name, &Selection::new(Some(&name), &sel.matchers))? else {
         return Ok(());
     };
-    sel.matchers
-        .matchers
-        .retain(|m| m.name != "__name__" && m.name != PROMETHEUS_NAME_LABEL);
-    sel.matchers.matchers.push(Matcher::new(
-        PromMatchOp::Equal,
-        PROMETHEUS_NAME_LABEL,
-        &name,
-    ));
+    let renamed = |matchers: &mut Vec<Matcher>| {
+        matchers.retain(|m| m.name != "__name__" && m.name != PROMETHEUS_NAME_LABEL);
+        matchers.push(Matcher::new(
+            PromMatchOp::Equal,
+            PROMETHEUS_NAME_LABEL,
+            &name,
+        ));
+    };
+    if sel.matchers.or_matchers.is_empty() {
+        renamed(&mut sel.matchers.matchers);
+    } else {
+        // A branch whose `__name__` matchers do not match the name selects
+        // nothing. With none left the selector selects nothing, and is left
+        // as written: emptied, `or_matchers` would select every series.
+        let names = |branch: &Vec<Matcher>| {
+            branch
+                .iter()
+                .filter(|m| m.name == "__name__")
+                .all(|m| m.is_match(&name))
+        };
+        if !sel.matchers.or_matchers.iter().any(names) {
+            return Ok(());
+        }
+        sel.matchers.or_matchers.retain(names);
+        sel.matchers.or_matchers.iter_mut().for_each(renamed);
+    }
     sel.name = Some(stored);
     Ok(())
 }
@@ -287,6 +276,43 @@ mod tests {
         engine.resolve_names(&mut expr).unwrap();
         assert_eq!(source.listings.load(Ordering::Relaxed), 1);
         assert!(expr.to_string().contains("b_nanoseconds_total"), "{expr}");
+    }
+
+    /// A selector with `or` naming a series by its exporter name reads, of
+    /// the stored name, the series renamed from it that a branch selects,
+    /// and not a series the stored name holds as its own.
+    #[test]
+    fn a_selector_with_or_reads_the_renamed_series_its_branches_select() {
+        let mut inner = Memory::new(1000);
+        for (t, v) in [(1, 1.0), (2, 2.0), (3, 3.0)] {
+            let ts = t * 1_000_000_000;
+            for job in ["j", "k"] {
+                let renamed =
+                    Labels::from([(PROMETHEUS_NAME_LABEL, "b_seconds_total"), ("job", job)]);
+                inner.upsert_float_counter_sample("b_nanoseconds_total", renamed, ts, v);
+            }
+            let own = Labels::from([("job", "k")]);
+            inner.upsert_float_counter_sample("b_nanoseconds_total", own, ts, 100.0 * v);
+        }
+        let engine = QueryEngine::new(Arc::new(inner) as Arc<dyn DataSource>);
+        let opts = crate::QueryOptions::default();
+        for query in [
+            r#"rate(b_seconds_total{job="k" or job="zzz"}[2s])"#,
+            r#"irate(b_seconds_total{job="zzz" or job="k"}[2s])"#,
+        ] {
+            let result = engine
+                .query_range_opts(query, 3.0, 3.0, 1.0, &opts)
+                .unwrap();
+            let crate::QueryResult::Matrix { result, .. } = result else {
+                panic!("{query}: not a matrix")
+            };
+            assert_eq!(result.len(), 1, "{query}: {result:?}");
+            assert_eq!(result[0].metric["job"], "k", "{query}: {result:?}");
+            assert!(
+                result[0].values.iter().all(|(_, v)| *v < 10.0),
+                "{query}: {result:?}"
+            );
+        }
     }
 
     /// A query fills the engine's names, so an engine that lives for a

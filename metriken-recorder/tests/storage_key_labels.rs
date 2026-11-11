@@ -239,7 +239,8 @@ const REFUSED: &[(&str, &str)] = &[
 /// removed. A selector matching that label set is an error on both rate
 /// paths, for counters, gauges and histograms, rather than a panic or one
 /// series of interleaved samples; a selector that does not match it reads
-/// as before.
+/// as before, as does a selector with `or` none of whose branches matches
+/// it.
 #[test]
 fn an_archive_written_before_the_rename_refuses_the_joined_series() {
     let dir = tempfile::tempdir().unwrap();
@@ -260,9 +261,20 @@ fn an_archive_written_before_the_rename_refuses_the_joined_series() {
                 "the keys listed are those two series of one name can differ by: {err}"
             );
         }
-        let job = matrix(&reader, "rate(x_total{job=\"j\"}[3s])", per_series);
-        assert_eq!(job.len(), 1, "{job:?}");
-        assert!(job[0].values.iter().all(|(_, v)| (v - 3.0).abs() < 1e-9));
+        for query in [
+            "rate(x_total{job=\"j\"}[3s])",
+            "rate(x_total{job=\"j\" or job=\"zzz\"}[3s])",
+        ] {
+            let job = matrix(&reader, query, per_series);
+            assert_eq!(job.len(), 1, "{query}: {job:?}");
+            assert!(job[0].values.iter().all(|(_, v)| (v - 3.0).abs() < 1e-9));
+        }
+        let h = matrix(
+            &reader,
+            "histogram_quantile(0.5, h{job=\"j\" or job=\"zzz\"})",
+            per_series,
+        );
+        assert!(h.is_empty(), "{h:?}");
     }
     // `columns`, which a caller can ask before a query, refuses it too.
     let err = reader.columns("rate(x_total[3s])").expect_err("columns");
@@ -287,7 +299,8 @@ fn an_archive_written_before_the_rename_refuses_the_joined_series() {
 }
 
 /// The live store refuses the same series when one snapshot holds two
-/// values of one series, as a converter before the rename produced.
+/// values of one series, as a converter before the rename produced, and
+/// reads a selector with `or` none of whose branches matches it.
 #[test]
 fn a_live_store_refuses_a_series_given_twice_in_one_snapshot() {
     let store = live(true);
@@ -299,8 +312,13 @@ fn a_live_store_refuses_a_series_given_twice_in_one_snapshot() {
             "{query}: {err}"
         );
     }
-    let job = matrix(&store, "rate(x_total{job=\"j\"}[3s])", false);
-    assert_eq!(job.len(), 1, "{job:?}");
+    for query in [
+        "rate(x_total{job=\"j\"}[3s])",
+        "rate(x_total{job=\"j\" or job=\"zzz\"}[3s])",
+    ] {
+        let job = matrix(&store, query, false);
+        assert_eq!(job.len(), 1, "{query}: {job:?}");
+    }
 }
 
 /// Two exporter samples with one stored name and label set in one scrape:

@@ -13,11 +13,13 @@ use crate::{DataSource, QueryOptions};
 mod columns;
 pub(crate) mod json_f64;
 pub(crate) mod prometheus_names;
+mod selection;
 #[cfg(feature = "archive")]
 pub(crate) use columns::Selector;
 pub use columns::{referenced_metrics, selector_filter};
 #[cfg(feature = "archive")]
 pub(crate) use columns::{repeated_matcher, selectors};
+pub(crate) use selection::Selection;
 pub(crate) mod streaming;
 
 #[cfg(test)]
@@ -103,11 +105,12 @@ pub(crate) fn reads_gauge_histogram(
 /// Gauge histogram `name`'s rows for evaluation from `start_ns` (snapped as
 /// the gauge grid is) to `end_ns` at `step_ns`, as parts each with its
 /// staleness (the step, or the part's row interval when that is longer),
-/// and the times to evaluate at. `None` when nothing is read.
+/// and the times to evaluate at, with the series `selection` selects.
+/// `None` when nothing is read.
 pub(crate) fn read_gauge_histogram(
     source: &dyn DataSource,
     name: &str,
-    filter: &Labels,
+    selection: &Selection,
     (start_ns, end_ns, step_ns): (u64, u64, u64),
     eval: Option<&[u64]>,
 ) -> Option<(Vec<streaming::gauge_histogram::Part>, Vec<u64>)> {
@@ -118,14 +121,28 @@ pub(crate) fn read_gauge_histogram(
     let longest_ns = (source.gauge_histogram_interval(name).max(0.0) * 1e9) as u64;
     let from = first.saturating_sub(step_ns.max(longest_ns));
     let parts = source
-        .gauge_histogram_parts(name, filter, from, last)?
+        .gauge_histogram_parts(name, &selection.filter, from, last)?
         .into_iter()
         .map(|(stream, interval_s)| {
             let staleness_ns = step_ns.max((interval_s.max(0.0) * 1e9) as u64);
-            (stream, staleness_ns)
+            (selection.histogram(stream), staleness_ns)
         })
         .collect();
     Some((parts, times))
+}
+
+/// Histogram `name`'s rows from `start_ns` to `end_ns`, of the series
+/// `selection` selects. `None` when nothing is read.
+pub(crate) fn read_histogram(
+    source: &dyn DataSource,
+    name: &str,
+    selection: &Selection,
+    start_ns: u64,
+    end_ns: u64,
+) -> Option<crate::histogram_stream::HistogramStream> {
+    source
+        .histogram_stream(name, &selection.filter, start_ns, end_ns)
+        .map(|stream| selection.histogram(stream))
 }
 
 /// A range's `(start_ns, end_ns, step_ns)` as the gauge grid lays it: the
@@ -804,12 +821,12 @@ fn name_selector(sel: &mut parser::VectorSelector) {
 }
 
 /// A histogram function's selector parsed as PromQL, with a `__name__`
-/// matcher named by `name_selector`: its metric name and the filter of its
-/// other matchers. `None` when `selector` does not parse as a PromQL vector
-/// selector (a metric name holding `/`, for one); the caller parses it by
-/// hand. An error for an `offset` or `@`, or for `__name__` matchers that do
+/// matcher named by `name_selector`: its metric name and the series its
+/// other matchers select. `None` when `selector` does not parse as a PromQL
+/// vector selector (a metric name holding `/`, for one); the caller parses
+/// it by hand. An error for an `offset` or `@`, or for `__name__` matchers that do
 /// not name one metric.
-fn promql_selector(selector: &str) -> Option<Result<(String, Labels), QueryError>> {
+fn promql_selector(selector: &str) -> Option<Result<(String, Selection), QueryError>> {
     let Ok(Expr::VectorSelector(mut sel)) = parser::parse(selector) else {
         return None;
     };
@@ -819,7 +836,10 @@ fn promql_selector(selector: &str) -> Option<Result<(String, Labels), QueryError
     }
     name_selector(&mut sel);
     match sel.name {
-        Some(name) => Some(Ok((name, extract_filter_labels(&sel.matchers.matchers)))),
+        Some(name) => {
+            let selection = Selection::new(Some(&name), &sel.matchers);
+            Some(Ok((name, selection)))
+        }
         None => refused(
             "a histogram function's selector names one metric: a metric name, or a single \
              `__name__=\"x\"` matcher",
@@ -1050,7 +1070,7 @@ pub(crate) fn extract_filter_labels(matchers: &[Matcher]) -> Labels {
     filter_labels
 }
 
-/// An error when `filter` matches a series of metric `name` that more than
+/// An error when `selection` selects a series of metric `name` that more than
 /// one column of one kind holds within one table of `source`, or that one
 /// snapshot gave a live store twice
 /// ([`DataSource::duplicated_series`]): a read would join their samples
@@ -1059,12 +1079,12 @@ pub(crate) fn extract_filter_labels(matchers: &[Matcher]) -> Labels {
 pub(crate) fn refuse_duplicated(
     source: &dyn DataSource,
     name: &str,
-    filter: &Labels,
+    selection: &Selection,
 ) -> Result<(), QueryError> {
     let duplicated = source.duplicated_series(name);
     let Some(labels) = duplicated
         .into_iter()
-        .find(|set| Labels::from(set.clone()).matches(filter))
+        .find(|set| selection.selects(&Labels::from(set.clone())))
     else {
         return Ok(());
     };
@@ -1125,11 +1145,13 @@ impl QueryEngine {
         self
     }
 
-    /// The stored name a selector of `name` with `filter` reads instead,
-    /// if any ([`prometheus_names`]).
-    fn stored_name(&self, name: &str, filter: &Labels) -> Result<Option<String>, QueryError> {
+    /// The stored name a selector of `name` selecting `selection` reads
+    /// instead, if any ([`prometheus_names`]).
+    fn stored_name(&self, name: &str, selection: &Selection) -> Result<Option<String>, QueryError> {
         match &self.names {
-            Some(names) => Ok(names.get(&(name.to_string(), filter.clone())).cloned()),
+            Some(names) => Ok(names
+                .get(&(name.to_string(), selection.filter.clone()))
+                .cloned()),
             None => {
                 let held = self
                     .held
@@ -1142,15 +1164,17 @@ impl QueryEngine {
     /// [`stored_name`](Self::stored_name), refusing the selector when the
     /// series it reads include one that two columns of one table hold
     /// ([`refuse_duplicated`]).
-    fn selector_name(&self, name: &str, filter: &Labels) -> Result<Option<String>, QueryError> {
-        let stored = self.stored_name(name, filter)?;
+    fn selector_name(
+        &self,
+        name: &str,
+        selection: &Selection,
+    ) -> Result<Option<String>, QueryError> {
+        let stored = self.stored_name(name, selection)?;
         match &stored {
-            Some(stored) => refuse_duplicated(
-                &*self.source,
-                stored,
-                &prometheus_names::renamed_filter(filter.clone(), name),
-            )?,
-            None => refuse_duplicated(&*self.source, name, filter)?,
+            Some(stored) => {
+                refuse_duplicated(&*self.source, stored, &selection.clone().renamed(name))?
+            }
+            None => refuse_duplicated(&*self.source, name, selection)?,
         }
         Ok(stored)
     }
@@ -1159,11 +1183,9 @@ impl QueryEngine {
     /// by its exporter name, and an error for a selector matching a
     /// series two columns of one table hold.
     pub(crate) fn resolve_names(&self, expr: &mut Expr) -> Result<(), QueryError> {
-        prometheus_names::resolve_selectors(
-            expr,
-            &|name, filter| self.selector_name(name, filter),
-            &|name, filter| refuse_duplicated(&*self.source, name, filter),
-        )
+        prometheus_names::resolve_selectors(expr, &|name, selection| {
+            self.selector_name(name, selection)
+        })
     }
 
     /// An engine over `source`, some of whose recordings form the process
@@ -1334,21 +1356,21 @@ impl QueryEngine {
         })
     }
 
-    /// A histogram function's selector: its metric name and filter, the
-    /// stored name and the `__prometheus_name__` matcher when it names a
-    /// series by its exporter name.
-    fn parse_metric_selector(&self, selector: &str) -> Result<(String, Labels), QueryError> {
-        let (name, filter) = self.parse_metric_selector_as_written(selector)?;
-        Ok(match self.selector_name(&name, &filter)? {
-            Some(stored) => (stored, prometheus_names::renamed_filter(filter, &name)),
-            None => (name, filter),
+    /// A histogram function's selector: its metric name and the series it
+    /// selects, the stored name and the `__prometheus_name__` matcher when
+    /// it names a series by its exporter name.
+    fn parse_metric_selector(&self, selector: &str) -> Result<(String, Selection), QueryError> {
+        let (name, selection) = self.parse_metric_selector_as_written(selector)?;
+        Ok(match self.selector_name(&name, &selection)? {
+            Some(stored) => (stored, selection.renamed(&name)),
+            None => (name, selection),
         })
     }
 
     fn parse_metric_selector_as_written(
         &self,
         selector: &str,
-    ) -> Result<(String, Labels), QueryError> {
+    ) -> Result<(String, Selection), QueryError> {
         if let Some(named) = promql_selector(selector) {
             return named;
         }
@@ -1386,9 +1408,12 @@ impl QueryEngine {
                     .inner
                     .insert(key.trim().to_string(), op.encode(value));
             }
-            Ok((metric_name, labels))
+            Ok((metric_name, Selection::from_filter(labels)))
         } else {
-            Ok((selector.to_string(), Labels::default()))
+            Ok((
+                selector.to_string(),
+                Selection::from_filter(Labels::default()),
+            ))
         }
     }
 
@@ -1471,7 +1496,7 @@ impl QueryEngine {
             })?;
 
         let (metric_selector, stride_ns) = parse_optional_stride(remaining)?;
-        let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
+        let (metric_name, selection) = self.parse_metric_selector(metric_selector)?;
 
         if reads_gauge_histogram(self.source.as_ref(), &metric_name)? {
             if stride_ns.is_some() {
@@ -1484,7 +1509,7 @@ impl QueryEngine {
             let read = read_gauge_histogram(
                 self.source.as_ref(),
                 &metric_name,
-                &labels,
+                &selection,
                 grid,
                 opts.eval_timestamps.as_deref(),
             );
@@ -1515,9 +1540,10 @@ impl QueryEngine {
                 stride_windows(ns, interval, start_ns, end_ns, opts)
             })
             .transpose()?;
-        let stream = self.source.histogram_stream(
+        let stream = read_histogram(
+            self.source.as_ref(),
             &metric_name,
-            &labels,
+            &selection,
             histogram_read_start(
                 self.source.as_ref(),
                 &metric_name,
@@ -1553,7 +1579,7 @@ impl QueryEngine {
     ) -> Result<QueryResult, QueryError> {
         let inner = &query_str["histogram_heatmap(".len()..query_str.len() - 1];
         let (metric_selector, stride_ns) = parse_optional_stride(inner.trim())?;
-        let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
+        let (metric_name, selection) = self.parse_metric_selector(metric_selector)?;
 
         if reads_gauge_histogram(self.source.as_ref(), &metric_name)? {
             if stride_ns.is_some() {
@@ -1566,7 +1592,7 @@ impl QueryEngine {
             let read = read_gauge_histogram(
                 self.source.as_ref(),
                 &metric_name,
-                &labels,
+                &selection,
                 grid,
                 opts.eval_timestamps.as_deref(),
             );
@@ -1601,9 +1627,10 @@ impl QueryEngine {
                 stride_windows(ns, interval, start_ns, end_ns, opts)
             })
             .transpose()?;
-        let stream = self.source.histogram_stream(
+        let stream = read_histogram(
+            self.source.as_ref(),
             &metric_name,
-            &labels,
+            &selection,
             histogram_read_start(
                 self.source.as_ref(),
                 &metric_name,
@@ -1644,16 +1671,17 @@ impl QueryEngine {
                 "histogram_irate does not accept a window/stride argument".to_string(),
             ));
         }
-        let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
+        let (metric_name, selection) = self.parse_metric_selector(metric_selector)?;
         if reads_gauge_histogram(self.source.as_ref(), &metric_name)? {
             return Err(gauge_histogram_refused(&metric_name, "histogram_irate"));
         }
 
         let start_ns = range_read_start_ns(start);
         let end_ns = range_end_ns(end);
-        let stream = self.source.histogram_stream(
+        let stream = read_histogram(
+            self.source.as_ref(),
             &metric_name,
-            &labels,
+            &selection,
             histogram_read_start(self.source.as_ref(), &metric_name, start_ns),
             end_ns,
         );
@@ -1686,7 +1714,7 @@ impl QueryEngine {
         opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
         let (metric_selector, stride_ns) = parse_optional_stride(inner.trim())?;
-        let (metric_name, labels) = self.parse_metric_selector(metric_selector)?;
+        let (metric_name, selection) = self.parse_metric_selector(metric_selector)?;
 
         if reads_gauge_histogram(self.source.as_ref(), &metric_name)? {
             if stride_ns.is_some() {
@@ -1699,7 +1727,7 @@ impl QueryEngine {
             let read = read_gauge_histogram(
                 self.source.as_ref(),
                 &metric_name,
-                &labels,
+                &selection,
                 grid,
                 opts.eval_timestamps.as_deref(),
             );
@@ -1740,9 +1768,10 @@ impl QueryEngine {
                 stride_windows(ns, interval, start_ns, end_ns, opts)
             })
             .transpose()?;
-        let stream = self.source.histogram_stream(
+        let stream = read_histogram(
+            self.source.as_ref(),
             &metric_name,
-            &labels,
+            &selection,
             histogram_read_start(
                 self.source.as_ref(),
                 &metric_name,

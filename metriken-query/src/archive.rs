@@ -1540,7 +1540,8 @@ mod tests {
     }
 
     /// `selector_filter` takes one vector selector's matchers, without its
-    /// metric name.
+    /// metric name, and refuses a selector with `or`, whose branches one
+    /// filter cannot hold.
     #[test]
     fn selector_filter_takes_one_selectors_matchers() {
         let filter = crate::selector_filter(r#"x{a="1", b=~"2|3", c!="4"}"#).unwrap();
@@ -1550,6 +1551,8 @@ mod tests {
         );
         assert!(crate::selector_filter(r#"rate(x[1m])"#).is_err());
         assert!(crate::selector_filter(r#"{a="1", a="2"}"#).is_err());
+        assert!(crate::selector_filter(r#"x{a="1" or a="2"}"#).is_err());
+        assert!(crate::selector_filter(r#"{a="1" or b="2"}"#).is_err());
         assert_eq!(
             crate::selector_filter(r#"{a!="1"}"#).unwrap().inner,
             labels(&[("a", "!1")])

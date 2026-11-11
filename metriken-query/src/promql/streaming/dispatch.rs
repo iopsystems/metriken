@@ -33,13 +33,13 @@ use super::histogram::HistogramOps;
 use super::per_source::{self, MemberSeries, SourceGroups, Tap, Window};
 use promql_parser::parser::{self, Expr};
 
-use crate::promql::extract_filter_labels;
 use crate::promql::streaming::{
     aggregate, braces, collect_to_matrix, distinct_label_sets, interval_binop, matrix_grouped_op,
     matrix_matrix_op, matrix_scalar_op, AggOp, AtPoints, BinOp, CounterGridRate,
     CounterPairwiseRate, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid, GroupBy, Join,
     LabeledSeries, MatchSpec, OneSide, SeriesSet,
 };
+use crate::promql::Selection;
 use crate::promql::{nothing_read, MatrixSample, MetricKind, QueryError, QueryResult};
 use crate::{DataSource, QueryOptions, RateMode};
 
@@ -572,7 +572,13 @@ fn grid_request<'c, 'g>(
         return None;
     }
     let name = sel.vs.name.as_deref()?;
-    let filter = extract_filter_labels(&sel.vs.matchers.matchers);
+    // A scan reads the series its filter matches; the per-series path
+    // applies the branches of a selector with `or`.
+    let selection = Selection::new(Some(name), &sel.vs.matchers);
+    if selection.has_branches() {
+        return None;
+    }
+    let filter = selection.filter;
     let range_ns = sel.range.as_nanos() as u64;
     // `rate` is over its `[range]`; `irate` over one step.
     let range = call.func.name == "rate";
@@ -1140,7 +1146,8 @@ where
         .name
         .as_deref()
         .ok_or_else(|| QueryError::ParseError("Matrix selector missing name".to_string()))?;
-    let filter = extract_filter_labels(&sel.vs.matchers.matchers);
+    let selection = Selection::new(Some(metric_name), &sel.vs.matchers);
+    let filter = &selection.filter;
     let range_ns = sel.range.as_nanos() as u64;
     // A windowed function's point at `t` reads `[t - range, t]`. Raw reads
     // as `raw_read_back` says.
@@ -1178,9 +1185,9 @@ where
                 }
             };
             let data_start = ctx.start_ns.saturating_sub(lookback);
-            let Some(streams) =
+            let Some(mut streams) =
                 ctx.source
-                    .counter_streams(metric_name, &filter, data_start, ctx.end_ns)
+                    .counter_streams(metric_name, filter, data_start, ctx.end_ns)
             else {
                 nothing_read(ctx.source, metric_name, MetricKind::Counter)?;
                 return Ok(Built::Series {
@@ -1189,6 +1196,7 @@ where
                     metric_name_for_error: None,
                 });
             };
+            selection.retain(&mut streams, |s| &s.labels);
             // Each series is its producer over its own sample stream, pulled
             // by whatever consumes it: an aggregate holds one buffered point
             // per series and each producer one interval's worth of samples,
@@ -1259,9 +1267,9 @@ where
             })
         }
         "avg_over_time" => {
-            let Some(gauges) = ctx
+            let Some(mut gauges) = ctx
                 .source
-                .gauges(metric_name, &filter, data_start, ctx.end_ns)
+                .gauges(metric_name, filter, data_start, ctx.end_ns)
             else {
                 nothing_read(ctx.source, metric_name, MetricKind::Gauge)?;
                 return Ok(Built::Series {
@@ -1270,6 +1278,7 @@ where
                     metric_name_for_error: None,
                 });
             };
+            selection.retain(&mut gauges.series, |g| &g.labels);
             let series: SeriesSet<'a> = gauges
                 .series
                 .into_iter()
@@ -1293,9 +1302,9 @@ where
             })
         }
         "idelta" => {
-            let Some(gauges) = ctx
+            let Some(mut gauges) = ctx
                 .source
-                .gauges(metric_name, &filter, data_start, ctx.end_ns)
+                .gauges(metric_name, filter, data_start, ctx.end_ns)
             else {
                 nothing_read(ctx.source, metric_name, MetricKind::Gauge)?;
                 return Ok(Built::Series {
@@ -1304,6 +1313,7 @@ where
                     metric_name_for_error: None,
                 });
             };
+            selection.retain(&mut gauges.series, |g| &g.labels);
             let series: SeriesSet<'a> = gauges
                 .series
                 .into_iter()
@@ -1329,9 +1339,9 @@ where
         "deriv" => {
             // The slope of the values in `[t - range, t]`: a gauge's, or a
             // counter's as read (no reset handling), as in PromQL.
-            let values: Vec<(crate::labels::Labels, Vec<u64>, Vec<f64>)> = if let Some(gauges) = ctx
-                .source
-                .gauges(metric_name, &filter, data_start, ctx.end_ns)
+            let mut values: Vec<(crate::labels::Labels, Vec<u64>, Vec<f64>)> = if let Some(gauges) =
+                ctx.source
+                    .gauges(metric_name, filter, data_start, ctx.end_ns)
             {
                 gauges
                     .series
@@ -1340,7 +1350,7 @@ where
                     .collect()
             } else if let Some(counters) =
                 ctx.source
-                    .counters(metric_name, &filter, data_start, ctx.end_ns)
+                    .counters(metric_name, filter, data_start, ctx.end_ns)
             {
                 counters
                     .series
@@ -1362,6 +1372,7 @@ where
                     metric_name_for_error: None,
                 });
             };
+            selection.retain(&mut values, |(labels, _, _)| labels);
             let series: SeriesSet<'a> = values
                 .into_iter()
                 .map(|(labels, timestamps, values)| {
@@ -1423,12 +1434,12 @@ where
         .name
         .as_deref()
         .ok_or_else(|| QueryError::ParseError("Vector selector missing name".to_string()))?;
-    let filter = extract_filter_labels(&sel.matchers.matchers);
+    let selection = Selection::new(Some(metric_name), &sel.matchers);
     if crate::promql::reads_gauge_histogram(ctx.source, metric_name)? {
         let read = crate::promql::read_gauge_histogram(
             ctx.source,
             metric_name,
-            &filter,
+            &selection,
             (ctx.start_ns, ctx.end_ns, ctx.step_ns),
             ctx.eval_timestamps.as_deref(),
         );
@@ -1446,9 +1457,10 @@ where
             name: metric_name.to_string(),
         });
     }
-    let Some(stream) = ctx.source.histogram_stream(
+    let Some(stream) = crate::promql::read_histogram(
+        ctx.source,
         metric_name,
-        &filter,
+        &selection,
         crate::promql::histogram_read_start(ctx.source, metric_name, ctx.start_ns),
         ctx.end_ns,
     ) else {
@@ -1479,7 +1491,7 @@ where
         .name
         .as_deref()
         .ok_or_else(|| QueryError::ParseError("Vector selector missing name".to_string()))?;
-    let filter = extract_filter_labels(&sel.matchers.matchers);
+    let selection = Selection::new(Some(metric_name), &sel.matchers);
 
     // A gauge is held a step, or its sampling interval when that is longer,
     // past each sample. The interval is the series' own: a source joining
@@ -1491,10 +1503,13 @@ where
         RateMode::Grid => ctx.start_ns,
         RateMode::Raw => ctx.start_ns.saturating_sub(raw_read_back(ctx, 0)),
     };
-    let Some(parts) =
-        ctx.source
-            .gauge_parts(metric_name, &filter, read_start, ctx.end_ns, ctx.step_ns)
-    else {
+    let Some(mut parts) = ctx.source.gauge_parts(
+        metric_name,
+        &selection.filter,
+        read_start,
+        ctx.end_ns,
+        ctx.step_ns,
+    ) else {
         // A bare selector reads gauges. A counter is read through rate() or
         // irate(), and saying so beats reporting a metric the source holds as
         // missing. Asked only on this path, so a found gauge costs nothing.
@@ -1505,6 +1520,9 @@ where
             metric_name_for_error: None,
         });
     };
+    for (gauges, _) in &mut parts {
+        selection.retain(&mut gauges.series, |g| &g.labels);
+    }
 
     let series: SeriesSet<'a> = parts
         .into_iter()
