@@ -278,7 +278,7 @@ impl ArchiveWriter {
     /// [`SourceRecorder::sync`] waits for that.
     ///
     /// [`SourceRecorder::finalize`] seals the source's streams, discards
-    /// every stream listed for it (see [`SourceRecorder::discard_streams`]),
+    /// every stream listed for it with its table or occupant stream,
     /// and marks it complete, so a reader of the finalized archive meets no
     /// rows it cannot decode. Until then, a reader that materializes the
     /// live WAL tail fails on those rows.
@@ -1655,11 +1655,10 @@ impl SourceRecorder {
     /// and of its table's occupant stream (or, for an occupant stream, of
     /// its table), and stop sealing them. Used for a stream whose rows
     /// cannot be encoded (see [`ArchiveWriter::create_isolated`]). dendro's
-    /// eviction
-    /// deletes a stream's segments and WAL rows older than a cutoff, so the
-    /// unsealed rows cannot be removed without the segments sealed before
-    /// them.
-    pub fn discard_streams(&mut self, streams: &[String]) -> Result<(), Error> {
+    /// eviction deletes a stream's segments and WAL rows older than a
+    /// cutoff, so the unsealed rows cannot be removed without the segments
+    /// sealed before them.
+    pub(crate) fn discard_streams(&mut self, streams: &[String]) -> Result<(), Error> {
         let mut gone: HashSet<String> = HashSet::new();
         for stream in streams {
             let table = occupants::table_of(stream).unwrap_or(stream).to_string();
@@ -1684,9 +1683,9 @@ impl SourceRecorder {
     /// Seal every stream's tail and mark the source complete. `last` is the
     /// last tick's `(ts, wall_offset)`. In an archive made by
     /// [`ArchiveWriter::create_isolated`], each stream that failed to
-    /// encode, at this seal or before, is discarded first
-    /// ([`discard_streams`](Self::discard_streams)), and stays listed by
-    /// [`ArchiveWriter::encode_failures`].
+    /// encode, at this seal or before, is discarded first, with its table
+    /// or occupant stream and the segments it sealed before the failure,
+    /// and stays listed by [`ArchiveWriter::encode_failures`].
     pub fn finalize(mut self, last: (u64, i64)) -> Result<(), Error> {
         let batch: Vec<String> = self.accounts.keys().cloned().collect();
         if !batch.is_empty() {

@@ -70,7 +70,11 @@ impl Encoder {
     }
 
     /// `encode()` for the stream `ctx` names. With [`failures`] set, an
-    /// error or a panic is recorded there and the stream gets no segment.
+    /// error or a panic is recorded there and the stream gets no segment,
+    /// and a success clears what was recorded for the stream: dendro's
+    /// `split_seal` encodes a split's first part with `encode`, and when
+    /// that part fails it seals the whole run with `encode`, which can
+    /// succeed.
     ///
     /// [`failures`]: Self::failures
     fn isolate(
@@ -81,17 +85,26 @@ impl Encoder {
         let Some(failures) = &self.failures else {
             return encode();
         };
-        let error = match caught(encode) {
-            Ok(segment) => return Ok(segment),
-            Err(error) => error,
-        };
-        failures
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(ctx.source_id)
-            .or_default()
-            .insert(ctx.stream.to_string(), error);
-        Ok(None)
+        let result = caught(encode);
+        let mut failures = failures.lock().unwrap_or_else(|e| e.into_inner());
+        match result {
+            Ok(segment) => {
+                if let Some(streams) = failures.get_mut(&ctx.source_id) {
+                    streams.remove(ctx.stream);
+                    if streams.is_empty() {
+                        failures.remove(&ctx.source_id);
+                    }
+                }
+                Ok(segment)
+            }
+            Err(error) => {
+                failures
+                    .entry(ctx.source_id)
+                    .or_default()
+                    .insert(ctx.stream.to_string(), error);
+                Ok(None)
+            }
+        }
     }
 
     /// The encoder for an archive this process is not writing: a copy, a
@@ -603,5 +616,35 @@ mod encode_after_isolation_tests {
         );
         assert!(matches!(encoder.encode(&ctx, &rows), Ok(None)));
         assert!(failures.lock().unwrap()[&3].contains_key("s"));
+    }
+}
+
+#[cfg(test)]
+mod clear_on_success_tests {
+    use super::*;
+
+    /// A failed first part of a split, then the whole run sealed as one
+    /// segment: the stream is not listed as failed.
+    #[test]
+    fn a_success_after_a_failure_clears_the_stream() {
+        let failures = EncodeFailures::default();
+        let encoder = Encoder::new(
+            LongStreams::default(),
+            false,
+            sealed_props(default_compression()),
+            Some(Arc::clone(&failures)),
+        );
+        let ctx = EncodeContext::new(5, "s");
+        assert!(matches!(
+            encoder.isolate(&ctx, || Err("part".into())),
+            Ok(None)
+        ));
+        assert!(failures.lock().unwrap()[&5].contains_key("s"));
+        assert!(matches!(encoder.isolate(&ctx, || Ok(None)), Ok(None)));
+        assert!(
+            failures.lock().unwrap().is_empty(),
+            "{:?}",
+            failures.lock().unwrap()
+        );
     }
 }

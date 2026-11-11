@@ -1739,11 +1739,14 @@ async fn a_failed_source_beside_a_refused_one_fails_the_recording() {
 
 /// A streamed source refused on reconnect after the other source failed
 /// leaves none recording: the refusal ends the recording while it runs,
-/// before any `finish`.
+/// before any `finish`, and the refused source's recording is finalized.
+/// The stream ends after two frames and its reconnects are answered 503,
+/// which keeps the source active, until the other source has failed; then
+/// they are answered 404, which refuses it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refusal_after_a_failure_with_none_left_fails_the_recording() {
     let agent = serve(Behaviour {
-        streams: Streams::OnceThen(20, 404),
+        streams: Streams::OnceThen(2, 503),
         banner: Some("Rezolus 6.0.0 Agent\n".into()),
         ..Behaviour::default()
     })
@@ -1761,7 +1764,8 @@ async fn a_refusal_after_a_failure_with_none_left_fails_the_recording() {
         .unwrap()
         .as_nanos() as u64;
     let dir = tempfile::tempdir().unwrap();
-    let mut cfg = RecorderConfig::new(dir.path().join("out.dendro"), INTERVAL);
+    let path = dir.path().join("out.dendro");
+    let mut cfg = RecorderConfig::new(&path, INTERVAL);
     cfg.writer = metriken_storage::WriterConfig {
         seal: dendro::seal::SealPolicy {
             max_rows: 2,
@@ -1782,9 +1786,15 @@ async fn a_refusal_after_a_failure_with_none_left_fails_the_recording() {
     let mut seen = Vec::new();
     while !seen.iter().any(|e| matches!(e, Event::Failed { .. })) {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Some(
-                e @ (Event::SourceFailed { .. } | Event::Refused { .. } | Event::Failed { .. }),
-            )) => seen.push(e),
+            Ok(Some(e @ Event::SourceFailed { .. })) => {
+                agent.set(Behaviour {
+                    streams: Streams::OnceThen(0, 404),
+                    banner: Some("Rezolus 6.0.0 Agent\n".into()),
+                    ..Behaviour::default()
+                });
+                seen.push(e);
+            }
+            Ok(Some(e @ (Event::Refused { .. } | Event::Failed { .. }))) => seen.push(e),
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => panic!("no Failed within 30 s: {seen:?}"),
         }
@@ -1802,6 +1812,12 @@ async fn a_refusal_after_a_failure_with_none_left_fails_the_recording() {
     );
     let finished = recorder.finish(Stop::Now, CancellationToken::new()).await;
     assert!(matches!(finished, Err(Error::Archive(_))), "{finished:?}");
+    let streamed = &recordings(&path, "fake/ops")["agent"];
+    assert!(streamed.rows >= 1, "{streamed:?}");
+    assert!(
+        streamed.complete,
+        "the refused source's recording is finalized"
+    );
 }
 
 /// With `retain`, rows older than the newest minus the retention are

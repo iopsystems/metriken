@@ -302,19 +302,21 @@ pub enum Event {
     },
     /// The source's rows in a table could not be written into a segment
     /// (the encoder could not encode them), so the source stopped recording:
-    /// no more passes, scrapes or frames are taken from it. Each failed
-    /// table is removed from its recording, its earlier segments included,
-    /// and the recording is finalized with its other tables. The other
-    /// sources keep recording. When no source is `Pending`, `Activating` or
-    /// `Active`, the recording fails ([`Event::Failed`], after this event);
-    /// a source refused after this one failed ends it the same way.
-    /// `reason` names each failed table and the encoder's error. At most
-    /// once per source; its state is then [`SourceState::Failed`].
+    /// no more passes, scrapes or frames are taken from it. Each failed table
+    /// is removed from its recording, its earlier segments included, and the
+    /// recording is finalized with its other tables. The other sources keep
+    /// recording. When no source is `Pending`, `Activating` or `Active`, the
+    /// recording fails ([`Event::Failed`], after this event); the check runs
+    /// again when a source is refused, so a refusal that leaves none
+    /// `Pending`, `Activating` or `Active` ends it too. `reason` names each
+    /// failed table and the encoder's error. At most once per source; its
+    /// state is then [`SourceState::Failed`].
     SourceFailed { source: SourceId, reason: String },
     /// The archive failed, or a source failed ([`Event::SourceFailed`]) and
     /// no source is left `Pending`, `Activating` or `Active`. The recorder
-    /// has stopped ticking; what is on disk
-    /// holds every tick committed before the failure. [`Recorder::finish`]
+    /// has stopped ticking; what is on disk holds every tick committed before
+    /// the failure. In the second case the recordings still open, of sources
+    /// refused on a reconnect, are finalized first. [`Recorder::finish`]
     /// returns this error.
     Failed { error: String },
     /// A streamed frame was staged. `seq` counts this source's frames,
@@ -1503,8 +1505,8 @@ impl Driver {
         self.last_pass = Some(wall);
     }
 
-    /// The archive failed: report it, stop ticking, and leave what is on
-    /// disk as it is.
+    /// The recording failed (the archive, or no source left recording):
+    /// report it, stop ticking, and leave what is on disk as it is.
     async fn fail(&mut self, error: String) {
         if self.failure_reported {
             self.failed.get_or_insert(error);
@@ -1658,9 +1660,11 @@ impl Driver {
     }
 
     /// Fail the recording when a source has failed and no source is
-    /// `Pending`, `Activating` or `Active`: nothing is left to record. A
-    /// recording whose sources were all refused, with none failed, goes on
-    /// as it did before sources could fail.
+    /// `Pending`, `Activating` or `Active`: nothing is left to record. The
+    /// recordings still open (sources refused on a reconnect keep theirs)
+    /// are finalized first, as `finish` would. A recording whose sources
+    /// were all refused, with none failed, goes on: a refusal alone never
+    /// fails the recording.
     async fn fail_if_none_left(&mut self) {
         let Some(last) = self.last_source_failure.clone() else {
             return;
@@ -1671,12 +1675,31 @@ impl Driver {
                 SourceState::Pending | SourceState::Activating | SourceState::Active
             )
         });
-        if !recording {
-            self.fail(format!(
-                "no source is left recording; the last to fail: {last}"
-            ))
-            .await;
+        if recording {
+            return;
         }
+        let (_, ts, wall_offset) = self.stamp_now();
+        let fallback = (ts, wall_offset);
+        let lasts = self.lasts();
+        let finalized = self
+            .blocking(move |a| -> Result<(), String> {
+                let mut first_err = None;
+                for (i, rec) in std::mem::take(&mut a.recs) {
+                    let last = lasts.get(&i).copied().unwrap_or(fallback);
+                    if let Err(e) = rec.finalize(last) {
+                        first_err.get_or_insert(e.to_string());
+                    }
+                }
+                first_err.map_or(Ok(()), Err)
+            })
+            .await;
+        if let Some(Err(e)) = finalized {
+            warn!("finalizing the recordings still open failed: {e}");
+        }
+        self.fail(format!(
+            "no source is left recording; the last to fail: {last}"
+        ))
+        .await;
     }
 
     /// Stage `snapshot` for slot `i`.
@@ -2262,11 +2285,11 @@ impl Driver {
 }
 
 /// Finalize and remove each recording with a stream its encoder could not
-/// encode
-/// ([`ArchiveWriter::create_isolated`]); `finalize` discards those streams.
-/// Returns each one's slot and the reason, for [`Driver::drop_failed`]. A
-/// recording that failed is never committed to again, so what it holds stays
-/// decodable; an error here is the archive's, and fails the recording.
+/// encode ([`ArchiveWriter::create_isolated`]); `finalize` discards those
+/// streams. Returns each one's slot and the reason, for
+/// [`Driver::drop_failed`]. A recording that failed is never committed to
+/// again, so what it holds stays decodable; an error here is the archive's,
+/// and fails the recording.
 fn drop_unencodable(
     a: &mut Archive,
     lasts: &BTreeMap<usize, (u64, i64)>,
