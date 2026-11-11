@@ -269,63 +269,38 @@ const STORED_UNITS = {
 };
 
 /**
- * The unit systems a value of each dimension can be formatted in, with
- * what a value in the dimension's base is multiplied by (`mul`) and divided
- * by (`div`) to be in the system's base. The first is the system a chart
- * uses when its spec names a stored unit and no system.
- *
- * - bytes into `bitrate`: ×8.
- * - bits into `bytes` or `datarate`: ÷8.
- * - time into `percentage`: ÷1e9, for the per-second rate of a time
- *   counter, which is seconds per second (a fraction) once in seconds.
+ * The unit systems whose base is each dimension's base, the first being
+ * the one a chart uses when its spec names a stored unit and no system.
  */
 const DIMENSION_SYSTEMS = {
-    time: { time: { mul: 1, div: 1 }, percentage: { mul: 1, div: 1e9 } },
-    bytes: {
-        bytes: { mul: 1, div: 1 },
-        datarate: { mul: 1, div: 1 },
-        bitrate: { mul: 8, div: 1 },
-    },
-    bits: {
-        bitrate: { mul: 1, div: 1 },
-        bytes: { mul: 1, div: 8 },
-        datarate: { mul: 1, div: 8 },
-    },
-    ratio: { percentage: { mul: 1, div: 1 } },
-    temperature: { temperature: { mul: 1, div: 1 } },
-    frequency: { frequency: { mul: 1, div: 1 } },
-    cores: { cores: { mul: 1, div: 1 } },
+    time: ['time'],
+    bytes: ['bytes', 'datarate'],
+    bits: ['bitrate'],
+    ratio: ['percentage'],
+    temperature: ['temperature'],
+    frequency: ['frequency'],
+    cores: ['cores'],
 };
 
 /**
  * The unit system a chart formats its values with, and the factor a value
- * is multiplied by to be in that system's base, from the chart's `format`:
+ * is multiplied by to be in that system's base, from the chart's `format`.
  *
- * - `format.unit_system` alone: that system, factor 1 (unchanged).
- * - `format.unit`, a stored unit (`STORED_UNITS`), alone: the first system
- *   of the unit's dimension (`DIMENSION_SYSTEMS`), and the unit's factor. A
- *   `seconds` series is formatted as `time` with factor 1e9, since `time`
- *   counts nanoseconds.
- * - both, where `DIMENSION_SYSTEMS` has a conversion from the unit's
- *   dimension to `unit_system`: that system, and the unit's factor
- *   converted. A `kibibytes` counter charted as `datarate` reads in bytes
- *   per second (×1024), as `bitrate` in bits per second (×8192), and a
- *   `seconds` counter's rate charted as `percentage` as a fraction (×1).
- * - with a `unit_system` of another dimension that has no conversion,
- *   `unit` is ignored (factor 1); the query must already be in that
- *   system's base.
+ * `unit` is the unit of the values the query returns; set it only when the
+ * query has not rescaled them. A `unit_system` of another dimension ignores
+ * it. Within the unit's dimension the chart rescales into the system's
+ * base: a `seconds` value by 1e9 into `time` (nanoseconds), a `kibibytes`
+ * value by 1024 into `bytes` or `datarate`, a `percent` value by 0.01 into
+ * `percentage` (a fraction).
  *
- * An unknown `unit` is ignored. `unit` describes the values the chart is
- * given, so a page sets it only when the query keeps the stored unit
- * (`irate()` of a bytes or bits counter, `sum()`, a quantile), not when it
- * rescales the values.
+ * - `format.unit_system` alone: that system, factor 1.
+ * - `format.unit` (`STORED_UNITS`) alone: the first system of the unit's
+ *   dimension (`DIMENSION_SYSTEMS`), and the unit's factor.
+ * - both, where `unit_system` is a system of the unit's dimension: that
+ *   system and the unit's factor.
+ * - both, where it is not: `unit_system`, factor 1.
  *
- * `format.unit_scale`, with `unit`, is the factor the values were stored
- * multiplied by: a histogram column's storage key `scale`, which
- * metriken-query does not divide out of its bounds or quantiles. The factor
- * is divided by it. It may be a number or a numeric string, as column
- * metadata holds it. It is ignored without a `unit` that applies, and when
- * it is not a positive finite number.
+ * An unknown `unit` is ignored.
  *
  * @param {object} [format] - the spec's `opts.format`
  * @return {{unitSystem: (string|undefined), factor: number}}
@@ -337,12 +312,8 @@ function resolveUnit(format = {}) {
         : null;
     if (!stored) return { unitSystem, factor: 1 };
     const systems = DIMENSION_SYSTEMS[stored.dimension];
-    const system = unitSystem || Object.keys(systems)[0];
-    if (!Object.hasOwn(systems, system)) return { unitSystem, factor: 1 };
-    const { mul, div } = systems[system];
-    const scale = Number(format.unit_scale);
-    const unscaled = Number.isFinite(scale) && scale > 0 ? stored.factor / scale : stored.factor;
-    return { unitSystem: system, factor: (unscaled * mul) / div };
+    if (unitSystem && !systems.includes(unitSystem)) return { unitSystem, factor: 1 };
+    return { unitSystem: unitSystem || systems[0], factor: stored.factor };
 }
 
 /**

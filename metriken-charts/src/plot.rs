@@ -172,37 +172,20 @@ impl PlotBuilder {
     }
 
     /// The unit the values the chart is given are in, as the storage key
-    /// `unit` names it (`seconds`, `kibibytes`, `percent`, ...). The charts
-    /// multiply each value into the base of the plot's [`Unit`] before
-    /// formatting it: a `seconds` value by 1e9 for [`Unit::Time`], which
-    /// counts nanoseconds, a `percent` value by 0.01 for
-    /// [`Unit::Percentage`], which counts fractions. A few conversions cross
-    /// quantities: bytes into [`Unit::Bitrate`] (×8), bits into
-    /// [`Unit::Bytes`] or [`Unit::Datarate`] (÷8), and a time unit into
-    /// [`Unit::Percentage`] (÷1e9, for the rate of a time counter). With a
-    /// [`Unit`] of another dimension that has no conversion, the unit is
-    /// ignored; the query must already be in that system's base. The charts
-    /// also ignore a unit they do not know. `STORED_UNITS` in
-    /// `charts/util/units.js` lists them; `resolveUnit` documents which
-    /// `Unit`s each applies to.
-    ///
-    /// Set it only when the query keeps the values in the stored unit (a
-    /// selector, `irate()` of a bytes or bits counter, `sum()`, a quantile),
-    /// not when it rescales them. `range` and `with_min_y_span` stay in the
-    /// stored unit.
+    /// `unit` names it (`seconds`, `kibibytes`, `percent`, ...). `unit` is
+    /// the unit of the values the query returns; set it only when the query
+    /// has not rescaled them. A `unit_system` of another dimension ignores
+    /// it. Within the unit's dimension the charts multiply each value into
+    /// the base of the plot's [`Unit`] before formatting it: a `seconds`
+    /// value by 1e9 for [`Unit::Time`], which counts nanoseconds, a
+    /// `kibibytes` value by 1024 for [`Unit::Bytes`] or [`Unit::Datarate`],
+    /// a `percent` value by 0.01 for [`Unit::Percentage`], which counts
+    /// fractions. The charts also ignore a unit they do not know.
+    /// `STORED_UNITS` in `charts/util/units.js` lists them; `resolveUnit`
+    /// documents which `Unit`s each applies to. `range` and
+    /// `with_min_y_span` stay in the stored unit.
     pub fn with_stored_unit<T: Into<String>>(mut self, unit: T) -> Self {
         self.opts.format.unit = Some(unit.into());
-        self
-    }
-
-    /// The factor a histogram's values were stored multiplied by, from the
-    /// column's storage key `scale`. metriken-query does not divide it out
-    /// of bucket bounds or quantiles, so the charts divide the
-    /// [`with_stored_unit`](Self::with_stored_unit) factor by it. Ignored
-    /// without a stored unit the charts apply, and when not positive and
-    /// finite.
-    pub fn with_stored_scale(mut self, scale: f64) -> Self {
-        self.opts.format.unit_scale = Some(scale);
         self
     }
 
@@ -466,11 +449,6 @@ struct FormatConfig {
     // `PlotBuilder::with_stored_unit`.
     #[serde(skip_serializing_if = "Option::is_none")]
     unit: Option<String>,
-
-    // The factor the values were stored multiplied by; see
-    // `PlotBuilder::with_stored_scale`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    unit_scale: Option<f64>,
     precision: Option<u8>, // decimal places
 
     log_scale: Option<bool>,
@@ -498,7 +476,6 @@ impl FormatConfig {
             y_axis_label: None,
             unit_system: Some(unit.to_string()),
             unit: None,
-            unit_scale: None,
             precision: Some(2),
             log_scale: None,
             range: None,
@@ -611,14 +588,11 @@ mod tests {
             |b: PlotBuilder| serde_json::to_value(b.build("q")).unwrap()["opts"]["format"].clone();
         let plain = format(Plot::gauge("t", "id", Unit::Time));
         assert!(plain.get("unit").is_none(), "{plain}");
-        assert!(plain.get("unit_scale").is_none(), "{plain}");
         let stored = format(
             Plot::histogram("t", "id", Unit::Time, HistogramView::Buckets)
-                .with_stored_unit("seconds")
-                .with_stored_scale(1e6),
+                .with_stored_unit("seconds"),
         );
         assert_eq!(stored["unit"], "seconds");
-        assert_eq!(stored["unit_scale"], 1e6);
         assert_eq!(stored["unit_system"], "time");
     }
 

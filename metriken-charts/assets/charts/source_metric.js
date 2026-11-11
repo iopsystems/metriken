@@ -24,14 +24,19 @@ export const sourceMetricChartId = (name) => `source-metric-${name}`;
  * Counters/gauges are not re-wrapped, so they carry their buildDefaultQuery
  * form (irate(...) / raw).
  *
- * `info.unit`, the unit the metric is stored in, becomes `opts.format.unit`,
- * so the chart scales and labels the values from it (`resolveUnit` in
- * `util/units.js`), and a histogram's `info.scale` (its `scale` storage key)
- * becomes `opts.format.unit_scale`. A counter's query is a per-second rate,
- * so a counter in a unit of bytes is drawn as `datarate`, and one in a unit
- * of time as `percentage` (seconds per second is a fraction). A `bits` gauge
- * is drawn as `count`, since the only bits system, `bitrate`, is a rate.
- * Without `info.unit` the spec has no `format`.
+ * `info.unit`, the unit the metric is stored in, becomes `opts.format.unit`
+ * where the query returns values in it, so the chart scales and labels them
+ * (`resolveUnit` in `util/units.js`). A counter's query is a per-second
+ * rate:
+ *
+ * - in a bytes unit, it is drawn as `datarate`, and in `bits` as `bitrate`,
+ *   with the unit;
+ * - in a time unit, it is time per second, a fraction once in seconds, so
+ *   the query divides by `1e9 / factor` (nothing for `seconds`) and the
+ *   chart is drawn as `percentage`, without the unit.
+ *
+ * A `bits` gauge is drawn as a count of bits, without the unit, since
+ * `bitrate` is a rate. Without `info.unit` the spec has no `format`.
  */
 export const specForSourceMetric = (info) => {
     const opts = {
@@ -40,20 +45,22 @@ export const specForSourceMetric = (info) => {
         description: info.description || '',
         type: info.metric_type,
     };
+    let divisor = 1;
     if (info.unit) {
-        opts.format = { unit: info.unit };
         const dimension = Object.hasOwn(STORED_UNITS, info.unit)
             ? STORED_UNITS[info.unit].dimension
             : null;
-        if (info.metric_type === 'counter' && dimension === 'bytes') {
-            opts.format.unit_system = 'datarate';
-        } else if (info.metric_type === 'counter' && dimension === 'time') {
-            opts.format.unit_system = 'percentage';
+        if (info.metric_type === 'counter' && dimension === 'time') {
+            divisor = 1e9 / STORED_UNITS[info.unit].factor;
+            opts.format = { unit_system: 'percentage' };
+        } else if (info.metric_type === 'counter' && dimension === 'bytes') {
+            opts.format = { unit: info.unit, unit_system: 'datarate' };
+        } else if (info.metric_type === 'counter' && dimension === 'bits') {
+            opts.format = { unit: info.unit, unit_system: 'bitrate' };
         } else if (info.metric_type === 'gauge' && dimension === 'bits') {
-            opts.format.unit_system = 'count';
-        }
-        if (info.metric_type === 'histogram' && info.scale != null) {
-            opts.format.unit_scale = info.scale;
+            opts.format = { unit_system: 'count' };
+        } else {
+            opts.format = { unit: info.unit };
         }
     }
     let promql_query;
@@ -62,6 +69,7 @@ export const specForSourceMetric = (info) => {
         promql_query = info.name;
     } else {
         promql_query = buildDefaultQuery(info);
+        if (divisor !== 1) promql_query = `${promql_query} / ${divisor}`;
     }
     // Simple-capture charts render full-width (renderChart keys off spec.width),
     // matching the jitter chart and giving the wide x-axis room to read.

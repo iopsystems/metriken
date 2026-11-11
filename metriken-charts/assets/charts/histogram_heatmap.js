@@ -20,11 +20,10 @@ import {
 import { infernoColor } from './util/colormap.js';
 
 // Bucket bounds are latencies in nanoseconds unless the spec names the unit
-// the histogram is stored in (`format.unit`, with `format.unit_scale`).
-// `unit_system` is not read: the bounds are the stored values whatever the
-// chart's query does with them.
+// the histogram is stored in (`format.unit`). `unit_system` is not read: the
+// bounds are the stored values whatever the chart's query does with them.
 function bucketBoundFormatter(format) {
-    const { unitSystem, factor } = resolveUnit({ unit: format.unit, unit_scale: format.unit_scale });
+    const { unitSystem, factor } = resolveUnit({ unit: format.unit });
     return createAxisLabelFormatter(unitSystem || 'time', 2, factor);
 }
 

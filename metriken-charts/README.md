@@ -155,26 +155,22 @@ tooltips and colour legends, apply it:
 | `{ unit: 'seconds' }` | `0.25` | `250 ms` |
 | `{ unit: 'kibibytes' }` | `4` | `4 KB` |
 | `{ unit: 'percent' }` | `45` | `45 %` |
-| `{ unit: 'bytes', unit_system: 'bitrate' }` | `125000` | `1 Mbps` |
-| `{ unit: 'seconds', unit_system: 'percentage' }` | `0.5` | `50 %` |
-| `{ unit: 'seconds', unit_system: 'count' }` | `0.5` | `0.5` |
+| `{ unit: 'kibibytes', unit_system: 'datarate' }` | `4` | `4.1 KB/s` |
+| `{ unit: 'nanoseconds', unit_system: 'percentage' }` | `0.45` | `45 %` |
 
-With no `unit_system`, the unit's own system is used. Three conversions
-cross dimensions: bytes into `bitrate` (×8), bits into `bytes` or
-`datarate` (÷8), and a time unit into `percentage` (÷1e9 from nanoseconds,
-for the per-second rate of a time counter, which is a fraction). With a
-`unit_system` of another dimension that has no conversion, `unit` is
-ignored; the query must already be in that system's base, as in the last
-row. `unit` describes the values the chart is given, so set it only when
-the query keeps the stored unit. `range` and `min_y_span` stay in that unit
-(for a histogram with `unit_scale`, in the stored unit times the scale).
-For a histogram stored with a `scale` key, `format.unit_scale` (a number
-or a numeric string) divides the factor by it. In Rust,
-`PlotBuilder::with_stored_unit` and `with_stored_scale` set them.
+`unit` is the unit of the values the query returns; set it only when the
+query has not rescaled them. A `unit_system` of another dimension ignores
+it, as in the last row, where the query has divided a nanosecond counter's
+rate by 1e9. With no `unit_system`, the unit's own system is used.
+`range` and `min_y_span` stay in the unit. In Rust,
+`PlotBuilder::with_stored_unit` sets it.
 
-`specForSourceMetric` draws a counter in a bytes unit as `datarate`, a
-counter in a time unit as `percentage`, and a `bits` gauge as `count`,
-since the only bits system, `bitrate`, is a rate.
+`specForSourceMetric` draws a counter in a bytes unit as `datarate` and one
+in `bits` as `bitrate`, with the unit. A counter in a time unit is time per
+second, so its query divides the rate by `1e9 / factor` (nothing for
+`seconds`) and it is drawn as `percentage`, without the unit. A `bits`
+gauge is drawn as a count of bits, without the unit, since `bitrate` is a
+rate.
 
 ## Display mode
 
