@@ -146,10 +146,12 @@ Requires metriken-storage's unreleased `prometheus_units` (below).
   hold. The parquet, segmented, lazy, labeled, recordings and union
   sources and `Memory` answer it, and `source::merge_units` merges several
   sources' answers. A source wrapping others must forward it, or its
-  metrics have no unit. `ArchiveReader::metric_units` answers it from the
-  footer of each table's first sealed segment holding the name, without
-  building the table's reader (from the reader when the name's rows are
-  all in the WAL). `Memory::set_unit(name, labels, unit)` records a
+  metrics have no unit. `ArchiveReader::metric_units` answers it from a
+  map of each table's names' units, built on the first call from its
+  parts' footers in order (sealed segments, then the live tail) and kept
+  for the reader's life, without building the table's reader; a unit that
+  changed in a later part of one table is not seen.
+  `Memory::set_unit(name, labels, unit)` records a
   series' unit, the latest call holding.
 - **Docs:** `SCALE_KEY` describes what metriken-recorder's converter
   writes (a fixed scale for a time unit, else the power of 10 that makes
@@ -198,7 +200,7 @@ Requires metriken-storage's unreleased `prometheus_units` (below).
   metric by. `Some` only when every column of `name`, in every recording
   and table, carries one and the same unit; `None` when the source does
   not hold `name`, a column has none, or two differ. Answered by
-  `ArchiveReader` (one segment footer per table holding the name),
+  `ArchiveReader` (a per-table map of units, built once),
   `ParquetReader`, `SegmentedParquetReader`, `UnionMetricsSource` and
   `MemoryStore`, whose ingest records each series' unit from its snapshot
   metadata. The default is `None`, so a `MetricsSource` that wraps another
