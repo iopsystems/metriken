@@ -1444,6 +1444,7 @@ dependencies = [
  "metriken-types",
  "parquet",
  "reqwest",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "tokio",

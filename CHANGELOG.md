@@ -53,21 +53,27 @@ from the two histogram heatmap fixes below.
 
 ### metriken-recorder (unreleased)
 
-- **Breaking:** a recording no longer fails when its last source fails.
-  When a source fails (`Event::SourceFailed`) or is refused and no source is
-  left `Pending`, `Activating` or `Active`, the recorder emits the new
-  `Event::NoneRecording` once, keeps the archive open and keeps ticking.
-  `Recorder::finish` then finalizes the archive, including the rows
-  committed before the failures, and returns `Ok(Summary)` with each source's
-  state. Before, the recorder emitted `Event::Failed` with "no source is left
-  recording", stopped ticking, and `finish` returned `Error::Archive`.
-  `Event::Failed` and `Error::Archive` now mean an archive error (a commit,
-  seal, retention or metadata write that failed, a writer task that stopped,
-  or a finalize or join error) or a panic in a local source's pass. `NoneRecording` also fires when the
-  recorder starts with no source `Pending` or `Active` (every endpoint
-  refused at detection, or none given). It is not emitted once `finish` has
-  begun. A recording in which no source delivered a row is still removed
+- **Breaking:** a recording no longer fails when its last source fails or
+  is refused. When a source fails (`Event::SourceFailed`) or is refused and
+  no source is left `Pending`, `Activating` or `Active`, the recorder emits
+  the new `Event::NoneRecording` once, keeps the archive open and keeps
+  ticking. `Recorder::finish` then finalizes the archive, including the rows
+  committed before the failures, and returns `Ok(Summary)` with each
+  source's state. Before, the recorder emitted `Event::Failed` with "no
+  source is left recording", stopped ticking, and `finish` returned
+  `Error::Archive`. `NoneRecording` also fires when the recorder starts with
+  no source `Pending` or `Active` (every endpoint refused at detection, or
+  none given). It is not emitted once `finish` has begun. A recording in
+  which no source delivered a frame, a scrape or a pass is still removed
   (`Summary::discarded`).
+- **Breaking:** a local source whose `pass` panics fails alone
+  (`Event::SourceFailed`, "its pass panicked: …"); the other sources keep
+  recording. Before, the panic failed the recording (`Event::Failed`) and
+  left the archive unfinalized.
+- An archive error still fails the recording: a commit, seal, retention,
+  metadata write or added recording that fails, or the writer task
+  stopping, emits `Event::Failed`, and `finish` then returns
+  `Error::Archive`, as it does for a finalize or join error.
 
 ### metriken-storage 0.12.0
 

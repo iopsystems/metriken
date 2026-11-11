@@ -133,7 +133,10 @@ impl SourceIdentity {
 /// (`tokio::task::spawn_blocking`), every local source's in one call, so a
 /// snapshot that takes a while does not hold a runtime worker that other
 /// tasks need. The tick still waits for it: a pass slower than the
-/// interval delays that tick's commit and the passes after it.
+/// interval delays that tick's commit and the passes after it. A `pass`
+/// that panics fails that source alone ([`Event::SourceFailed`]): it is
+/// dropped and never asked again, and the rows it staged before are kept.
+/// This needs `panic = "unwind"`; under `panic = "abort"` the process ends.
 pub trait LocalSource: Send + 'static {
     /// The source's labels, metadata and clock anchor, read once when the
     /// recorder starts.
@@ -180,8 +183,8 @@ pub enum SourceState {
     Refused,
     /// Its rows could not be recorded ([`Event::SourceFailed`]): it stopped
     /// recording, and its recording is finalized without the rows that
-    /// failed. Never retried. The recording does not fail with it, even when
-    /// it was the last source recording.
+    /// failed. Never retried. The other sources keep recording; when none is
+    /// left, see [`Event::NoneRecording`].
     Failed,
 }
 
@@ -306,14 +309,14 @@ pub enum Event {
     /// recording: no more passes, scrapes or frames are taken from it. Its rows
     /// in a table could not be written into a segment (the encoder could not
     /// encode them), or its rows could not be staged, or a streamed frame from
-    /// it could not be read or decoded. For rows that could not be encoded,
+    /// it could not be read or decoded, or its local pass panicked. For rows that could not be encoded,
     /// each failed table's rows after its newest segment are deleted and its
-    /// segments are kept; rows that could not be staged, read or decoded were
-    /// never written. The recording is then finalized. The other sources keep
+    /// segments are kept; rows that could not be staged, read or decoded, and
+    /// a pass that panicked, were never written. The recording is then finalized. The other sources keep
     /// recording, and the recording does not fail, even when this was the
     /// last source recording ([`Event::NoneRecording`] follows then).
     /// `reason` names each failed table and the encoder's error, or what
-    /// could not be staged or read. At most once per source; its state is
+    /// could not be staged or read, or the panic's message. At most once per source; its state is
     /// then [`SourceState::Failed`].
     SourceFailed { source: SourceId, reason: String },
     /// No source is `Pending`, `Activating` or `Active`: each was refused or
@@ -323,16 +326,15 @@ pub enum Event {
     /// again, so the count cannot rise after it. Not emitted once
     /// [`Recorder::finish`] has begun. The recording has not failed: the
     /// recorder keeps ticking with nothing to record, and
-    /// [`Recorder::finish`] finalizes the archive with the rows committed
-    /// so far and returns each source's state. A caller with no other reason
+    /// [`Recorder::finish`] returns each source's state: it finalizes the
+    /// archive with the rows committed so far, or removes it when no source
+    /// delivered a frame, a scrape or a pass ([`Summary::discarded`]). A caller with no other reason
     /// to stop can finish on this event.
     NoneRecording,
-    /// The recording failed: a commit, a seal, retention, a metadata write
-    /// or adding a recording failed, the writer task stopped, or a local
-    /// source's pass panicked. A source that fails ([`Event::SourceFailed`])
-    /// does not cause this, even the last. The recorder has stopped ticking;
-    /// what is on disk holds every tick committed before the failure.
-    /// [`Recorder::finish`] returns this error.
+    /// The archive failed: a commit, a seal, retention, a metadata write or
+    /// adding a recording failed, or the writer task stopped. The recorder
+    /// has stopped ticking; what is on disk holds every tick committed before
+    /// the failure. [`Recorder::finish`] returns this error.
     Failed { error: String },
     /// A streamed frame was staged. `seq` counts this source's frames,
     /// across reconnects; `stamp` is its newest pass, `None` for an empty
@@ -456,8 +458,8 @@ pub fn default_timeout(interval: Duration) -> Duration {
 #[non_exhaustive]
 pub enum Error {
     /// The archive failed mid-run ([`Event::Failed`]), or at finalize or
-    /// when the writer was joined. A source that failed
-    /// ([`Event::SourceFailed`]) is not one, even the last.
+    /// when the writer was joined, or a [`Recorder::patch_metadata`] write
+    /// failed; that one does not fail the recording.
     Archive(String),
     /// No such source, one that was refused before it was recorded, or one
     /// that failed ([`Event::SourceFailed`]).
@@ -750,7 +752,8 @@ impl Recorder {
     /// Returns `Ok` with each source's state when every source failed or was
     /// refused ([`Event::NoneRecording`]): the rows committed before the
     /// failures are finalized as any others. `Err` is the archive's
-    /// ([`Error::Archive`]).
+    /// ([`Error::Archive`]): a failure reported by [`Event::Failed`], or a
+    /// finalize or join error, which no event reports.
     ///
     /// When no source delivered a frame, a scrape or a pass, the archive is
     /// removed instead and [`Summary::discarded`] says so.
@@ -1761,7 +1764,8 @@ impl Driver {
     }
 
     /// One pass of every active local source, on a blocking thread (see
-    /// [`LocalSource`]), staged in order.
+    /// [`LocalSource`]), staged in order. A source whose pass panics is
+    /// dropped and fails alone ([`unstageable`](Self::unstageable)).
     // Without `http`, `Kind::Local` is the only kind.
     #[cfg_attr(not(feature = "http"), allow(irrefutable_let_patterns))]
     async fn local_passes(&mut self, wall: u64) -> Result<(), String> {
@@ -1783,17 +1787,32 @@ impl Driver {
             taken
                 .into_iter()
                 .map(|(i, mut source)| {
-                    let pass = source.pass();
-                    (i, source, pass)
+                    let pass =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| source.pass()));
+                    match pass {
+                        Ok(pass) => (i, Ok((source, pass))),
+                        // The source is dropped: its state after a panic is
+                        // unknown, and it is never asked again.
+                        Err(panic) => (i, Err(panic_message(panic.as_ref()))),
+                    }
                 })
                 .collect::<Vec<_>>()
         })
         .await
         .map_err(|e| format!("a local source's pass failed: {e}"))?;
-        for (i, returned, pass) in passes {
-            if let Kind::Local { source, .. } = &mut self.slots[i].kind {
-                *source = Some(returned);
-            }
+        for (i, outcome) in passes {
+            let pass = match outcome {
+                Ok((returned, pass)) => {
+                    if let Kind::Local { source, .. } = &mut self.slots[i].kind {
+                        *source = Some(returned);
+                    }
+                    pass
+                }
+                Err(msg) => {
+                    self.unstageable(i, format!("its pass panicked: {msg}"));
+                    continue;
+                }
+            };
             let Some((snapshot, stamp)) = pass else {
                 continue;
             };
@@ -2360,6 +2379,17 @@ fn drop_unencodable(
         dropped.push((i, reason));
     }
     Ok(dropped)
+}
+
+/// A panic's message, when it is a string.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "a panic with no message".to_string()
+    }
 }
 
 /// One line naming each stream that failed to encode, and why.
