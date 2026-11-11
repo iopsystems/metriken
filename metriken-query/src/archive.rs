@@ -149,7 +149,7 @@ impl<'a> Plan<'a> {
                     .into_iter()
                     .map(|n| {
                         names
-                            .get(&(n.clone(), filter.filter.clone()))
+                            .get(&(n.clone(), filter.branch_filters()))
                             .cloned()
                             .unwrap_or(n)
                     })
@@ -654,8 +654,8 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
 
 /// The stored name each selector of `written` reads when it names a
 /// series by its exporter name (`promql::prometheus_names`), decided per
-/// selector over the tables it reaches: those in `scope` whose recording's
-/// labels its filter can match. A selector reads its own name when one of
+/// selector name and branch filters over the tables it reaches: those in
+/// `scope` whose recording's labels one of its branches' filters can match. A selector reads its own name when one of
 /// those tables holds it, and otherwise the candidate stored name one of
 /// them holds with a series whose `__prometheus_name__` is that name; an
 /// error when more than one candidate does. Only tables holding the name or
@@ -670,7 +670,7 @@ fn resolve_names(
     let mut names = NameResolution::new();
     for (given, filter) in written {
         for name in given {
-            let key = (name.clone(), filter.filter.clone());
+            let key = (name.clone(), filter.branch_filters());
             if names.contains_key(&key) {
                 continue;
             }

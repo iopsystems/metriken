@@ -29,9 +29,10 @@ use crate::promql::{QueryError, Selection};
 use crate::DataSource;
 
 /// The stored name each selector reads instead of the name it gives, keyed
-/// by that name and the filter its read takes (`Selection::filter`). A
+/// by that name and the filters of its branches
+/// (`Selection::branch_filters`), which decide the recordings it reaches. A
 /// selector that is not a key reads its own name.
-pub(crate) type NameResolution = HashMap<(String, Labels), String>;
+pub(crate) type NameResolution = HashMap<(String, Vec<Labels>), String>;
 
 /// Every name `source` holds, of any kind: read once per engine, so a
 /// query lists the source's names once however many selectors it has. An

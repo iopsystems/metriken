@@ -3,12 +3,12 @@
 //!
 //! promql-parser puts every matcher of a selector with `or` into
 //! `Matchers::or_matchers`, one list per branch, and leaves
-//! `Matchers::matchers` empty. A source reads with one filter
-//! ([`Labels::matches`]), which holds one matcher per label and cannot
-//! express a union. A [`Selection`] therefore reads with the matchers every
-//! branch shares, and keeps a series read with them when it satisfies every
-//! matcher of at least one branch. A series that two branches select is
-//! read once, so it is kept once.
+//! `Matchers::matchers` empty. A source reads with one filter, a `Labels`
+//! applied by [`Labels::matches`], which holds one matcher per label and
+//! cannot express a union. A [`Selection`] therefore reads with the
+//! matchers every branch shares, and keeps a series read with them when it
+//! satisfies every matcher of at least one branch. A series that two
+//! branches select is read once, so it is kept once.
 
 use std::collections::BTreeMap;
 
@@ -110,7 +110,6 @@ impl Selection {
     /// [`filter`](Self::filter) is chosen): a series a branch selects
     /// passes that branch's filter. For a selector without `or`, `filter`
     /// alone. Empty when no branch can select the selector's name.
-    #[cfg_attr(not(feature = "archive"), allow(dead_code))]
     pub(crate) fn branch_filters(&self) -> Vec<Labels> {
         match &self.branches {
             None => vec![self.filter.clone()],

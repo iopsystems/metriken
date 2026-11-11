@@ -1149,7 +1149,7 @@ impl QueryEngine {
     fn stored_name(&self, name: &str, selection: &Selection) -> Result<Option<String>, QueryError> {
         match &self.names {
             Some(names) => Ok(names
-                .get(&(name.to_string(), selection.filter.clone()))
+                .get(&(name.to_string(), selection.branch_filters()))
                 .cloned()),
             None => {
                 let held = self
