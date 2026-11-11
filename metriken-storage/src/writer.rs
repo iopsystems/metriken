@@ -278,8 +278,8 @@ impl ArchiveWriter {
     /// [`SourceRecorder::sync`] waits for that.
     ///
     /// [`SourceRecorder::finalize`] seals the source's streams, deletes the
-    /// rows no segment holds of every stream listed for it, and marks it
-    /// complete, so a reader of the finalized archive meets no rows it
+    /// rows of every stream listed for it after the stream's newest segment
+    /// (every row of a stream with no segment), and marks it complete, so a reader of the finalized archive meets no rows it
     /// cannot decode. The segments a listed stream sealed before it failed
     /// are kept. Until finalize, a reader that materializes the live WAL
     /// tail fails on those rows. When the listed stream is a long table's
@@ -1654,8 +1654,9 @@ impl SourceRecorder {
         Ok(())
     }
 
-    /// Delete the rows of `streams` that no segment holds and stop sealing
-    /// them; their segments are kept. Used for a stream whose rows cannot be
+    /// Delete the rows of `streams` after each one's newest segment (every
+    /// row of a stream with no segment) and stop sealing them; their
+    /// segments are kept. Used for a stream whose rows cannot be
     /// encoded (see [`ArchiveWriter::create_isolated`]).
     pub(crate) fn discard_streams(&mut self, streams: &[String]) -> Result<(), Error> {
         let gone: HashSet<String> = streams.iter().cloned().collect();
@@ -1676,9 +1677,9 @@ impl SourceRecorder {
 
     /// Seal every stream's tail and mark the source complete. `last` is the
     /// last tick's `(ts, wall_offset)`. In an archive made by
-    /// [`ArchiveWriter::create_isolated`], the rows that no segment holds
+    /// [`ArchiveWriter::create_isolated`], the rows after the newest segment
     /// of each stream that failed to encode, at this seal or before, are
-    /// deleted first. The segments the stream sealed before the failure are
+    /// deleted before the source is marked complete. The segments the stream sealed before the failure are
     /// kept, and the stream stays listed by
     /// [`ArchiveWriter::encode_failures`].
     pub fn finalize(mut self, last: (u64, i64)) -> Result<(), Error> {

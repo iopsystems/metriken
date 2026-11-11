@@ -304,9 +304,10 @@ pub enum Event {
     /// recording: no more passes, scrapes or frames are taken from it. Its
     /// rows in a table could not be written into a segment (the encoder
     /// could not encode them), or its rows could not be staged, or a
-    /// streamed frame from it could not be read or decoded. The rows of each
-    /// failed table that no segment holds are deleted, the segments the
-    /// table sealed before the failure are kept, and the recording is
+    /// streamed frame from it could not be read or decoded. For rows that
+    /// could not be encoded, each failed table's rows after its newest
+    /// segment are deleted and its segments are kept; rows that could not
+    /// be staged, read or decoded were never written. The recording is then
     /// finalized. The other sources keep recording. When no source is `Pending`, `Activating` or `Active`, the
     /// recording fails ([`Event::Failed`], after this event); the check runs
     /// again when a source is refused, so a refusal that leaves none
@@ -860,8 +861,8 @@ struct Settings {
 struct Archive {
     recs: BTreeMap<usize, SourceRecorder>,
     staged: Vec<Staged>,
-    /// Per slot, why its rows could not be staged or decoded since the last
-    /// commit. Nothing more is staged for it; the commit drops it
+    /// Per slot, why its rows could not be staged, read or decoded since the
+    /// last commit. Nothing more is staged for it; the commit drops it
     /// ([`drop_unencodable`]).
     unstageable: BTreeMap<usize, String>,
     writer: ArchiveWriter,
@@ -1557,9 +1558,10 @@ impl Driver {
     }
 
     /// Commit the tick's staged rows as one transaction, run every source's
-    /// seal check, apply retention, drop each source a seal found
-    /// unencodable ([`drop_failed`](Self::drop_failed)), and report each
-    /// source that committed.
+    /// seal check, apply retention, drop each source whose rows could not
+    /// be encoded, staged, read or decoded
+    /// ([`drop_failed`](Self::drop_failed)), and report each source that
+    /// committed.
     async fn commit(&mut self, maintain: bool) {
         let retain = self.settings.retain;
         let cutoffs: Vec<(usize, u64)> = match retain {
@@ -1576,6 +1578,9 @@ impl Driver {
             _ => Vec::new(),
         };
         let lasts = self.lasts();
+        // For a source dropped before it staged a row.
+        let (_, ts, wall_offset) = self.stamp_now();
+        let fallback = (ts, wall_offset);
         let result = self
             .blocking(move |a| -> Result<Vec<(usize, String)>, String> {
                 a.writer
@@ -1597,7 +1602,7 @@ impl Driver {
                         }
                     }
                 }
-                drop_unencodable(a, &lasts)
+                drop_unencodable(a, &lasts, fallback)
             })
             .await;
         match result {
@@ -1642,9 +1647,9 @@ impl Driver {
             .collect()
     }
 
-    /// Each `(slot, reason)`'s recording was finalized without the tables
-    /// its encoder could not encode ([`drop_unencodable`]): stop recording
-    /// the slot, and emit [`Event::SourceFailed`]. Then fail the recording
+    /// Each `(slot, reason)`'s recording was finalized after its rows could
+    /// not be encoded, staged, read or decoded ([`drop_unencodable`]): stop
+    /// recording the slot, and emit [`Event::SourceFailed`]. Then fail the recording
     /// when none is left ([`fail_if_none_left`](Self::fail_if_none_left)).
     async fn drop_failed(&mut self, dropped: Vec<(usize, String)>) {
         if dropped.is_empty() {
@@ -1749,12 +1754,13 @@ impl Driver {
         Ok(())
     }
 
-    /// Slot `i`'s rows could not be staged or decoded, for `reason`: stage
+    /// Slot `i`'s rows could not be staged, read or decoded, for `reason`: stage
     /// nothing more for it, and drop it at the next commit as a slot whose
     /// rows could not be encoded is dropped ([`drop_unencodable`]). The rows
     /// it staged before are committed.
     fn unstageable(&mut self, i: usize, reason: String) {
-        warn!("{}: {reason}", self.slots[i].label());
+        // `drop_failed` warns with the reason when the commit drops it.
+        debug!("{}: {reason}", self.slots[i].label());
         if let Some(archive) = self.archive.as_mut() {
             archive.unstageable.entry(i).or_insert(reason);
         }
@@ -2324,15 +2330,17 @@ impl Driver {
 }
 
 /// Finalize and remove each recording with a stream its encoder could not
-/// encode ([`ArchiveWriter::create_isolated`]), whose rows the encoder's
-/// failures leave out, and each whose rows could not be staged
-/// ([`Archive::unstageable`]). Returns each one's slot and the reason, for
+/// encode ([`ArchiveWriter::create_isolated`]), and each whose rows could
+/// not be staged, read or decoded ([`Archive::unstageable`]), at its last
+/// staged stamp or else at `fallback`. Returns each one's slot and the
+/// reason, for
 /// [`Driver::drop_failed`]. A recording that failed is never committed to
 /// again, so what it holds stays decodable; an error here is the archive's,
 /// and fails the recording.
 fn drop_unencodable(
     a: &mut Archive,
     lasts: &BTreeMap<usize, (u64, i64)>,
+    fallback: (u64, i64),
 ) -> Result<Vec<(usize, String)>, String> {
     let unstageable = std::mem::take(&mut a.unstageable);
     let failed: Vec<usize> = a
@@ -2356,7 +2364,7 @@ fn drop_unencodable(
             continue;
         }
         let rec = a.recs.remove(&i).expect("listed above");
-        let last = lasts.get(&i).copied().unwrap_or((0, 0));
+        let last = lasts.get(&i).copied().unwrap_or(fallback);
         rec.finalize(last).map_err(|e| e.to_string())?;
         // Finalize's seal can fail a stream too.
         let after = a.writer.encode_failures(id);
@@ -2784,6 +2792,11 @@ impl Driver {
     }
 
     async fn refuse(&mut self, i: usize, reason: String) {
+        // A slot whose rows could not be staged fails at the next commit,
+        // and is reported once, as failed.
+        if self.is_unstageable(i) {
+            return;
+        }
         let slot = &mut self.slots[i];
         slot.state = SourceState::Refused;
         if let Kind::Endpoint(ep) = &mut slot.kind {

@@ -3917,4 +3917,12 @@ async fn a_streamed_frame_that_cannot_be_read_fails_only_its_source() {
     let states: Vec<SourceState> = summary.sources.iter().map(|s| s.state).collect();
     assert_eq!(states, [SourceState::Failed, SourceState::Active]);
     assert!(recordings(&path, "self/latency")["self"].complete);
+    // The failed source staged no row, and is finalized at the time it was
+    // dropped, not at 0.
+    let archive = dendro::archive::Archive::open(&path).unwrap();
+    for source in archive.read_sources().unwrap() {
+        for (ts, _) in archive.read_clock_offsets(source.id).unwrap() {
+            assert!(ts > 0, "{:?}: a clock offset at {ts}", source.meta.labels);
+        }
+    }
 }
