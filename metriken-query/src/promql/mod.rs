@@ -447,7 +447,7 @@ pub(crate) fn histogram_read_start(
     start_ns: u64,
 ) -> u64 {
     let interval_ns = (source.histogram_interval(name).max(0.0) * 1e9) as u64;
-    start_ns.saturating_sub(2 * interval_ns)
+    start_ns.saturating_sub(interval_ns.saturating_mul(2))
 }
 
 /// The most windows a strided call shorter than its metric's row interval
