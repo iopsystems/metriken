@@ -460,3 +460,12 @@ test('a source gauge or histogram carries its unit, and ignores a scale', () => 
     const h = specForSourceMetric({ name: 'hit_ratio', metric_type: 'histogram', unit: 'ratio', scale: '10' });
     assert.deepEqual(h.opts.format, { unit: 'ratio' });
 });
+
+test('a source bits histogram is a count of bits, and a counter in another unit has no format', () => {
+    const h = specForSourceMetric({ name: 'frame_bits', metric_type: 'histogram', unit: 'bits' });
+    assert.deepEqual(h.opts.format, { unit_system: 'count' });
+    for (const unit of ['percent', 'ratio', 'celsius', 'hertz', 'cores']) {
+        const c = specForSourceMetric({ name: 'c_total', metric_type: 'counter', unit });
+        assert.equal(c.opts.format, undefined, unit);
+    }
+});

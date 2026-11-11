@@ -35,8 +35,10 @@ export const sourceMetricChartId = (name) => `source-metric-${name}`;
  *   the query divides by `1e9 / factor` (nothing for `seconds`) and the
  *   chart is drawn as `percentage`, without the unit.
  *
- * A `bits` gauge is drawn as a count of bits, without the unit, since
- * `bitrate` is a rate. Without `info.unit` the spec has no `format`.
+ * Any other counter's rate is not in its unit, so its spec has no
+ * `format`. A `bits` gauge or histogram is drawn as a count of bits,
+ * without the unit, since `bitrate` is a rate. Without `info.unit` the spec
+ * has no `format`.
  */
 export const specForSourceMetric = (info) => {
     const opts = {
@@ -57,9 +59,9 @@ export const specForSourceMetric = (info) => {
             opts.format = { unit: info.unit, unit_system: 'datarate' };
         } else if (info.metric_type === 'counter' && dimension === 'bits') {
             opts.format = { unit: info.unit, unit_system: 'bitrate' };
-        } else if (info.metric_type === 'gauge' && dimension === 'bits') {
+        } else if (dimension === 'bits') {
             opts.format = { unit_system: 'count' };
-        } else {
+        } else if (info.metric_type !== 'counter') {
             opts.format = { unit: info.unit };
         }
     }

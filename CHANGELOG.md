@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### metriken-charts (unreleased)
 
-Additive (0.1.5): a spec without `format.unit` formats as before.
+Additive (0.1.5): a spec without `format.unit` formats as before, apart
+from the two histogram heatmap fixes below.
 
 - **Added:** `format.unit`, the unit a series is stored in (`seconds`,
   `milliseconds`, `microseconds`, `nanoseconds`, `bytes`, `kilobytes`,
