@@ -67,18 +67,6 @@ pub type SegmentBytes = Result<Option<Bytes>, Box<dyn Error + Send + Sync>>;
 /// Identity that varies with time: what a column's samples are attributed
 /// to depends on when they were taken.
 ///
-/// Whether the `__run__` matcher `encoded` (as [`MatchOp::encode`] writes
-/// it) selects a series of run `run`, or one with no `__run__` for `None`.
-///
-/// [`MatchOp::encode`]: crate::MatchOp::encode
-fn run_selected(encoded: &str, run: Option<usize>) -> bool {
-    let series = match run {
-        Some(run) => Labels::from([("__run__", run.to_string().as_str())]),
-        None => Labels::default(),
-    };
-    series.matches(&Labels::from([("__run__", encoded)]))
-}
-
 /// A table's column is a slot, and a slot changes hands — a task exits and
 /// another lands in its place. The column's own labels say what the slot
 /// meant when the segment was written, or, once identity leaves column
@@ -1520,6 +1508,16 @@ fn merge_gauge(a: &mut Gauge, g: Gauge) {
     };
 }
 
+/// Whether the `__run__` matcher `encoded` (as [`MatchOp::encode`] writes
+/// it) selects run `run`. `__run__` routes as the run's number, `"0"` for a
+/// histogram with one run.
+///
+/// [`MatchOp::encode`]: crate::MatchOp::encode
+fn run_selected(encoded: &str, run: usize) -> bool {
+    Labels::from([("__run__", run.to_string().as_str())])
+        .matches(&Labels::from([("__run__", encoded)]))
+}
+
 /// Add a `__run__` label to every series in `stream`, disambiguating a
 /// histogram identity that [`HistogramRunIndex`] found split across
 /// incompatible configs.
@@ -1747,14 +1745,13 @@ impl SegmentedSource {
         let (runs, identity) = self.histogram_state(kind);
         if runs.run_count(name) <= 1 {
             // No conflict, so the segments' own labels carry no `__run__`.
-            // The one run is run 0, and its series carry no `__run__`: a
-            // `__run__` matcher keeps it when it selects either `"0"` or an
-            // absent label. A dashboard can pin `__run__="0"` to keep one
-            // query working across an A/B pair where only the other side
-            // drifted.
+            // `__run__` routes as `"0"` for the one run, as `columns()` sees
+            // it, so a matcher is decided against that value. A dashboard
+            // can pin `__run__="0"` to keep one query working across an A/B
+            // pair where only the other side drifted.
             let mut effective = filter.clone();
             if let Some(v) = effective.inner.remove("__run__") {
-                if !run_selected(&v, Some(0)) && !run_selected(&v, None) {
+                if !run_selected(&v, 0) {
                     return None;
                 }
             }
@@ -1778,10 +1775,24 @@ impl SegmentedSource {
         // config is its own run, disambiguated by a `__run__` label; an
         // unqualified selector (no explicit `__run__`) resolves to the
         // FIRST run rather than mixing configs — split, warn, never coerce.
-        // A `__run__` matcher reads the first run it selects.
+        // A `__run__` matcher reads the run it selects. One that selects
+        // several reads none: their configs differ, and one stream holds
+        // one config.
         let (want_run, inner_filter) = match filter.inner.get("__run__") {
             Some(v) => {
-                let want = (0..runs.run_count(name)).find(|&run| run_selected(v, Some(run)))?;
+                let selected: Vec<usize> = (0..runs.run_count(name))
+                    .filter(|&run| run_selected(v, run))
+                    .collect();
+                let [want] = selected[..] else {
+                    if selected.len() > 1 {
+                        tracing::warn!(
+                            metric = name,
+                            "a __run__ matcher selects runs {selected:?}, whose histogram \
+                             configs differ; select one with __run__=\"<n>\""
+                        );
+                    }
+                    return None;
+                };
                 let mut f = filter.clone();
                 f.inner.remove("__run__");
                 (want, f)

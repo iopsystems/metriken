@@ -18,11 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   filter (parquet, segmented, memory, an archive's recording labels
   through `LabeledSource`) and to an overlay's `SourceSelector::Matching`,
   which now selects a source without `k` for `k=""`.
-- **Changed:** a `__run__` matcher on a segmented histogram follows the same
-  rule. With one run, whose series carry no `__run__`, a matcher keeps the
-  run when it selects `"0"` or an absent label (`__run__=""`,
-  `__run__!="1"`, `__run__=~"0|"`); with several, a matcher other than `=`
-  reads the first run it selects. Before, only `__run__="<n>"` was read.
+- **Changed:** a `__run__` matcher of any operator selects a segmented
+  histogram's runs, decided against each run's number (`"0"` for a
+  histogram with one run), as `columns()` decides it: `__run__!="1"` and
+  `__run__=~"0|"` read the one run, `__run__=""` reads none. A matcher that
+  selects several runs, whose configs differ, reads none and logs a
+  warning. Before, a query read only `__run__="<n>"`.
 - **Docs:** `ColumnRelabel` says a matcher of any operator on a key the
   relabelling supplies must be taken off the segment filter.
 
