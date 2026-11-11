@@ -171,6 +171,24 @@ impl PlotBuilder {
         self
     }
 
+    /// The unit the values the chart is given are in, as the storage key
+    /// `unit` names it (`seconds`, `kibibytes`, `percent`, ...). `unit` is
+    /// the unit of the values the query returns; set it only when the query
+    /// has not rescaled them. A `unit_system` of another dimension ignores
+    /// it. Within the unit's dimension the charts multiply each value into
+    /// the base of the plot's [`Unit`] before formatting it: a `seconds`
+    /// value by 1e9 for [`Unit::Time`], which counts nanoseconds, a
+    /// `kibibytes` value by 1024 for [`Unit::Bytes`] or [`Unit::Datarate`],
+    /// a `percent` value by 0.01 for [`Unit::Percentage`], which counts
+    /// fractions. The charts also ignore a unit they do not know.
+    /// `STORED_UNITS` in `charts/util/units.js` lists them; `resolveUnit`
+    /// documents which `Unit`s each applies to. `range` and
+    /// `with_min_y_span` stay in the stored unit.
+    pub fn with_stored_unit<T: Into<String>>(mut self, unit: T) -> Self {
+        self.opts.format.unit = Some(unit.into());
+        self
+    }
+
     /// A subtitle for the chart. The chart modules do not draw it; the page
     /// does.
     pub fn with_description<T: Into<String>>(mut self, text: T) -> Self {
@@ -426,7 +444,12 @@ struct FormatConfig {
     y_axis_label: Option<String>,
 
     unit_system: Option<String>, // e.g., "percentage", "time", "bitrate"
-    precision: Option<u8>,       // decimal places
+
+    // The unit the values are stored in, e.g. "seconds"; see
+    // `PlotBuilder::with_stored_unit`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unit: Option<String>,
+    precision: Option<u8>, // decimal places
 
     log_scale: Option<bool>,
 
@@ -452,6 +475,7 @@ impl FormatConfig {
             x_axis_label: None,
             y_axis_label: None,
             unit_system: Some(unit.to_string()),
+            unit: None,
             precision: Some(2),
             log_scale: None,
             range: None,
@@ -477,6 +501,8 @@ pub enum Unit {
     Percentage,
     Frequency,
     Power,
+    Temperature,
+    Cores,
 }
 
 impl std::fmt::Display for Unit {
@@ -491,6 +517,8 @@ impl std::fmt::Display for Unit {
             Self::Percentage => "percentage",
             Self::Frequency => "frequency",
             Self::Power => "power",
+            Self::Temperature => "temperature",
+            Self::Cores => "cores",
         };
 
         write!(f, "{s}")
@@ -509,6 +537,8 @@ impl Unit {
         Self::Power,
         Self::Count,
         Self::Rate,
+        Self::Temperature,
+        Self::Cores,
     ];
 }
 
@@ -550,6 +580,20 @@ mod tests {
         for name in &ours {
             assert_eq!(name.parse::<Unit>().unwrap().to_string(), *name);
         }
+    }
+
+    #[test]
+    fn stored_unit_is_in_the_format_only_when_set() {
+        let format =
+            |b: PlotBuilder| serde_json::to_value(b.build("q")).unwrap()["opts"]["format"].clone();
+        let plain = format(Plot::gauge("t", "id", Unit::Time));
+        assert!(plain.get("unit").is_none(), "{plain}");
+        let stored = format(
+            Plot::histogram("t", "id", Unit::Time, HistogramView::Buckets)
+                .with_stored_unit("seconds"),
+        );
+        assert_eq!(stored["unit"], "seconds");
+        assert_eq!(stored["unit_system"], "time");
     }
 
     #[test]

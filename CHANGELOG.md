@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-charts (unreleased)
+
+Additive (0.1.5): a spec without `format.unit` formats as before, apart
+from the two histogram heatmap fixes below.
+
+- **Added:** `format.unit`, the unit a series is stored in (`seconds`,
+  `milliseconds`, `microseconds`, `nanoseconds`, `bytes`, `kilobytes`,
+  `kibibytes`, `megabytes`, `mebibytes`, `gigabytes`, `gibibytes`, `bits`,
+  `percent`, `ratio`, `celsius`, `hertz`, `cores`). `unit` is the unit of
+  the values the query returns; set it only when the query has not
+  rescaled them. A `unit_system` of another dimension ignores it. Within
+  the unit's dimension a chart multiplies each value into its unit
+  system's base before scaling and suffixing it: a `seconds` value by 1e9
+  for `time`, a `kibibytes` value by 1024 for `bytes` or `datarate`, a
+  `percent` value by 0.01 for `percentage`. With no `unit_system` the
+  unit's own system is used. `percentage` is read as `percent` (0 to 100):
+  rezolus samplers and metriken-recorder 0.12–0.14 write that name. Line,
+  multi-series and percentile (dots and decimated bands) axes and
+  tooltips, and heatmap and quantile heatmap tooltips and colour legends,
+  apply it. A histogram heatmap labels its bucket bounds in the unit, and
+  in nanoseconds without one, as before.
+- **Added:** `resolveUnit(format)` and `STORED_UNITS` in `util/units.js`;
+  `formatWithUnit`, `createAxisLabelFormatter` and `getBaseYAxisOption`
+  take an optional factor.
+- **Added:** the unit systems `temperature` (°C) and `cores`, and
+  `Unit::Temperature` and `Unit::Cores`.
+- **Added:** `PlotBuilder::with_stored_unit`, which sets `format.unit`.
+- **Added:** `specForSourceMetric` uses a catalog entry's `unit`. A counter
+  in a bytes unit is drawn as `datarate` and one in `bits` as `bitrate`,
+  with the unit. A counter in a time unit has its rate divided by
+  `1e9 / factor` in the query (nothing for `seconds`) and is drawn as
+  `percentage`. A `bits` gauge is drawn as a count of bits. Other metrics
+  carry the unit. A catalog entry without `unit` gives the spec it gave
+  before.
+- **Fixed:** a histogram heatmap raised every bucket bound below 1 to 1,
+  so a histogram in seconds or a ratio (bounds 0.005, 0.01, ...) drew its
+  buckets below 1 with no height and its axis from 1. It now draws them on
+  its log axis, with the first bucket starting a decade below the
+  smallest positive bound. A histogram whose positive bounds are all at
+  least 1 draws as before.
+- **Fixed:** a histogram heatmap whose counts were all 0, or all in
+  buckets above `range.max`, threw `RangeError: Invalid typed array
+  length`. It now draws no data.
+
 ### metriken-storage 0.12.0
 
 - **Breaking:** `Labels::matches` takes a label the series does not carry

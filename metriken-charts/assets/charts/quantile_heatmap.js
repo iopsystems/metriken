@@ -4,7 +4,7 @@
 // (low value → green, high value → red).
 
 import { formatDateTime } from './util/utils.js';
-import { createAxisLabelFormatter, plainValue } from './util/units.js';
+import { createAxisLabelFormatter, plainValue, resolveUnit } from './util/units.js';
 import {
     getBaseOption,
     applyNoData,
@@ -74,7 +74,7 @@ export function configureQuantileHeatmap(chart) {
 
     const baseOption = getBaseOption();
     const format = opts.format || {};
-    const unitSystem = format.unit_system;
+    const { unitSystem, factor: unitFactor } = resolveUnit(format);
 
     const timeData = data[0];
     const tCount = timeData.length;
@@ -240,7 +240,7 @@ export function configureQuantileHeatmap(chart) {
     };
 
     const valueFmt = unitSystem
-        ? createAxisLabelFormatter(unitSystem)
+        ? createAxisLabelFormatter(unitSystem, 2, unitFactor)
         : (v) => String(plainValue(v));
     // For tooltip HTML: an unknown `unit_system` is returned verbatim as the
     // unit, so it is escaped. The color-legend ticks (textContent) keep valueFmt.

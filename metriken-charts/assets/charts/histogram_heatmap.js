@@ -3,6 +3,7 @@ import {
 } from './util/utils.js';
 import {
     createAxisLabelFormatter,
+    resolveUnit,
 } from './util/units.js';
 import {
     getBaseOption,
@@ -18,8 +19,13 @@ import {
 } from './base.js';
 import { infernoColor } from './util/colormap.js';
 
-// Reuse the shared time formatter for latency bucket labels
-const formatLatencyBucket = createAxisLabelFormatter('time');
+// Bucket bounds are latencies in nanoseconds unless the spec names the unit
+// the histogram is stored in (`format.unit`). `unit_system` is not read: the
+// bounds are the stored values whatever the chart's query does with them.
+function bucketBoundFormatter(format) {
+    const { unitSystem, factor } = resolveUnit({ unit: format.unit });
+    return createAxisLabelFormatter(unitSystem || 'time', 2, factor);
+}
 
 import {
     buildGradientCanvas,
@@ -51,6 +57,7 @@ export function configureHistogramHeatmap(chart) {
     // Access format properties using snake_case naming to match Rust serialization
     const format = opts.format || {};
     const range = format.range;
+    const formatLatencyBucket = bucketBoundFormatter(format);
 
     // Find the range of buckets that actually have data
     let minBucketIdx = Infinity;
@@ -64,13 +71,30 @@ export function configureHistogramHeatmap(chart) {
         }
     }
 
+    // No bucket with a count at or below range.max: nothing to draw.
+    if (minBucketIdx === Infinity) {
+        applyNoData(chart);
+        return;
+    }
+
     // Add some padding around the range
     minBucketIdx = Math.max(0, minBucketIdx - 1);
     maxBucketIdx = Math.min(bucketBounds.length - 1, maxBucketIdx + 1);
 
+    // The lower edge drawn for the first bucket, and the least lower edge of
+    // any bucket, since a log axis cannot reach 0. With integer bounds (every
+    // positive bound at least 1) it is 1. With bounds below 1, as a seconds
+    // or ratio histogram has, it is a decade below the smallest positive
+    // bound, so the first bucket keeps a cell a decade tall.
+    let minPositiveBound = Infinity;
+    for (const b of bucketBounds) {
+        if (b > 0 && b < minPositiveBound) minPositiveBound = b;
+    }
+    const boundFloor = minPositiveBound < 1 ? minPositiveBound / 10 : 1;
+
     // Get the visible bucket bounds for log scale, snapped to powers of 10
     // so ECharts places ticks at clean decade boundaries (1ns, 10ns, 100ns, ...)
-    const rawMinBucket = minBucketIdx > 0 ? Math.max(1, bucketBounds[minBucketIdx - 1]) : 1;
+    const rawMinBucket = minBucketIdx > 0 ? Math.max(boundFloor, bucketBounds[minBucketIdx - 1]) : boundFloor;
     let rawMaxBucket = bucketBounds[maxBucketIdx];
     if (range?.max != null) rawMaxBucket = Math.min(rawMaxBucket, range.max);
     const minBucketValue = Math.pow(10, Math.floor(Math.log10(rawMinBucket)));
@@ -132,7 +156,7 @@ export function configureHistogramHeatmap(chart) {
 
             const bucketIdx = bo + minBucketIdx;
             if (range?.max != null && bucketBounds[bucketIdx] > range.max) continue;
-            const lowerBound = bucketIdx > 0 ? Math.max(1, bucketBounds[bucketIdx - 1]) : 1;
+            const lowerBound = bucketIdx > 0 ? Math.max(boundFloor, bucketBounds[bucketIdx - 1]) : boundFloor;
             const upperBound = bucketBounds[bucketIdx];
 
             allCellsData.push([timestampMs, Math.log10(lowerBound), Math.log10(upperBound), count, dt, bucketIdx]);
