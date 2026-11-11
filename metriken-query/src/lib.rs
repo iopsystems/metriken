@@ -489,10 +489,10 @@ pub trait MetricsSource: Send + Sync {
 
     /// The label sets of counter `name` that `filter` matches, as this
     /// engine's selector `name{...}` with those matchers selects them
-    /// (`Labels::matches`: a regex matcher is anchored at both ends, and
-    /// `k=""` and `k=~""` do not match a series without `k`). Build `filter`
-    /// from a
-    /// selector with [`selector_filter`]. The default filters
+    /// (`Labels::matches`: a regex matcher is anchored at both ends, and a
+    /// label a series does not carry has the value `""`, so `k=""` matches
+    /// a series without `k`). Build `filter` from a selector with
+    /// [`selector_filter`]. The default filters
     /// [`counter_labels`](Self::counter_labels); `ArchiveReader` overrides
     /// it and does not read a recording whose labels `filter` contradicts.
     fn counter_labels_matching(

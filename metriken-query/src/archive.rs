@@ -1450,6 +1450,52 @@ mod tests {
             .collect()
     }
 
+    /// A label neither a series nor its recording carries matches as `""`,
+    /// for a recording label (`source`, which one recording lacks) as for a
+    /// series label (`l`); the filtered listing agrees with the query.
+    #[test]
+    fn an_absent_recording_or_series_label_matches_as_empty() {
+        let reader = archive(vec![
+            recording(
+                &[("source", "a")],
+                vec![(
+                    "t",
+                    typed_table("x", "gauge", &[(&[("l", "a")], 1), (&[], 3)], 5),
+                )],
+            ),
+            recording(
+                &[("host", "h")],
+                vec![("t", typed_table("x", "gauge", &[(&[], 5)], 5))],
+            ),
+        ]);
+        let values = |query: &str| {
+            let mut v: Vec<f64> = series(&reader, query).into_iter().map(|s| s.1).collect();
+            v.sort_by(f64::total_cmp);
+            v
+        };
+        for (query, want) in [
+            (r#"x{source=""}"#, &[25.0][..]),
+            (r#"x{source!=""}"#, &[5.0, 15.0]),
+            (r#"x{source=~"a|"}"#, &[5.0, 15.0, 25.0]),
+            (r#"x{source!~".*"}"#, &[]),
+            (r#"x{source="" or source="a"}"#, &[5.0, 15.0, 25.0]),
+            (r#"x{l=""}"#, &[15.0, 25.0]),
+            (r#"x{l!=""}"#, &[5.0]),
+            (r#"x{l=~"a|"}"#, &[5.0, 15.0, 25.0]),
+            (r#"x{l!~".*"}"#, &[]),
+        ] {
+            assert_eq!(values(query), want, "{query}");
+            let filter = crate::selector_filter(query.trim_start_matches('x'));
+            if let Ok(filter) = filter {
+                assert_eq!(
+                    MetricsSource::gauge_labels_matching(&reader, "x", &filter).len(),
+                    want.len(),
+                    "{query}: listing"
+                );
+            }
+        }
+    }
+
     /// A filtered listing lists the series a query's selector with the same
     /// matchers selects, and reads only the recordings whose labels can
     /// match it.

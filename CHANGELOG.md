@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-storage (unreleased)
+
+- **Fixed:** `Labels::matches` takes a label the series does not carry as
+  `""`, as Prometheus does: `l=""` matches a series without `l`, as do
+  `l=~"a|"` and `l!="a"`, and `l!=""` and `l!~".*"` do not. A label the
+  series lacked failed `=` and `=~` and passed `!=` and `!~` whatever the
+  operand. This applies to every reader's filter (parquet, segmented,
+  memory, an archive's recording labels through `LabeledSource`) and to an
+  overlay's `SourceSelector::Matching`, which now selects a source without
+  `k` for `k=""`.
+
+### metriken-query (unreleased)
+
+- **Fixed:** a selector that matches the empty string selects the series
+  that lack the label, through every source: `x{l=""}` selects the series
+  of `x` without `l`, `x{l=~"a|"}` those with `l="a"` and those without,
+  and `x{l!~".*"}` none. Only a selector with `or` did this before. The
+  filtered listings (`counter_labels_matching` and its siblings) follow
+  the same rule. A selector with `or` reads with every matcher its
+  branches share, including one that matches `""`.
+
 ### metriken-storage 0.11.2
 
 - **Added:** `ArchiveWriter::create_isolated`: an archive in which a
