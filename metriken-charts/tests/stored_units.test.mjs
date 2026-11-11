@@ -183,6 +183,7 @@ function stubChart(spec) {
             setOption(o) { option = option ? { ...option, ...o } : o; },
             getOption: () => option,
             getModel: () => null,
+            clear() { option = null; },
             dispatchAction() {},
             on() {},
             off() {},
@@ -314,6 +315,80 @@ test('a histogram heatmap reads its bucket unit from `unit`, not `unit_system`',
     });
     configureHistogramHeatmap(chart);
     assert.equal(chart.echart.getOption().yAxis.axisLabel.formatter(1), '10 ms');
+});
+
+// A Prometheus `_seconds` histogram's default bounds, as metriken-query
+// returns them once it has divided out the column's `scale`.
+const SECONDS_BOUNDS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
+
+function histogramChart(format, bucketBounds, data) {
+    const chart = stubChart({ opts: { title: 't', format }, time_data: [T0, T0 + 1], bucket_bounds: bucketBounds, data });
+    configureHistogramHeatmap(chart);
+    return chart;
+}
+const cellsOf = (chart) => chart.echart.getOption().series[0].data;
+
+test('a histogram heatmap draws bucket bounds below 1 on its log axis', () => {
+    // Counts in the first bucket (up to 5 ms), at 25..50 ms and at 1..2.5 s.
+    const chart = histogramChart({ unit: 'seconds' }, SECONDS_BOUNDS, [[0, 0, 3], [0, 3, 5], [1, 8, 7]]);
+    const { yAxis, tooltip } = chart.echart.getOption();
+    // The first bucket is drawn from a decade below its bound, 0.5 ms, so
+    // the axis starts at the decade 0.1 ms; it ends at the decade above the
+    // padded top bucket's bound, 5 s.
+    assert.equal(yAxis.min, -4);
+    assert.equal(yAxis.max, 1);
+    assert.equal(yAxis.axisLabel.formatter(-4), '100 μs');
+    assert.equal(yAxis.axisLabel.formatter(-3), '1 ms');
+    assert.equal(yAxis.axisLabel.formatter(0), '1 s');
+    const cells = cellsOf(chart).map(([, lo, hi, count, , idx]) => [idx, lo, hi, count]);
+    assert.deepEqual(cells.map(([idx]) => idx), [0, 3, 8]);
+    for (const [idx, lo, hi] of cells) {
+        assert.ok(Number.isFinite(lo) && Number.isFinite(hi) && lo < hi, `bucket ${idx}: ${lo}..${hi}`);
+        assert.equal(hi, Math.log10(SECONDS_BOUNDS[idx]));
+    }
+    assert.equal(cells[0][1], Math.log10(0.0005));
+    assert.equal(cells[1][1], Math.log10(0.025));
+    // The tooltip names a bucket by its lower bound.
+    assert.match(tooltip.formatter({ data: cellsOf(chart)[1] }), /25 ms/);
+    assert.match(tooltip.formatter({ data: cellsOf(chart)[0] }), /500 μs/);
+});
+
+test('a histogram heatmap with bounds below 1 leaves out buckets above range.max', () => {
+    const chart = histogramChart({ unit: 'seconds', range: { max: 0.05 } }, SECONDS_BOUNDS,
+        [[0, 0, 3], [0, 3, 5], [1, 8, 7]]);
+    const { yAxis } = chart.echart.getOption();
+    assert.deepEqual(cellsOf(chart).map((c) => c[5]), [0, 3]);
+    assert.equal(yAxis.min, -4);
+    assert.equal(yAxis.max, Math.ceil(Math.log10(0.05)));
+});
+
+test('a histogram heatmap with every count above range.max draws no data', () => {
+    // A percentage chart capped at 1 over integer bounds whose counts are
+    // all in buckets above it.
+    const chart = histogramChart({ unit_system: 'percentage', range: { max: 1 } }, [1, 2, 4, 8],
+        [[0, 2, 3], [1, 3, 4]]);
+    assert.equal(chart.echart.getOption(), null);
+    // So does one whose counts are all 0.
+    assert.equal(histogramChart({}, [1, 2, 4, 8], [[0, 2, 0]]).echart.getOption(), null);
+});
+
+test('a histogram heatmap with integer bounds draws from 1 as before', () => {
+    // Bounds 0, 1, 2, 4, ... as a base-2 histogram has, counts at 2..4 ns,
+    // 64..128 ns and in the bucket whose bound is 0.
+    const bounds = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256];
+    const chart = histogramChart({ unit_system: 'time' }, bounds, [[0, 0, 2], [0, 3, 5], [1, 8, 7]]);
+    const { yAxis } = chart.echart.getOption();
+    assert.equal(yAxis.min, 0);
+    assert.equal(yAxis.max, Math.ceil(Math.log10(256)));
+    assert.equal(yAxis.axisLabel.formatter(0), '1 ns');
+    const cells = cellsOf(chart).map(([, lo, hi, , , idx]) => [idx, lo, hi]);
+    // The bucket at 0 is drawn from 1 to log10(0), so it has no height and
+    // renderItem skips it; the others start at their lower bound, at least 1.
+    assert.deepEqual(cells, [
+        [0, 0, -Infinity],
+        [3, Math.log10(2), Math.log10(4)],
+        [8, Math.log10(64), Math.log10(128)],
+    ]);
 });
 
 test('a percent series charted as a line reads in percent', () => {

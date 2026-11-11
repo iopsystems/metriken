@@ -40,6 +40,15 @@ Additive (0.1.5): a spec without `format.unit` formats as before.
   `percentage`. A `bits` gauge is drawn as a count of bits. Other metrics
   carry the unit. A catalog entry without `unit` gives the spec it gave
   before.
+- **Fixed:** a histogram heatmap raised every bucket bound below 1 to 1,
+  so a histogram in seconds or a ratio (bounds 0.005, 0.01, ...) drew its
+  buckets below 1 with no height and its axis from 1. It now draws them on
+  its log axis, with the first bucket starting a decade below the
+  smallest positive bound. A histogram whose positive bounds are all at
+  least 1 draws as before.
+- **Fixed:** a histogram heatmap whose counts were all 0, or all in
+  buckets above `range.max`, threw `RangeError: Invalid typed array
+  length`. It now draws no data.
 
 ### metriken-storage 0.12.0
 
