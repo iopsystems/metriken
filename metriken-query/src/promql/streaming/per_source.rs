@@ -2253,37 +2253,42 @@ mod tests {
     }
 
     /// A member whose histogram interval exceeds `u64::MAX / 3` nanoseconds
-    /// is read to the end of time instead of overflowing the read's end.
+    /// is read to its end instead of overflowing the read's end, and the
+    /// combine returns the rows the finer member alone gives.
     #[test]
-    fn a_histogram_interval_past_a_third_of_u64_nanoseconds_reads() {
+    fn a_histogram_interval_past_a_third_of_u64_nanoseconds_reads_to_the_members_end() {
         let cpu0: &[(&str, &str)] = &[("cpu", "0")];
         let rows: Vec<u64> = (0..=20).map(|s| s * S).collect();
         let fine = histogram_source(1, &[(cpu0, rows.clone())]);
         let coarse = histogram_source(10_000_000_000, &[(cpu0, rows)]);
-        let members: Vec<Member> = [fine, coarse]
-            .into_iter()
-            .enumerate()
-            .map(|(m, source)| Member {
-                raw: Arc::clone(&source),
-                source,
-                lo: 0,
-                hi: u64::MAX,
-                uuid: Some(format!("u{m}")),
-                catalog_index: m,
-                position: m,
-                first_ns: u64::MAX,
-            })
-            .collect();
-        let conflicts = Arc::new(super::super::conflicts::Conflicts::default());
-        let rows = collect(combine_histograms(
-            &members,
-            "h",
-            &Labels::default(),
-            0,
-            20 * S,
-            &conflicts,
-        ));
-        assert!(matches!(rows, Some(Some(ref r)) if !r.is_empty()));
+        let combine = |sources: Vec<Arc<dyn DataSource>>| {
+            let members: Vec<Member> = sources
+                .into_iter()
+                .enumerate()
+                .map(|(m, source)| Member {
+                    raw: Arc::clone(&source),
+                    source,
+                    lo: 0,
+                    hi: u64::MAX,
+                    uuid: Some(format!("u{m}")),
+                    catalog_index: m,
+                    position: m,
+                    first_ns: u64::MAX,
+                })
+                .collect();
+            let conflicts = Arc::new(super::super::conflicts::Conflicts::default());
+            collect(combine_histograms(
+                &members,
+                "h",
+                &Labels::default(),
+                0,
+                20 * S,
+                &conflicts,
+            ))
+        };
+        let alone = combine(vec![Arc::clone(&fine)]);
+        assert!(matches!(alone, Some(Some(ref r)) if !r.is_empty()));
+        assert_eq!(combine(vec![fine, coarse]), alone);
     }
 
     /// A member whose `cpu=1` rows end at 10 s while its `cpu=0` rows go on

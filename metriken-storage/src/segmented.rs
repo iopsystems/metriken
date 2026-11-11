@@ -2006,7 +2006,7 @@ impl DataSource for SegmentedSource {
         self.histogram_stream_of(HistKind::Gauge, name, filter, start_ns, end_ns)
     }
 
-    /// The shortest of the present tables' intervals, or 1.0 with none.
+    /// The shortest of the present segments' intervals, or 1.0 with none.
     fn interval(&self) -> f64 {
         self.state
             .catalog

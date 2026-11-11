@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### metriken-storage 0.11.2
 
 - **Fixed:** `MultiParquetSource::interval` with no files, and
-  `SegmentedSource::interval` with no table present, answer 1.0, as
+  `SegmentedSource::interval` with no segment present, answer 1.0, as
   `RecordingsSource` and `UnionSource` do with no children. They answered
   `f64::MAX`, which a histogram read turned into a multiply overflow panic
   in debug builds.
@@ -25,8 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Fixed:** a histogram read whose interval exceeds `u64::MAX / 2`
   nanoseconds starts at time 0 instead of overflowing, which panicked in
   debug builds. A histogram read across recordings whose coarsest interval
-  exceeds `u64::MAX / 3` nanoseconds reads to the end of time instead of
-  overflowing.
+  exceeds `u64::MAX / 3` nanoseconds reads each member to its end instead
+  of overflowing.
 
 ### metriken-storage 0.11.1
 
