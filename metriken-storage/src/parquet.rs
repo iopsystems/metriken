@@ -450,9 +450,23 @@ impl MultiParquetSource {
         bytes: impl Into<Bytes>,
         pool: Arc<BufferPool>,
     ) -> Result<Self, Box<dyn Error>> {
-        let bytes = bytes.into();
+        Self::open_content_keyed_ref(bytes.into(), PoolRef::Strong(pool))
+    }
+
+    /// [`open_content_keyed`](Self::open_content_keyed) for a segment
+    /// `pool` will keep: it refers to `pool` weakly, so a pool that holds it
+    /// is still freed with its last outside handle. Its reads cache nothing
+    /// once the pool is gone.
+    pub(crate) fn open_kept_in(
+        bytes: impl Into<Bytes>,
+        pool: &Arc<BufferPool>,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::open_content_keyed_ref(bytes.into(), PoolRef::Weak(Arc::downgrade(pool)))
+    }
+
+    fn open_content_keyed_ref(bytes: Bytes, pool: PoolRef) -> Result<Self, Box<dyn Error>> {
         let id = content_source_id(&bytes);
-        let src = ParquetSource::open_bytes_with_pool_id(bytes, pool, id)?;
+        let src = ParquetSource::open_bytes_with_pool_ref(bytes, pool, id)?;
         Ok(Self {
             files: vec![(
                 Arc::new(FileSource(src)) as Arc<dyn DataSource>,
@@ -850,6 +864,14 @@ impl parquet::file::reader::ChunkReader for PositionalFile {
     }
 }
 
+/// How a source refers to its pool. A segment the pool itself keeps (see
+/// [`MultiParquetSource::open_kept_in`]) refers to it weakly, so the pool
+/// does not keep itself alive through its own entries.
+enum PoolRef {
+    Strong(Arc<BufferPool>),
+    Weak(std::sync::Weak<BufferPool>),
+}
+
 pub struct ParquetSource {
     /// Unique numeric identity assigned at construction; used as the `source_id`
     /// component of every `CacheKey` produced by this source.
@@ -857,8 +879,9 @@ pub struct ParquetSource {
     backing: ParquetBacking,
     meta: ArrowReaderMetadata,
     sampling_interval_ms: u64,
-    /// Optional shared buffer pool for decoded row-group blocks.
-    pool: Option<Arc<BufferPool>>,
+    /// Optional shared buffer pool for decoded row-group blocks; read it
+    /// with [`pool`](Self::pool).
+    pool: Option<PoolRef>,
     /// The parsed schema, computed on first use.
     ///
     /// `parse_schema` walks every field in the file, so re-running it per
@@ -1172,6 +1195,15 @@ impl DataSource for FileSource {
 }
 
 impl ParquetSource {
+    /// The pool decoded blocks are cached in: `None` without one, or when a
+    /// pool held weakly has been dropped.
+    fn pool(&self) -> Option<Arc<BufferPool>> {
+        match self.pool.as_ref()? {
+            PoolRef::Strong(pool) => Some(Arc::clone(pool)),
+            PoolRef::Weak(pool) => pool.upgrade(),
+        }
+    }
+
     /// The `occupant` column of a [long](crate::long) segment; `None` for
     /// any other file, including one with a column of that name that is
     /// not marked long.
@@ -1211,14 +1243,14 @@ impl ParquetSource {
             column_idx: usize::MAX - col,
             row_group_idx: rg_idx,
         };
-        if let Some(pool) = &self.pool {
+        if let Some(pool) = self.pool() {
             if let Some(index) = pool.get_derived::<OccupantRows>(key) {
                 return Ok(index);
             }
         }
         let occupants = read_counter_values_per_rg(self, rg_idx, col)?;
         let index = Arc::new(OccupantRows::build(&occupants));
-        if let Some(pool) = &self.pool {
+        if let Some(pool) = self.pool() {
             pool.put_derived(key, Arc::clone(&index), index.bytes());
         }
         Ok(index)
@@ -1592,7 +1624,7 @@ impl ParquetSource {
             backing: ParquetBacking::File(PositionalFile::new(file)?),
             meta,
             sampling_interval_ms,
-            pool: Some(pool),
+            pool: Some(PoolRef::Strong(pool)),
             columns: OnceLock::new(),
             duplicated: OnceLock::new(),
             fixed_cols: OnceLock::new(),
@@ -1613,6 +1645,14 @@ impl ParquetSource {
     pub fn open_bytes_with_pool_id(
         bytes: Bytes,
         pool: Arc<BufferPool>,
+        id: u64,
+    ) -> Result<Arc<Self>, Box<dyn Error>> {
+        Self::open_bytes_with_pool_ref(bytes, PoolRef::Strong(pool), id)
+    }
+
+    fn open_bytes_with_pool_ref(
+        bytes: Bytes,
+        pool: PoolRef,
         id: u64,
     ) -> Result<Arc<Self>, Box<dyn Error>> {
         let meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())?;
@@ -1644,7 +1684,7 @@ impl ParquetSource {
             backing: ParquetBacking::File(PositionalFile::new(file)?),
             meta,
             sampling_interval_ms,
-            pool: Some(pool),
+            pool: Some(PoolRef::Strong(pool)),
             columns: OnceLock::new(),
             duplicated: OnceLock::new(),
             fixed_cols: OnceLock::new(),
@@ -2273,7 +2313,7 @@ fn read_timestamps(
         row_group_idx: rg_idx,
     };
 
-    if let Some(pool) = &pf.pool {
+    if let Some(pool) = pf.pool() {
         if let Some(cached) = pool.get_timestamps(key) {
             return Ok(cached);
         }
@@ -2334,7 +2374,7 @@ fn read_timestamps(
     out.shrink_to_fit();
     let result = Arc::new(out);
 
-    if let Some(pool) = &pf.pool {
+    if let Some(pool) = pf.pool() {
         pool.put_timestamps(key, Arc::clone(&result));
     }
 
@@ -2424,7 +2464,7 @@ fn read_counter_values_per_rg(
         row_group_idx: rg_idx,
     };
 
-    if let Some(pool) = &pf.pool {
+    if let Some(pool) = pf.pool() {
         if let Some(cached) = pool.get_counter_values(key) {
             return Ok(cached);
         }
@@ -2483,7 +2523,7 @@ fn read_counter_values_per_rg(
     out.shrink_to_fit();
     let result = Arc::new(out);
 
-    if let Some(pool) = &pf.pool {
+    if let Some(pool) = pf.pool() {
         pool.put_counter_values(key, Arc::clone(&result));
     }
 
@@ -2501,7 +2541,7 @@ fn read_gauge_values_per_rg(
         row_group_idx: rg_idx,
     };
 
-    if let Some(pool) = &pf.pool {
+    if let Some(pool) = pf.pool() {
         if let Some(cached) = pool.get_gauge_values(key) {
             return Ok(cached);
         }
@@ -2560,7 +2600,7 @@ fn read_gauge_values_per_rg(
     out.shrink_to_fit();
     let result = Arc::new(out);
 
-    if let Some(pool) = &pf.pool {
+    if let Some(pool) = pf.pool() {
         pool.put_gauge_values(key, Arc::clone(&result));
     }
 
@@ -2581,7 +2621,7 @@ fn read_float_values_per_rg(
         row_group_idx: rg_idx,
     };
 
-    if let Some(pool) = &pf.pool {
+    if let Some(pool) = pf.pool() {
         if let Some(cached) = pool.get_derived::<Vec<Option<f64>>>(key) {
             return Ok(cached);
         }
@@ -2638,7 +2678,7 @@ fn read_float_values_per_rg(
     let size = out.len() * std::mem::size_of::<Option<f64>>();
     let result = Arc::new(out);
 
-    if let Some(pool) = &pf.pool {
+    if let Some(pool) = pf.pool() {
         pool.put_derived(key, Arc::clone(&result), size);
     }
 
@@ -3526,7 +3566,7 @@ impl ParquetHistogramCursor {
                             Some(list) => Arc::new(snapshots_of(list)),
                             None => continue,
                         }
-                    } else if let Some(pool) = &self.pf.pool {
+                    } else if let Some(pool) = self.pf.pool() {
                         if let Some(cached) = pool.get_histogram_snapshots(key) {
                             cached
                         } else {

@@ -1,8 +1,10 @@
-//! Process-wide buffer pool for decoded parquet row groups.
+//! Process-wide buffer pool for decoded parquet row groups and opened
+//! segments.
 //!
 //! Follows the standard layered-cache pattern used by ClickHouse, DuckDB,
 //! PostgreSQL, and other columnar/OLAP systems. Sources opened with the same
-//! pool share its budget and LRU.
+//! pool share its budget and LRU: a segmented table's opened segments and the
+//! blocks decoded from them are charged against the one budget.
 //!
 //! # Usage
 //!
@@ -48,7 +50,8 @@ pub fn content_source_id(bytes: &[u8]) -> u64 {
     ((h as u64) ^ ((h >> 64) as u64)) | (1 << 63)
 }
 
-/// A bounded LRU cache of decoded parquet row groups.
+/// A bounded LRU cache of decoded parquet row groups and of segmented
+/// readers' opened segments.
 ///
 /// Construct one per process (or per logical workload), share across many
 /// sources via `Arc`. The pool tracks RAM usage and evicts the
@@ -76,7 +79,8 @@ pub struct BufferPoolStats {
     pub entries: usize,
 }
 
-/// Identifies a single decoded column block within a parquet source.
+/// Identifies a decoded column block within a parquet source, or an opened
+/// segment of a segmented reader.
 #[derive(Hash, Eq, PartialEq, Clone, Copy)]
 pub struct CacheKey {
     pub source_id: u64,
@@ -102,7 +106,8 @@ pub enum Block {
     GaugeValues(Arc<Vec<Option<i64>>>),
     HistogramSnapshots(Arc<Vec<Option<HistogramSnapshot>>>),
     /// Anything else derived from one column of one row group, such as a
-    /// long segment's row index by occupant.
+    /// long segment's row index by occupant, or a segmented reader's opened
+    /// segment.
     Derived(Arc<dyn std::any::Any + Send + Sync>),
 }
 
@@ -220,6 +225,29 @@ impl BufferPool {
         size: usize,
     ) {
         self.put(key, Block::Derived(data), size);
+    }
+
+    /// An opened segment, as [`get_derived`](Self::get_derived) without
+    /// counting a hit or a miss: the counters report decoded blocks.
+    pub(crate) fn get_opened<T: std::any::Any + Send + Sync>(
+        &self,
+        key: CacheKey,
+    ) -> Option<Arc<T>> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.cache.get(&key).and_then(|entry| match &entry.data {
+            Block::Derived(v) => Arc::clone(v).downcast::<T>().ok(),
+            _ => None,
+        })
+    }
+
+    /// How many entries `keep` selects, and the bytes they are charged.
+    pub(crate) fn count_where(&self, keep: impl Fn(&CacheKey) -> bool) -> (usize, usize) {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .cache
+            .iter()
+            .filter(|(k, _)| keep(k))
+            .fold((0, 0), |(n, b), (_, e)| (n + 1, b + e.size_bytes))
     }
 
     // ─── Gauge value column ──────────────────────────────────────────────────

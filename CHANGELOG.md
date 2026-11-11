@@ -38,6 +38,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   segment. When the failed stream is an occupant stream, the table's
   series for occupants first described in the deleted rows read without
   their labels. Requires dendro 0.7.1.
+- **Changed:** A segmented table keeps the segments its queries open in its
+  `BufferPool`, charged against the pool's budget with the blocks decoded
+  from them. Each table kept its own cache of opened segments, each with a
+  budget of the whole pool, so a reader of many tables held many times the
+  pool in opened segments, none of it counted by the pool. The budget now
+  covers both, so a pool sized for decoded blocks alone keeps fewer of
+  them, and `BufferPool::stats` (`entries`, `bytes_used`),
+  `current_bytes` and `clear` include the opened segments; hit and miss
+  counts do not. A segment that does not fit in the budget beside the
+  blocks one series decodes from it is evicted while a query reads it, so
+  it is opened again for each series; a table's cache kept at least one.
+  `SegmentedSource::cached_segments` counts the segments the reader would
+  find in the pool. `Handover::without_segments` returns the handover
+  unchanged: a handover holds no opened segments, and a reader reopened
+  with `ArchiveReader::reuse_from` finds, while the pool holds them, the
+  keyed segments that earlier readers in its chain of handovers opened,
+  including when a reader in the chain was never queried. A dashboard
+  browse of a 12 h v3 `.rez` with a 2 GiB pool, with jemalloc as the
+  allocator, peaked at 3546–3547 MiB RSS, from 5061–5079 MiB (#400).
 
 ### metriken-query (unreleased)
 
@@ -53,6 +72,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reaches a recording whose labels contradict every branch, and a query
   refused as reading a metric of two kinds across recordings can now
   succeed.
+- **Changed:** `SegmentedParquetReader` keeps the segments its queries
+  open in its `BufferPool`, within the pool's budget, and a reader opened
+  with `open_after` finds an earlier reader's keyed segments there; see
+  metriken-storage's entry. `cached_segments` counts the segments the
+  reader would find in the pool. Requires metriken-storage 0.12.0 (#400).
 
 ### metriken-recorder (unreleased)
 

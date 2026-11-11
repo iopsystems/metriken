@@ -8,15 +8,15 @@
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::ops::Range;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::Bytes;
-use lru::LruCache;
 
 use crate::histogram_stream::{HistKind, HistogramStream, HistogramStreamMeta};
 use crate::labels::Labels;
 use crate::parquet::MultiParquetSource;
 
+use crate::buffer_pool::CacheKey;
 use crate::types::{Counter, Counters, Gauge, Gauges};
 use crate::{BufferPool, DataSource};
 
@@ -29,7 +29,7 @@ use crate::{BufferPool, DataSource};
 /// which the segment bytes were 1.27 GB and parsed footers most of the rest.
 /// With a store, open reads each segment once to build its catalog and
 /// identity indexes and then lets it go; a query fetches the segments its
-/// time range touches, through a bounded cache.
+/// time range touches, and keeps them in the [`BufferPool`] within its budget.
 ///
 /// Segments are in logical (time) order, so `idx` is a position, not an id.
 pub trait SegmentStore: Send + Sync {
@@ -678,48 +678,16 @@ impl SegmentCatalog {
     }
 }
 
-/// Opened segments, most recently used last, bounded by what they hold.
-///
-/// A segment is fetched from the store and its footer parsed when a query
-/// first touches it; the next query over the same range finds it here. Each
-/// entry is charged [`MultiParquetSource::resident_estimate`] — its bytes plus
-/// what its parsed footer and column descriptors take, which on a wide
-/// table is more than the bytes — against the budget the pool already asks
-/// the operator for.
-struct SegmentCache {
-    entries: LruCache<usize, (Arc<MultiParquetSource>, usize)>,
-    bytes: usize,
-    max_bytes: usize,
-}
-
-impl SegmentCache {
-    fn new(max_bytes: usize) -> Self {
-        Self {
-            entries: LruCache::unbounded(),
-            bytes: 0,
-            max_bytes,
-        }
-    }
-
-    fn get(&mut self, idx: usize) -> Option<Arc<MultiParquetSource>> {
-        self.entries.get(&idx).map(|(seg, _)| Arc::clone(seg))
-    }
-
-    /// Insert, then evict least recently used entries until within budget —
-    /// never the one just inserted, so a segment larger than the whole
-    /// budget still opens.
-    fn insert(&mut self, idx: usize, seg: Arc<MultiParquetSource>, size: usize) {
-        if let Some((_, old)) = self.entries.push(idx, (seg, size)) {
-            self.bytes = self.bytes.saturating_sub(old.1);
-        }
-        self.bytes += size;
-        while self.bytes > self.max_bytes && self.entries.len() > 1 {
-            if let Some((_, (_, freed))) = self.entries.pop_lru() {
-                self.bytes = self.bytes.saturating_sub(freed);
-            }
-        }
-    }
-}
+/// The pool column an unkeyed opened segment is kept under, with its reader's
+/// own id and its index: `CacheKey { source_id: tail_id, column_idx:
+/// SEGMENT_COLUMN, row_group_idx: idx }`. A segment among the leading keyed
+/// ones a reader saves state for is kept under the id its readers share and
+/// its [`SegmentStore::key`] (see `SegmentedSource::segment_key`). Each
+/// entry is charged
+/// [`MultiParquetSource::resident_estimate`], its bytes plus what its parsed
+/// footer and column descriptors take, which on a wide table is more than the
+/// bytes.
+const SEGMENT_COLUMN: usize = usize::MAX;
 
 /// Reject a segment whose OWN schema carries two histogram columns for the
 /// same metric name under different `grouping_power`/`max_value_power`
@@ -952,10 +920,16 @@ impl HistogramRunIndex {
 pub struct SegmentedSource {
     /// Where segment bytes come from when a query needs them.
     store: Arc<dyn SegmentStore>,
-    /// Segments opened by queries, bounded by bytes.
-    cache: Mutex<SegmentCache>,
-    /// Decode cache every opened segment is wired to.
+    /// Holds the segments queries open, and what is decoded from them.
     pool: Arc<BufferPool>,
+    /// The pool id of the keyed segments `sealed` covers, shared with the
+    /// reader whose handover this one was opened from. Under it a segment is
+    /// found by its key, which names the same bytes in every reader of the
+    /// table.
+    sealed_id: u64,
+    /// The pool id of every other segment, this reader's own; under it a
+    /// segment is found by its index.
+    tail_id: u64,
     /// Time-varying identity for the columns, if the archive has one.
     relabel: Option<Arc<dyn ColumnRelabel>>,
     /// What open built from every segment.
@@ -1002,31 +976,25 @@ struct Location {
 #[derive(Clone)]
 pub struct Handover {
     sealed: Sealed,
-    /// The pool `segments` were opened on.
+    /// The pool the keyed segments were opened in.
     pool: Arc<BufferPool>,
-    /// Opened keyed segments, `(index, segment, size)`, least recently used
-    /// first.
-    segments: Vec<(usize, Arc<MultiParquetSource>, usize)>,
+    /// Their pool id.
+    sealed_id: u64,
 }
 
 impl std::fmt::Debug for Handover {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Handover")
             .field("keyed_segments", &self.sealed.keys.len())
-            .field("open_segments", &self.segments.len())
             .finish()
     }
 }
 
 impl Handover {
-    /// This handover without the opened segments: the state alone, for a
-    /// handover that is kept while no reader of the table is open.
+    /// This handover. A handover holds no opened segments: they are in the
+    /// pool, which keeps or evicts them like any other entry.
     pub fn without_segments(&self) -> Handover {
-        Handover {
-            sealed: self.sealed.clone(),
-            pool: Arc::clone(&self.pool),
-            segments: Vec::new(),
-        }
+        self.clone()
     }
 
     /// The state after the handing reader's keyed segments, and how many
@@ -1046,7 +1014,10 @@ impl SegmentedSource {
     /// segment's footer once and keeps what answers questions without the
     /// bytes: which series exist, each segment's span and interval, the
     /// histogram run index, the merged file metadata and the column map.
-    /// Opened segments are cached within `pool.max_bytes()`.
+    /// Segments a query opens are kept in `pool`, charged against its budget
+    /// alongside the blocks decoded from them; a segment that does not fit in the
+    /// budget beside the blocks one series decodes from it is evicted while
+    /// a query reads it, and opened again for each series.
     pub fn open_with_pool(
         store: Arc<dyn SegmentStore>,
         pool: Arc<BufferPool>,
@@ -1153,24 +1124,22 @@ impl SegmentedSource {
         // present differently to a later reader, so nothing is saved.
         let sealed = sealed.filter(|s| reusable && !s.unresolved);
 
-        // The previous reader's opened segments for the shared ones, so a
-        // query after a reopen does not fetch and parse them again. Only on
-        // the same pool, whose budget they are decoded into.
-        let mut cache = SegmentCache::new(pool.max_bytes());
-        if let (Some(prev), Some((_, len))) = (previous, &reused) {
-            if Arc::ptr_eq(&prev.pool, &pool) {
-                for (idx, seg, size) in &prev.segments {
-                    if idx < len {
-                        cache.insert(*idx, Arc::clone(seg), *size);
-                    }
-                }
-            }
-        }
+        // The keyed segments the previous reader opened are in the pool under
+        // its id and their keys, so a query after a reopen does not fetch
+        // and parse them again. A key names the same bytes in every reader
+        // of the table, so the id is shared; the rest of this reader's
+        // segments get its own.
+        let tail_id = crate::buffer_pool::next_source_id();
+        let sealed_id = match (previous, &reused) {
+            (Some(prev), Some(_)) if Arc::ptr_eq(&prev.pool, &pool) => prev.sealed_id,
+            _ => crate::buffer_pool::next_source_id(),
+        };
 
         let source = Arc::new(SegmentedSource {
             store,
-            cache: Mutex::new(cache),
             pool,
+            sealed_id,
+            tail_id,
             relabel,
             state,
             sealed: sealed.map(|state| Sealed {
@@ -1183,20 +1152,10 @@ impl SegmentedSource {
     }
 
     pub fn handover(&self) -> Option<Handover> {
-        let sealed = self.sealed.clone()?;
-        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        // Least recently used first, so a cache filled in this order keeps it.
-        let segments = cache
-            .entries
-            .iter()
-            .rev()
-            .filter(|(idx, _)| **idx < sealed.keys.len())
-            .map(|(idx, (seg, size))| (*idx, Arc::clone(seg), *size))
-            .collect();
         Some(Handover {
-            sealed,
+            sealed: self.sealed.clone()?,
             pool: Arc::clone(&self.pool),
-            segments,
+            sealed_id: self.sealed_id,
         })
     }
 
@@ -1211,10 +1170,39 @@ impl SegmentedSource {
         self.state.catalog.len()
     }
 
-    /// How many segments the cache currently holds open, and their bytes.
+    /// How many of the segments this reader would find in the pool it
+    /// holds, and the bytes they are charged. A keyed segment another reader
+    /// of the table opened counts.
     pub fn cached_segments(&self) -> (usize, usize) {
-        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        (cache.entries.len(), cache.bytes)
+        let keyed: std::collections::HashSet<CacheKey> = (0..self.sealed_len())
+            .map(|idx| self.segment_key(idx))
+            .collect();
+        self.pool
+            .count_where(|k| k.source_id == self.tail_id || keyed.contains(k))
+    }
+
+    /// How many leading segments are kept by key under `sealed_id`.
+    fn sealed_len(&self) -> usize {
+        self.sealed.as_ref().map_or(0, |s| s.keys.len())
+    }
+
+    /// The pool key segment `idx` is kept under. A keyed segment: the shared
+    /// id, and its 64-bit key split across the two index fields, so it is
+    /// exact where `usize` is 32 bits. Nothing else is kept under that id.
+    /// Any other segment: this reader's id and the index.
+    fn segment_key(&self, idx: usize) -> CacheKey {
+        match self.sealed.as_ref().and_then(|s| s.keys.get(idx)) {
+            Some(&key) => CacheKey {
+                source_id: self.sealed_id,
+                column_idx: (key >> 32) as usize,
+                row_group_idx: (key & u64::from(u32::MAX)) as usize,
+            },
+            None => CacheKey {
+                source_id: self.tail_id,
+                column_idx: SEGMENT_COLUMN,
+                row_group_idx: idx,
+            },
+        }
     }
 
     /// See [`DataSource::counter_scan`]. `None` when the relabel's
@@ -1335,27 +1323,24 @@ impl SegmentedSource {
         }
     }
 
-    /// Segment `idx`, opened footer-only — from the cache, or fetched from
-    /// the store and cached. `None` when the store no longer has it.
+    /// Segment `idx`, opened footer-only — from the pool, or fetched from
+    /// the store and kept in the pool. `None` when the store no longer has
+    /// it.
     fn segment(&self, idx: usize) -> Result<Option<Arc<MultiParquetSource>>, Box<dyn Error>> {
         self.segment_kept(idx, true)
     }
 
-    /// Segment `idx` as [`segment`](Self::segment) opens it, cached only
+    /// Segment `idx` as [`segment`](Self::segment) opens it, kept only
     /// when `keep`. A scan that reads every segment once passes `false`, so
-    /// it holds one segment at a time instead of filling the cache with
+    /// it holds one segment at a time instead of filling the pool with
     /// segments no query asked for.
     fn segment_kept(
         &self,
         idx: usize,
         keep: bool,
     ) -> Result<Option<Arc<MultiParquetSource>>, Box<dyn Error>> {
-        if let Some(seg) = self
-            .cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(idx)
-        {
+        let key = self.segment_key(idx);
+        if let Some(seg) = self.pool.get_opened::<MultiParquetSource>(key) {
             return Ok(Some(seg));
         }
         // Fetched and parsed outside the lock: two queries racing on one
@@ -1363,18 +1348,12 @@ impl SegmentedSource {
         let Some(bytes) = self.store.bytes(idx).map_err(|e| e.to_string())? else {
             return Ok(None);
         };
-        let seg = Arc::new(MultiParquetSource::open_content_keyed(
-            bytes,
-            Arc::clone(&self.pool),
-        )?);
+        let seg = Arc::new(MultiParquetSource::open_kept_in(bytes, &self.pool)?);
         if !keep {
             return Ok(Some(seg));
         }
         let size = seg.resident_estimate();
-        self.cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(idx, Arc::clone(&seg), size);
+        self.pool.put_derived(key, Arc::clone(&seg), size);
         Ok(Some(seg))
     }
 
@@ -1382,11 +1361,11 @@ impl SegmentedSource {
     /// the caller reaches them, in order.
     ///
     /// An iterator and not a `Vec` on purpose: a collected list would hold
-    /// every touched segment open at once for the whole query, and the cache
-    /// bound would then bound nothing — a query over a wide table's full
+    /// every touched segment open at once for the whole query, and the pool's
+    /// budget would then bound nothing — a query over a wide table's full
     /// range would have the whole table resident again, which is what this
     /// store exists to avoid. Opened one at a time, a segment lives for its
-    /// own decode and then only as long as the cache keeps it.
+    /// own decode and then only as long as the pool keeps it.
     ///
     /// A segment the store has lost is skipped; a read failure is logged and
     /// the segment skipped, since a `DataSource` method has no error to
@@ -1886,7 +1865,7 @@ impl DataSource for SegmentedSource {
     /// out of each touched segment as it is pulled. What `counters` holds
     /// all at once, this holds one segment's worth of one series at a time;
     /// an aggregate pulling every series in lockstep keeps the segment they
-    /// are all reading in the cache and the decoded columns in the pool.
+    /// are all reading open and the decoded columns in the pool.
     fn counter_streams<'s>(
         &'s self,
         name: &str,
@@ -2109,8 +2088,8 @@ impl DataSource for SegmentedSource {
     fn sample_timestamps(&self) -> Vec<u64> {
         // Per-sample timestamps, concatenated in segment order — same splice
         // contract as the query path, no sort/dedup. Reads every segment
-        // present at open, and caches none it opens: a scan of a table's
-        // whole range would otherwise fill the cache to its budget.
+        // present at open, and keeps none it opens: a scan of a table's
+        // whole range would otherwise fill the pool to its budget.
         let mut out = Vec::new();
         let present = self.state.catalog.iter().enumerate();
         for idx in present.filter(|(_, c)| c.present).map(|(idx, _)| idx) {

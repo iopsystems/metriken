@@ -25,7 +25,7 @@ use metriken_storage::segmented::*;
 /// interval), and keeps neither the bytes nor the parsed footer. A query
 /// fetches only the segments whose span it touches, and each of those
 /// decodes only the row groups the query's time range touches; opened
-/// segments are held in a cache bounded by the pool's byte budget.
+/// segments are kept in the pool, within its budget.
 ///
 /// Queries (`query_range` / `query` / `columns`) evaluate over a
 /// [`DataSource`] that splices raw per-series samples across segments in
@@ -62,9 +62,10 @@ impl SegmentedParquetReader {
     /// answers questions without the bytes: which series exist (per metric
     /// kind), each segment's time span and interval, the histogram run
     /// index, the merged file metadata and the column map. Nothing is
-    /// decoded. The cache of opened segments is bounded by
-    /// `pool.max_bytes()`, counted in segment bytes; it always holds at
-    /// least the segment most recently opened.
+    /// decoded. Segments a query opens are kept in `pool`, charged against
+    /// its budget with the blocks decoded from them; a segment that does not fit in the
+    /// budget beside the blocks one series decodes from it is evicted while
+    /// a query reads it, and opened again for each series.
     pub fn open_with_pool(
         store: Arc<dyn SegmentStore>,
         pool: Arc<BufferPool>,
@@ -96,8 +97,10 @@ impl SegmentedParquetReader {
     ///
     /// The leading segments whose [`SegmentStore::key`] matches the earlier
     /// reader's are not read again: the new reader starts from the identity
-    /// indexes and catalog the earlier one had after them, and takes over
-    /// the segments it had open when both use the same `pool`. The rest are
+    /// indexes and catalog the earlier one had after them, and finds the
+    /// keyed segments that earlier readers in its chain of handovers opened
+    /// in `pool`, while the pool holds them, when both use the same `pool`.
+    /// The rest are
     /// read as [`open_with_pool`](Self::open_with_pool) reads them. Reuse
     /// needs a relabel whose identities are fixed
     /// ([`ColumnRelabel::identities_are_fixed`]) or none, and the earlier
@@ -118,8 +121,8 @@ impl SegmentedParquetReader {
 
     /// What a reader opened after this one over the same table can start
     /// from, with [`open_after`](Self::open_after): the open state after
-    /// the leading keyed segments, and the segments among them this reader
-    /// has open. `None` when this reader saved no such state: it was not
+    /// the leading keyed segments, and the pool id their opened segments are
+    /// kept under. `None` when this reader saved no such state: it was not
     /// opened with [`open_after`](Self::open_after), its store keys no
     /// segment, its relabel's identities are not fixed, or a column named an
     /// occupant the relabel did not describe. A handover holds no
@@ -221,7 +224,8 @@ impl SegmentedParquetReader {
         self.metadata_get("version").unwrap_or_default()
     }
 
-    /// How many segments the cache currently holds open, and their bytes.
+    /// How many of the segments this reader would find in the pool it
+    /// holds, and their bytes.
     /// For tests and diagnostics.
     pub fn cached_segments(&self) -> (usize, usize) {
         self.source.cached_segments()
@@ -2274,13 +2278,14 @@ pub(crate) mod tests {
         assert_eq!(r.cached_segments().0, 3);
     }
 
-    /// The cache is bounded by segment bytes and keeps the most recently
-    /// used, never fewer than one.
+    /// Opened segments are kept within the pool's budget, least recently
+    /// used evicted first; a segment larger than the whole budget is not
+    /// kept.
     #[test]
-    fn the_segment_cache_evicts_least_recently_used_within_its_byte_budget() {
+    fn opened_segments_are_evicted_least_recently_used_within_the_pools_budget() {
         let segments = three_segments();
         // What one opened segment is charged: its bytes plus the footer
-        // estimate, the same figure the cache uses.
+        // estimate, the same figure the pool is charged.
         let one =
             MultiParquetSource::open_bytes_with_pool(segments[0].clone(), BufferPool::new(1 << 20))
                 .unwrap()
@@ -2303,11 +2308,45 @@ pub(crate) mod tests {
         let _ = r.query_range_opts("irate(c[1s])", 0.5, 1.5, 1.0, &opts);
         assert_eq!(store.fetched(), vec![0]);
 
-        // A budget smaller than one segment still opens one at a time.
+        // A budget smaller than one segment keeps none, and a query still
+        // opens each segment it touches.
         let store = CountingStore::new(three_segments());
         let r = SegmentedParquetReader::open_with_pool(store.clone(), BufferPool::new(1)).unwrap();
+        store.fetched();
         let _ = r.query_range_opts("irate(c[1s])", 0.0, 6.0, 1.0, &opts);
-        assert_eq!(r.cached_segments().0, 1);
+        assert_eq!(store.fetched(), vec![0, 1, 2]);
+        assert_eq!(r.cached_segments().0, 0);
+    }
+
+    /// Tables opened on one pool share its budget for opened segments: with
+    /// room for two segments in all, two tables that each read three hold
+    /// two between them, not two each.
+    #[test]
+    fn tables_on_one_pool_share_its_budget_for_opened_segments() {
+        let one = MultiParquetSource::open_bytes_with_pool(
+            three_segments()[0].clone(),
+            BufferPool::new(1 << 20),
+        )
+        .unwrap()
+        .resident_estimate();
+        let pool = BufferPool::new(2 * one + one / 2);
+        let a = SegmentedParquetReader::open_with_pool(
+            CountingStore::new(three_segments()),
+            Arc::clone(&pool),
+        )
+        .unwrap();
+        let b = SegmentedParquetReader::open_with_pool(
+            CountingStore::new(three_segments()),
+            Arc::clone(&pool),
+        )
+        .unwrap();
+        let opts = QueryOptions::default().with_per_series_rates(true);
+        let _ = a.query_range_opts("irate(c[1s])", 0.0, 6.0, 1.0, &opts);
+        let _ = b.query_range_opts("irate(c[1s])", 0.0, 6.0, 1.0, &opts);
+        let (na, ba) = a.cached_segments();
+        let (nb, bb) = b.cached_segments();
+        assert_eq!(na + nb, 2, "a holds {na}, b holds {nb}");
+        assert!(ba + bb <= pool.max_bytes());
     }
 
     /// Listing the sample timestamps reads every segment it does not hold
@@ -2878,7 +2917,7 @@ pub(crate) mod tests {
         assert_eq!(
             store.fetched(),
             vec![2, 3],
-            "the segments the first reader had open are taken over, not fetched"
+            "the segments the first reader opened are found in the pool, not fetched"
         );
 
         // With no new sealed segment, a third reader starts from the same
@@ -2893,6 +2932,72 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(store.fetched(), vec![3]);
         assert_eq!(answer(&third), answer(&fresh));
+    }
+
+    /// A pool that holds a reader's opened segments is freed once the reader
+    /// and every other handle to the pool are dropped: an opened segment
+    /// does not keep its pool alive.
+    #[test]
+    fn a_pool_holding_opened_segments_is_freed_with_its_last_handle() {
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let weak = Arc::downgrade(&pool);
+        let r = SegmentedParquetReader::open_with_pool(CountingStore::new(three_segments()), pool)
+            .unwrap();
+        let opts = QueryOptions::default().with_per_series_rates(true);
+        let _ = r.query_range_opts("irate(c[1s])", 0.0, 6.0, 1.0, &opts);
+        assert_eq!(r.cached_segments().0, 3);
+        drop(r);
+        assert!(
+            weak.upgrade().is_none(),
+            "the pool outlived its last handle"
+        );
+    }
+
+    /// Two readers reopened from one handover, whose stores hold different
+    /// segments at a keyed position past the handover's prefix, each read
+    /// their own: a reader finds an earlier one's segment in the pool only
+    /// under the same key.
+    #[test]
+    fn two_readers_from_one_handover_read_their_own_segments() {
+        let seg = |from| segment("cpu_cycles", &[], &rows(from, 4));
+        let other = |from: u64| {
+            let r: Vec<(u64, u64)> = (from..from + 4)
+                .map(|s| (s * 1_000_000_000, s * 1000))
+                .collect();
+            segment("cpu_cycles", &[], &r)
+        };
+        let pool = BufferPool::new(64 * 1024 * 1024);
+        let first = SegmentedParquetReader::open_after(
+            KeyedSegments::new(vec![(Some(1), seg(1)), (None, seg(5))]),
+            Arc::clone(&pool),
+            None,
+            None,
+        )
+        .unwrap();
+        answer(&first);
+        let h = first.handover().unwrap();
+        let b = SegmentedParquetReader::open_after(
+            KeyedSegments::new(vec![(Some(1), seg(1)), (Some(2), seg(5)), (None, seg(9))]),
+            Arc::clone(&pool),
+            None,
+            Some(&h),
+        )
+        .unwrap();
+        answer(&b);
+        let c_store = || vec![(Some(1), seg(1)), (Some(7), other(5)), (None, seg(9))];
+        let c = SegmentedParquetReader::open_after(
+            KeyedSegments::new(c_store()),
+            Arc::clone(&pool),
+            None,
+            Some(&h),
+        )
+        .unwrap();
+        let fresh = SegmentedParquetReader::open_with_pool(
+            KeyedSegments::new(c_store()),
+            Arc::clone(&pool),
+        )
+        .unwrap();
+        assert_eq!(answer(&c), answer(&fresh));
     }
 
     /// When the leading keys differ (retention evicted the first segment),
