@@ -1645,13 +1645,163 @@ async fn a_recording_whose_every_source_failed_fails() {
         panic!("SourceFailed then Failed: {seen:?}");
     };
     assert_eq!(*source, SourceId(0));
-    assert!(error.contains("every source failed"), "{error}");
+    assert!(error.contains("no source is left recording"), "{error}");
     assert!(error.contains("table dup"), "{error}");
     let finished = recorder.finish(Stop::Now, CancellationToken::new()).await;
     assert!(
         matches!(&finished, Err(Error::Archive(e)) if e == error),
         "{finished:?}"
     );
+}
+
+/// The only source first fails at the seal `finish` makes: the recording
+/// fails there, after the source's own event.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recording_whose_only_source_fails_at_finish_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fails-at-finish.dendro");
+    let anchor = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let (recorder, _ids, mut rx) = Recorder::start_local(
+        RecorderConfig::new(&path, INTERVAL),
+        vec![Box::new(Duplicating { anchor, n: 0 })],
+    )
+    .await
+    .unwrap();
+    committed_passes(&mut rx, 3).await;
+    let finished = recorder.finish(Stop::Now, CancellationToken::new()).await;
+    let mut seen = Vec::new();
+    while let Some(event) = rx.recv().await {
+        if matches!(event, Event::SourceFailed { .. } | Event::Failed { .. }) {
+            seen.push(event);
+        }
+    }
+    let [Event::SourceFailed { source, .. }, Event::Failed { error }] = &seen[..] else {
+        panic!("SourceFailed then Failed: {seen:?}");
+    };
+    assert_eq!(*source, SourceId(0));
+    assert!(
+        matches!(&finished, Err(Error::Archive(e)) if e == error),
+        "{finished:?}"
+    );
+}
+
+/// A source refused at startup records nothing, so when the other source
+/// fails none is left recording and the recording fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_source_beside_a_refused_one_fails_the_recording() {
+    let agent = serve(old_agent("5.20.0")).await;
+    let probe = Arc::new(AgentProbe(client()));
+    let refused = detect_one(spec(&agent.url), probe.as_ref()).await;
+    assert!(
+        matches!(refused, Detected::Refused { .. }),
+        "{}",
+        describe(&refused)
+    );
+    let anchor = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let run = record(
+        vec![refused],
+        probe,
+        vec![Box::new(Duplicating { anchor, n: 0 })],
+        |cfg| {
+            cfg.writer = metriken_storage::WriterConfig {
+                seal: dendro::seal::SealPolicy {
+                    max_rows: 2,
+                    ..dendro::seal::SealPolicy::default()
+                },
+                ..metriken_storage::WriterConfig::default()
+            };
+        },
+        Duration::from_millis(1500),
+        Stop::Now,
+    )
+    .await;
+    let seen: Vec<&Event> = run
+        .events
+        .iter()
+        .filter(|e| matches!(e, Event::SourceFailed { .. } | Event::Failed { .. }))
+        .collect();
+    assert!(
+        matches!(seen[..], [Event::SourceFailed { .. }, Event::Failed { .. }]),
+        "{seen:?}"
+    );
+    assert!(
+        matches!(run.summary, Err(Error::Archive(_))),
+        "{:?}",
+        run.summary
+    );
+}
+
+/// A streamed source refused on reconnect after the other source failed
+/// leaves none recording: the refusal ends the recording while it runs,
+/// before any `finish`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_after_a_failure_with_none_left_fails_the_recording() {
+    let agent = serve(Behaviour {
+        streams: Streams::OnceThen(20, 404),
+        banner: Some("Rezolus 6.0.0 Agent\n".into()),
+        ..Behaviour::default()
+    })
+    .await;
+    let probe = Arc::new(AgentProbe(client()));
+    let detected = detect(
+        &client(),
+        &detect_cfg(),
+        vec![named(&agent.url, "agent")],
+        probe.as_ref(),
+    )
+    .await;
+    let anchor = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = RecorderConfig::new(dir.path().join("out.dendro"), INTERVAL);
+    cfg.writer = metriken_storage::WriterConfig {
+        seal: dendro::seal::SealPolicy {
+            max_rows: 2,
+            ..dendro::seal::SealPolicy::default()
+        },
+        ..metriken_storage::WriterConfig::default()
+    };
+    let (recorder, _ids, mut rx) = Recorder::start(
+        cfg,
+        client(),
+        probe,
+        detected,
+        vec![Box::new(Duplicating { anchor, n: 0 })],
+    )
+    .await
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut seen = Vec::new();
+    while !seen.iter().any(|e| matches!(e, Event::Failed { .. })) {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(
+                e @ (Event::SourceFailed { .. } | Event::Refused { .. } | Event::Failed { .. }),
+            )) => seen.push(e),
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => panic!("no Failed within 30 s: {seen:?}"),
+        }
+    }
+    assert!(
+        matches!(
+            seen[..],
+            [
+                Event::SourceFailed { .. },
+                Event::Refused { .. },
+                Event::Failed { .. }
+            ]
+        ),
+        "{seen:?}"
+    );
+    let finished = recorder.finish(Stop::Now, CancellationToken::new()).await;
+    assert!(matches!(finished, Err(Error::Archive(_))), "{finished:?}");
 }
 
 /// With `retain`, rows older than the newest minus the retention are

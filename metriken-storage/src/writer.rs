@@ -283,8 +283,12 @@ impl ArchiveWriter {
     /// rows it cannot decode. Until then, a reader that materializes the
     /// live WAL tail fails on those rows.
     ///
-    /// A panic in the encoder is caught and recorded like an error, except
-    /// in a build with `panic = "abort"`, where it aborts the process.
+    /// A panic in the encoder is caught and recorded like an error when it
+    /// unwinds. Under `panic = "abort"`, or with a panic hook that exits the
+    /// process, it ends the process.
+    ///
+    /// An encoder result dendro rejects (a segment that does not cover its
+    /// rows) still stops the writer.
     ///
     /// [`encode_failures`]: Self::encode_failures
     pub fn create_isolated(path: &Path, config: WriterConfig) -> Result<Self, Error> {
@@ -1649,8 +1653,9 @@ impl SourceRecorder {
 
     /// Remove `streams` from this source: every row and segment of each,
     /// and of its table's occupant stream (or, for an occupant stream, of
-    /// its table), and stop sealing them. For a stream whose rows cannot be
-    /// encoded (see [`ArchiveWriter::create_isolated`]). dendro's eviction
+    /// its table), and stop sealing them. Used for a stream whose rows
+    /// cannot be encoded (see [`ArchiveWriter::create_isolated`]). dendro's
+    /// eviction
     /// deletes a stream's segments and WAL rows older than a cutoff, so the
     /// unsealed rows cannot be removed without the segments sealed before
     /// them.

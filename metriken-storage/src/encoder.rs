@@ -81,17 +81,9 @@ impl Encoder {
         let Some(failures) = &self.failures else {
             return encode();
         };
-        let error = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(encode)) {
-            Ok(Ok(segment)) => return Ok(segment),
-            Ok(Err(e)) => e.to_string(),
-            Err(payload) => {
-                let what = payload
-                    .downcast_ref::<&str>()
-                    .map(|s| s.to_string())
-                    .or_else(|| payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "a panic with no message".to_string());
-                format!("the encoder panicked: {what}")
-            }
+        let error = match caught(encode) {
+            Ok(segment) => return Ok(segment),
+            Err(error) => error,
         };
         failures
             .lock()
@@ -207,7 +199,30 @@ impl SegmentEncoder for Encoder {
         before: &[DWalRow],
         rows: &[DWalRow],
     ) -> EncodeResult {
-        self.isolate(ctx, || self.encode_rows_after(ctx, before, rows))
+        let encode = || self.encode_rows_after(ctx, before, rows);
+        if self.failures.is_none() {
+            return encode();
+        }
+        // A part that fails gives no segment and is not recorded: dendro's
+        // `split_seal` then seals the stream's rows as one segment with
+        // `encode`, which records the failure if those fail too.
+        Ok(caught(encode).unwrap_or(None))
+    }
+}
+
+/// `encode()`, with an error or a panic as its message.
+fn caught(encode: impl FnOnce() -> EncodeResult) -> Result<Option<Segment>, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(encode)) {
+        Ok(Ok(segment)) => Ok(segment),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(payload) => {
+            let what = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a panic with no message".to_string());
+            Err(format!("the encoder panicked: {what}"))
+        }
     }
 }
 
@@ -525,7 +540,8 @@ mod isolate_tests {
         )
     }
 
-    /// No input makes the encoder panic, so the panic is the closure's.
+    /// The closure panics, standing in for an encoder panic, since no known
+    /// input makes the encoder panic.
     #[test]
     fn an_isolating_encoder_records_a_panic_and_gives_no_segment() {
         let failures = EncodeFailures::default();
@@ -546,5 +562,46 @@ mod isolate_tests {
         let ctx = EncodeContext::new(7, "t");
         let out = encoder.isolate(&ctx, || Err("bad".into()));
         assert_eq!(out.err().map(|e| e.to_string()).as_deref(), Some("bad"));
+    }
+}
+
+#[cfg(test)]
+mod encode_after_isolation_tests {
+    use super::*;
+
+    /// A row whose payload is not msgpack, so neither encode path decodes it.
+    fn garbage(ts: i64) -> DWalRow {
+        DWalRow {
+            stream: "s".to_string(),
+            ts,
+            wall_offset: 0,
+            row: vec![0xc1],
+        }
+    }
+
+    /// A later part of a split seal that fails gives no segment and records
+    /// nothing; the same rows through `encode`, as dendro's fallback seals
+    /// them, record the failure.
+    #[test]
+    fn a_failed_part_of_a_split_is_left_to_the_whole_run_seal() {
+        let failures = EncodeFailures::default();
+        let encoder = Encoder::new(
+            LongStreams::default(),
+            false,
+            sealed_props(default_compression()),
+            Some(Arc::clone(&failures)),
+        );
+        let ctx = EncodeContext::new(3, "s");
+        let (before, rows) = ([garbage(1)], [garbage(2)]);
+        assert!(matches!(
+            encoder.encode_after(&ctx, &before, &rows),
+            Ok(None)
+        ));
+        assert!(
+            failures.lock().unwrap().is_empty(),
+            "a part records nothing"
+        );
+        assert!(matches!(encoder.encode(&ctx, &rows), Ok(None)));
+        assert!(failures.lock().unwrap()[&3].contains_key("s"));
     }
 }

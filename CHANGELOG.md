@@ -21,7 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   implementations return a finite, non-negative value.
 - **Added:** `ArchiveWriter::create_isolated`: an archive in which a
   stream whose rows the encoder cannot write into a segment (an error or
-  a panic) fails only its own source. Such a stream gets no segment, its
+  a panic) fails only its own source. An encoder result dendro rejects (a
+  segment that does not cover its rows) still stops the writer. Such a
+  stream gets no segment, its
   rows stay in the WAL, and the writer keeps running; with
   `ArchiveWriter::create`, dendro stops its writer thread at that seal and
   every source's later commits and syncs return the error, as before.
@@ -35,8 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SourceRecorder::discard_streams` removes streams from a source. dendro's
   eviction deletes a stream's segments and WAL rows older than a cutoff,
   so the unsealed rows cannot be removed without the segments sealed
-  before them: a discarded stream's earlier segments go too. Under
-  `panic = "abort"`, an encoder panic aborts the process.
+  before them: a discarded stream's earlier segments go too. A panic in
+  the encoder is caught and recorded like an error when it unwinds. Under
+  `panic = "abort"`, or with a panic hook that exits the process, it ends
+  the process.
 
 ### metriken-query 0.48.2
 
@@ -85,9 +89,12 @@ Requires metriken-storage 0.11.2.
   snapshot from a local source naming one metric of a sampler twice is
   one such input.
 - **Changed:** a caller with several sources now gets
-  `Event::SourceFailed` for such a source and the recording continues;
-  when every source has failed, it still gets `Event::Failed` (after the
-  last `SourceFailed`), and `Recorder::finish` returns `Error::Archive`.
+  `Event::SourceFailed` for such a source and the recording continues.
+  When no source is `Pending`, `Activating` or `Active`, the recording
+  fails (`Event::Failed`, after the `SourceFailed`), and
+  `Recorder::finish` returns `Error::Archive`; a source refused after
+  another failed ends it the same way. A recording whose sources were all
+  refused, with none failed, goes on as before.
 - **Known limit:** an error staging one source's pass (decoding a
   streamed frame, or `SourceRecorder::stage` and `stage_streamed`) still
   fails the recording for every source, as does any error from the
