@@ -16,7 +16,7 @@ exclude = ["tests/"]
 [dependencies]
 arrow.workspace = true
 bytes = "1"
-dendro = { version = "0.7.0", default-features = false, features = ["archive"], optional = true }
+dendro = { version = "0.7.1", default-features = false, features = ["archive"], optional = true }
 foldhash = "0.2.0"
 lru = "0.18.5"
 regex = "1.12"
@@ -46,7 +46,7 @@ serde_json.workspace = true
 tempfile.workspace = true
 metriken = { path = "../metriken" }
 metriken-exposition = { path = "../metriken-exposition" }
-dendro = { version = "0.7.0" }
+dendro = { version = "0.7.1" }
 
 [features]
 default = ["lz4", "archive"]

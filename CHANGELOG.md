@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `__run__` as absent.
 - **Docs:** `ColumnRelabel` says a matcher of any operator on a key the
   relabelling supplies must be taken off the segment filter.
+- **Changed:** in an archive made by `ArchiveWriter::create_isolated`,
+  `SourceRecorder::finalize` deletes only the rows of a failed stream that
+  no segment holds, with dendro's `discard_live_rows`, and keeps the
+  segments the stream sealed before it failed. The stream's table or
+  occupant stream is no longer removed with it. Before, the stream and its
+  partner lost every segment. Requires dendro 0.7.1.
 
 ### metriken-query (unreleased)
 
@@ -44,6 +50,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reaches a recording whose labels contradict every branch, and a query
   refused as reading a metric of two kinds across recordings can now
   succeed.
+
+### metriken-recorder (unreleased)
+
+- **Changed:** a source whose rows cannot be staged, or whose streamed frame
+  cannot be read or decoded, fails alone (`Event::SourceFailed`), as a
+  source whose rows cannot be encoded does; before, the whole recording
+  failed. The rows it staged before are committed.
+- **Changed:** a failed source keeps the segments its failed tables sealed
+  before the failure (metriken-storage's change above).
 
 ### metriken-storage 0.11.2
 

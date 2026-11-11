@@ -2686,9 +2686,10 @@ fn an_unencodable_stream_fails_only_its_source_in_an_isolated_archive() {
 }
 
 /// A stream that sealed segments and then failed: the finalized archive
-/// holds no table for it, and the source is complete and readable.
+/// keeps the segments it sealed and none of the rows after them, and the
+/// source is complete and readable.
 #[test]
-fn a_stream_that_sealed_and_then_failed_is_removed_with_its_segments() {
+fn a_stream_that_sealed_and_then_failed_keeps_its_segments() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sealed-then-failed.dendro");
     let config = WriterConfig {
@@ -2735,18 +2736,33 @@ fn a_stream_that_sealed_and_then_failed_is_removed_with_its_segments() {
     let sources = catalog.sources().unwrap();
     assert_eq!(sources.len(), 1);
     assert!(sources[0].complete);
-    assert!(
-        !catalog.tables(id).unwrap().iter().any(|t| t == "s"),
-        "{:?}",
-        catalog.tables(id).unwrap()
-    );
-    assert_eq!(catalog.segment_span(id, "s").unwrap().1.rows, 0);
+    assert_eq!(catalog.segment_span(id, "s").unwrap().1.rows, 4);
     assert_eq!(catalog.live_wal_span(id, "s").unwrap().rows, 0);
-    ArchiveReader::from_catalog(Box::new(catalog), None, BufferPool::new(64 << 20), None).unwrap();
+    let readers =
+        ArchiveReader::from_catalog(Box::new(catalog), None, BufferPool::new(64 << 20), None)
+            .unwrap();
+    assert_eq!(readers.len(), 1);
+    // The sealed ticks read back: `x` counts up by one a tick, so its
+    // rate is 1 at ticks 2 to 4 and absent after them.
+    let (start, end) = (BASE as f64 / 1e9, (BASE + 8 * S) as f64 / 1e9);
+    let QueryResult::Matrix { result, .. } = readers[0]
+        .1
+        .query_range("irate(x[1s])", start, end, 1.0)
+        .unwrap()
+    else {
+        panic!("not a matrix");
+    };
+    let points: Vec<(f64, f64)> = result.iter().flat_map(|m| m.values.clone()).collect();
+    let ticks: Vec<f64> = (2..=4).map(|t| (BASE + t * S) as f64 / 1e9).collect();
+    assert_eq!(
+        points,
+        ticks.iter().map(|&t| (t, 1.0)).collect::<Vec<_>>(),
+        "{result:?}"
+    );
 }
 
-/// Records ticks 1-4 of `a_stream_that_sealed_and_then_failed_...` into an
-/// archive at `path` and closes it unfinalized. Returns the source's sealed
+/// Records ticks 1-4 of `a_stream_that_sealed_and_then_failed_keeps_its_segments`
+/// into an archive at `path` and closes it unfinalized. Returns the source's sealed
 /// and live row counts of `s`.
 fn sealed_through_tick_4(path: &Path) -> (u64, u64) {
     let config = WriterConfig {

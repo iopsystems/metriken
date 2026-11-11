@@ -178,9 +178,9 @@ pub enum SourceState {
     /// Answered and cannot be recorded. Never retried. A source refused on
     /// a reconnect keeps the rows it had.
     Refused,
-    /// Its rows could not be written into a segment
-    /// ([`Event::SourceFailed`]): it stopped recording, and its recording is
-    /// finalized without the tables that failed.
+    /// Its rows could not be recorded ([`Event::SourceFailed`]): it stopped
+    /// recording, and its recording is finalized without the rows that
+    /// failed.
     Failed,
 }
 
@@ -300,16 +300,19 @@ pub enum Event {
         epoch: String,
         version: Option<String>,
     },
-    /// The source's rows in a table could not be written into a segment
-    /// (the encoder could not encode them), so the source stopped recording:
-    /// no more passes, scrapes or frames are taken from it. Each failed table
-    /// is removed from its recording, its earlier segments included, and the
-    /// recording is finalized with its other tables. The other sources keep
-    /// recording. When no source is `Pending`, `Activating` or `Active`, the
+    /// The source's rows could not be recorded, so the source stopped
+    /// recording: no more passes, scrapes or frames are taken from it. Its
+    /// rows in a table could not be written into a segment (the encoder
+    /// could not encode them), or its rows could not be staged, or a
+    /// streamed frame from it could not be read or decoded. The rows of each
+    /// failed table that no segment holds are deleted, the segments the
+    /// table sealed before the failure are kept, and the recording is
+    /// finalized. The other sources keep recording. When no source is `Pending`, `Activating` or `Active`, the
     /// recording fails ([`Event::Failed`], after this event); the check runs
     /// again when a source is refused, so a refusal that leaves none
     /// `Pending`, `Activating` or `Active` ends it too. `reason` names each
-    /// failed table and the encoder's error. At most once per source; its
+    /// failed table and the encoder's error, or what could not be staged or
+    /// read. At most once per source; its
     /// state is then [`SourceState::Failed`].
     SourceFailed { source: SourceId, reason: String },
     /// The archive failed, or a source failed ([`Event::SourceFailed`]) and
@@ -674,6 +677,7 @@ impl Recorder {
         driver.archive = Some(Archive {
             recs: BTreeMap::new(),
             staged: Vec::new(),
+            unstageable: BTreeMap::new(),
             writer,
         });
 
@@ -856,6 +860,10 @@ struct Settings {
 struct Archive {
     recs: BTreeMap<usize, SourceRecorder>,
     staged: Vec<Staged>,
+    /// Per slot, why its rows could not be staged or decoded since the last
+    /// commit. Nothing more is staged for it; the commit drops it
+    /// ([`drop_unencodable`]).
+    unstageable: BTreeMap<usize, String>,
     writer: ArchiveWriter,
 }
 
@@ -1645,7 +1653,7 @@ impl Driver {
         for (i, reason) in dropped {
             let slot = &mut self.slots[i];
             let label = slot.label();
-            warn!("{label}: its rows could not be written into a segment ({reason}); it stopped recording");
+            warn!("{label}: {reason}; it stopped recording");
             slot.state = SourceState::Failed;
             slot.added = false;
             #[cfg(feature = "http")]
@@ -1707,7 +1715,9 @@ impl Driver {
         .await;
     }
 
-    /// Stage `snapshot` for slot `i`.
+    /// Stage `snapshot` for slot `i`. Rows that cannot be staged fail the
+    /// slot alone ([`unstageable`](Self::unstageable)); nothing more is
+    /// staged for a slot that failed so.
     fn stage(
         &mut self,
         i: usize,
@@ -1719,18 +1729,42 @@ impl Driver {
             .archive
             .as_mut()
             .ok_or_else(|| "the archive is closed".to_string())?;
+        if archive.unstageable.contains_key(&i) {
+            return Ok(());
+        }
         let rec = archive.recs.get_mut(&i).ok_or_else(|| {
             format!(
                 "{} delivered a pass with no recording open for it",
                 self.slots[i].label()
             )
         })?;
-        archive.staged.push(
-            rec.stage(snapshot, ts, wall_offset)
-                .map_err(|e| e.to_string())?,
-        );
+        match rec.stage(snapshot, ts, wall_offset) {
+            Ok(staged) => archive.staged.push(staged),
+            Err(e) => {
+                self.unstageable(i, format!("its rows could not be staged: {e}"));
+                return Ok(());
+            }
+        }
         self.slots[i].staged(ts, wall_offset);
         Ok(())
+    }
+
+    /// Slot `i`'s rows could not be staged or decoded, for `reason`: stage
+    /// nothing more for it, and drop it at the next commit as a slot whose
+    /// rows could not be encoded is dropped ([`drop_unencodable`]). The rows
+    /// it staged before are committed.
+    fn unstageable(&mut self, i: usize, reason: String) {
+        warn!("{}: {reason}", self.slots[i].label());
+        if let Some(archive) = self.archive.as_mut() {
+            archive.unstageable.entry(i).or_insert(reason);
+        }
+    }
+
+    /// Whether slot `i`'s rows could not be staged since the last commit.
+    fn is_unstageable(&self, i: usize) -> bool {
+        self.archive
+            .as_ref()
+            .is_some_and(|a| a.unstageable.contains_key(&i))
     }
 
     /// One pass of every active local source, on a blocking thread (see
@@ -2290,8 +2324,9 @@ impl Driver {
 }
 
 /// Finalize and remove each recording with a stream its encoder could not
-/// encode ([`ArchiveWriter::create_isolated`]); `finalize` discards those
-/// streams. Returns each one's slot and the reason, for
+/// encode ([`ArchiveWriter::create_isolated`]), whose rows the encoder's
+/// failures leave out, and each whose rows could not be staged
+/// ([`Archive::unstageable`]). Returns each one's slot and the reason, for
 /// [`Driver::drop_failed`]. A recording that failed is never committed to
 /// again, so what it holds stays decodable; an error here is the archive's,
 /// and fails the recording.
@@ -2299,10 +2334,13 @@ fn drop_unencodable(
     a: &mut Archive,
     lasts: &BTreeMap<usize, (u64, i64)>,
 ) -> Result<Vec<(usize, String)>, String> {
+    let unstageable = std::mem::take(&mut a.unstageable);
     let failed: Vec<usize> = a
         .recs
         .iter()
-        .filter(|(_, rec)| !a.writer.encode_failures(rec.source_id()).is_empty())
+        .filter(|(i, rec)| {
+            unstageable.contains_key(i) || !a.writer.encode_failures(rec.source_id()).is_empty()
+        })
         .map(|(i, _)| *i)
         .collect();
     let mut dropped = Vec::new();
@@ -2312,16 +2350,23 @@ fn drop_unencodable(
         // The seal `maybe_seal` queued may still be running: wait for it,
         // and read the list again.
         rec.sync().map_err(|e| e.to_string())?;
-        let failures = a.writer.encode_failures(id);
-        if failures.is_empty() {
+        let before = a.writer.encode_failures(id);
+        if before.is_empty() && !unstageable.contains_key(&i) {
             // A split's part failed, then the whole run sealed.
             continue;
         }
         let rec = a.recs.remove(&i).expect("listed above");
-        // A stream fails at a seal, so the source has staged a row.
         let last = lasts.get(&i).copied().unwrap_or((0, 0));
         rec.finalize(last).map_err(|e| e.to_string())?;
-        dropped.push((i, unencodable_reason(&failures)));
+        // Finalize's seal can fail a stream too.
+        let after = a.writer.encode_failures(id);
+        let failures = if after.is_empty() { before } else { after };
+        let reason = match unstageable.get(&i) {
+            Some(reason) if failures.is_empty() => reason.clone(),
+            Some(reason) => format!("{reason}; {}", unencodable_reason(&failures)),
+            None => unencodable_reason(&failures),
+        };
+        dropped.push((i, reason));
     }
     Ok(dropped)
 }
@@ -2598,9 +2643,18 @@ impl Driver {
                     return Ok(());
                 }
                 self.slots[i].delivered(wall);
+                if self.is_unstageable(i) {
+                    return Ok(());
+                }
                 let newest = applied.newest_wall_ns();
                 let (seq, gap) = (applied.seq, applied.gap);
-                let passes = applied.passes()?;
+                let passes = match applied.passes() {
+                    Ok(passes) => passes,
+                    Err(e) => {
+                        self.unstageable(i, format!("a streamed frame could not be read: {e}"));
+                        return Ok(());
+                    }
+                };
                 let frames = {
                     let Kind::Endpoint(ep) = &mut self.slots[i].kind else {
                         return Ok(());
@@ -2623,7 +2677,16 @@ impl Driver {
                             return Ok(());
                         };
                         let before = ep.decoder.unresolved;
-                        let groups = ep.decoder.decode(pass.rows)?;
+                        let groups = match ep.decoder.decode(pass.rows) {
+                            Ok(groups) => groups,
+                            Err(e) => {
+                                self.unstageable(
+                                    i,
+                                    format!("a streamed frame could not be decoded: {e}"),
+                                );
+                                return Ok(());
+                            }
+                        };
                         if ep.decoder.unresolved > before {
                             warn!(
                                 "{label}: {} streamed rows named a schema this connection had \
@@ -2640,10 +2703,13 @@ impl Driver {
                     let rec = archive.recs.get_mut(&i).ok_or_else(|| {
                         format!("{label} streamed an interval with no recording open for it")
                     })?;
-                    archive.staged.push(
-                        rec.stage_streamed(groups, pass.ts, pass.wall_offset)
-                            .map_err(|e| e.to_string())?,
-                    );
+                    match rec.stage_streamed(groups, pass.ts, pass.wall_offset) {
+                        Ok(staged) => archive.staged.push(staged),
+                        Err(e) => {
+                            self.unstageable(i, format!("its rows could not be staged: {e}"));
+                            return Ok(());
+                        }
+                    }
                     self.slots[i].staged(pass.ts, pass.wall_offset);
                     stamp = Some(Stamp {
                         ts: pass.ts,
