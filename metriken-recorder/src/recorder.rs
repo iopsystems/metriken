@@ -1662,9 +1662,9 @@ impl Driver {
     /// Fail the recording when a source has failed and no source is
     /// `Pending`, `Activating` or `Active`: nothing is left to record. The
     /// recordings still open (sources refused on a reconnect keep theirs)
-    /// are finalized first, as `finish` would. A recording whose sources
-    /// were all refused, with none failed, goes on: a refusal alone never
-    /// fails the recording.
+    /// are finalized first, after the rows staged since the last commit are
+    /// committed, as `finish` would. A refusal alone never fails the
+    /// recording.
     async fn fail_if_none_left(&mut self) {
         let Some(last) = self.last_source_failure.clone() else {
             return;
@@ -1683,6 +1683,11 @@ impl Driver {
         let lasts = self.lasts();
         let finalized = self
             .blocking(move |a| -> Result<(), String> {
+                // A streamed frame staged since the last commit, which
+                // `lasts` already counts.
+                if let Err(e) = a.writer.commit(std::mem::take(&mut a.staged)) {
+                    warn!("committing the rows staged before the recording failed: {e}");
+                }
                 let mut first_err = None;
                 for (i, rec) in std::mem::take(&mut a.recs) {
                     let last = lasts.get(&i).copied().unwrap_or(fallback);
@@ -2302,12 +2307,21 @@ fn drop_unencodable(
         .collect();
     let mut dropped = Vec::new();
     for i in failed {
-        let rec = a.recs.remove(&i).expect("listed above");
+        let rec = a.recs.get_mut(&i).expect("listed above");
         let id = rec.source_id();
+        // The seal `maybe_seal` queued may still be running: wait for it,
+        // and read the list again.
+        rec.sync().map_err(|e| e.to_string())?;
+        let failures = a.writer.encode_failures(id);
+        if failures.is_empty() {
+            // A split's part failed, then the whole run sealed.
+            continue;
+        }
+        let rec = a.recs.remove(&i).expect("listed above");
         // A stream fails at a seal, so the source has staged a row.
         let last = lasts.get(&i).copied().unwrap_or((0, 0));
         rec.finalize(last).map_err(|e| e.to_string())?;
-        dropped.push((i, unencodable_reason(&a.writer.encode_failures(id))));
+        dropped.push((i, unencodable_reason(&failures)));
     }
     Ok(dropped)
 }

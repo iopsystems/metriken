@@ -94,8 +94,7 @@ Requires metriken-storage 0.11.2.
   `Recorder::finish` returns `Error::Archive`. The check runs again when a
   source is refused, so a refusal that leaves none `Pending`, `Activating`
   or `Active` ends it too; the recordings still open then, of sources
-  refused on a reconnect, are finalized first. A recording whose sources
-  were all refused, with none failed, goes on: a refusal alone never fails
+  refused on a reconnect, are finalized first. A refusal alone never fails
   the recording.
 - **Known limit:** an error staging one source's pass (decoding a
   streamed frame, or `SourceRecorder::stage` and `stage_streamed`) still
