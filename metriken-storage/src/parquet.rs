@@ -232,11 +232,13 @@ impl DataSource for MultiParquetSource {
         last
     }
 
+    /// The shortest of the files' intervals, or 1.0 with no files.
     fn interval(&self) -> f64 {
         self.files
             .iter()
             .map(|(pf, _)| pf.interval())
-            .fold(f64::MAX, f64::min)
+            .min_by(f64::total_cmp)
+            .unwrap_or(1.0)
     }
 
     /// The longest of the intervals of the files holding `name`.
@@ -4145,6 +4147,16 @@ mod interval_tests {
         assert_eq!(source.counter_interval("slow"), 10.0);
         assert_eq!(source.counter_interval("fast"), 1.0);
         assert_eq!(source.counter_interval("absent"), 1.0);
+    }
+
+    /// With no files, the interval is 1.0, as for the other sources holding
+    /// no table.
+    #[test]
+    fn no_files_interval_is_one_second() {
+        let source = MultiParquetSource { files: Vec::new() };
+        assert_eq!(source.interval(), 1.0);
+        assert_eq!(source.histogram_interval("h"), 1.0);
+        assert_eq!(source.counter_interval("c"), 1.0);
     }
 
     /// Each counter series carries its own file's interval.

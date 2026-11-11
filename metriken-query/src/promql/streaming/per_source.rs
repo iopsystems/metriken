@@ -608,7 +608,14 @@ fn combine_histograms(
     // Each member read three coarsest intervals past the read's end, so a
     // member's run seldom seems to end at it: a pair ending past `end_ns`
     // decides which pairs before it are taken and is then left out.
-    let past = end_ns.saturating_add(3 * ranked.iter().map(|(i, _)| *i).max().unwrap_or(0));
+    let past = end_ns.saturating_add(
+        ranked
+            .iter()
+            .map(|(i, _)| *i)
+            .max()
+            .unwrap_or(0)
+            .saturating_mul(3),
+    );
     let read = |m: &Member| {
         let (lo, hi) = (start_ns.max(m.lo), past.min(m.hi));
         (lo <= hi)
@@ -1850,7 +1857,14 @@ mod tests {
         // the read's end, so a member's run seldom seems to end at it: a pair
         // ending past `end_ns` decides which pairs before it are taken and is
         // then left out.
-        let past = end_ns.saturating_add(3 * ranked.iter().map(|(i, _)| *i).max().unwrap_or(0));
+        let past = end_ns.saturating_add(
+            ranked
+                .iter()
+                .map(|(i, _)| *i)
+                .max()
+                .unwrap_or(0)
+                .saturating_mul(3),
+        );
         let mut config = None;
         let mut series: Vec<Labels> = Vec::new();
         let mut index: HashMap<Labels, usize> = HashMap::new();
@@ -2236,6 +2250,45 @@ mod tests {
         assert_eq!(series.get("cpu").map(String::as_str), Some("1"));
         assert_eq!(series.get("__name__").map(String::as_str), Some("h"));
         assert_eq!((*first, *count), (10.0, 1));
+    }
+
+    /// A member whose histogram interval exceeds `u64::MAX / 3` nanoseconds
+    /// is read to its end instead of overflowing the read's end, and the
+    /// combine returns the rows the finer member alone gives.
+    #[test]
+    fn a_histogram_interval_past_a_third_of_u64_nanoseconds_reads_to_the_members_end() {
+        let cpu0: &[(&str, &str)] = &[("cpu", "0")];
+        let rows: Vec<u64> = (0..=20).map(|s| s * S).collect();
+        let fine = histogram_source(1, &[(cpu0, rows.clone())]);
+        let coarse = histogram_source(10_000_000_000, &[(cpu0, rows)]);
+        let combine = |sources: Vec<Arc<dyn DataSource>>| {
+            let members: Vec<Member> = sources
+                .into_iter()
+                .enumerate()
+                .map(|(m, source)| Member {
+                    raw: Arc::clone(&source),
+                    source,
+                    lo: 0,
+                    hi: u64::MAX,
+                    uuid: Some(format!("u{m}")),
+                    catalog_index: m,
+                    position: m,
+                    first_ns: u64::MAX,
+                })
+                .collect();
+            let conflicts = Arc::new(super::super::conflicts::Conflicts::default());
+            collect(combine_histograms(
+                &members,
+                "h",
+                &Labels::default(),
+                0,
+                20 * S,
+                &conflicts,
+            ))
+        };
+        let alone = combine(vec![Arc::clone(&fine)]);
+        assert!(matches!(alone, Some(Some(ref r)) if !r.is_empty()));
+        assert_eq!(combine(vec![fine, coarse]), alone);
     }
 
     /// A member whose `cpu=1` rows end at 10 s while its `cpu=0` rows go on

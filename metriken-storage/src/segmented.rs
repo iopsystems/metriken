@@ -2006,13 +2006,15 @@ impl DataSource for SegmentedSource {
         self.histogram_stream_of(HistKind::Gauge, name, filter, start_ns, end_ns)
     }
 
+    /// The shortest of the present segments' intervals, or 1.0 with none.
     fn interval(&self) -> f64 {
         self.state
             .catalog
             .iter()
             .filter(|c| c.present)
             .map(|c| c.interval)
-            .fold(f64::MAX, f64::min)
+            .min_by(f64::total_cmp)
+            .unwrap_or(1.0)
     }
 
     fn time_range(&self) -> Option<(u64, u64)> {

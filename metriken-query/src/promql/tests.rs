@@ -1586,6 +1586,37 @@ fn create_hist_source(cumulative_per_cpu: &[u64]) -> Memory {
     source
 }
 
+/// A histogram function over a source with no files fails with
+/// `MetricNotFound` instead of panicking on the read start.
+#[test]
+fn histogram_functions_over_a_source_with_no_files_find_no_metric() {
+    use metriken_storage::parquet::MultiParquetSource;
+    let engine = QueryEngine::new(Arc::new(MultiParquetSource { files: Vec::new() }));
+    for query in [
+        "histogram_quantile(0.5, req_latency)",
+        "histogram_count(req_latency)",
+    ] {
+        let result = engine.query_range(query, 1000.0, 1003.0, 1.0);
+        assert!(
+            matches!(&result, Err(QueryError::MetricNotFound(_))),
+            "{query}: {result:?}"
+        );
+    }
+}
+
+/// A histogram whose interval in nanoseconds exceeds `u64::MAX` reads from
+/// time 0 rather than overflowing the read start.
+#[test]
+fn histogram_interval_past_u64_nanoseconds_reads_from_zero() {
+    use metriken_storage::labeled::LabeledSource;
+    let inner: Arc<dyn DataSource> = Arc::new(create_hist_source(&[0, 5, 12]));
+    let source = LabeledSource::new(inner, Labels::default()).with_interval(1e12);
+    assert_eq!(
+        super::histogram_read_start(&source, "req_latency", 1_000_000_000_000),
+        0
+    );
+}
+
 #[test]
 fn test_histogram_count_collapses_series_and_sums_counts() {
     let source = Arc::new(create_hist_source(&[0, 5, 12]));
