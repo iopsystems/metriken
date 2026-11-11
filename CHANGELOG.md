@@ -93,18 +93,45 @@ from the two histogram heatmap fixes below.
   `fallback_candidates`, `TOKENS`, `Unit`, and `SamplerReader::holds_labeled`.
   `unit_of` returns the `unit` value (`Option<&'static str>`) where it
   returned a `Unit`. `SUFFIXES` and `split_suffix` are unchanged.
+- **Breaking:** `HistogramRow` gains `scale: f64`, the factor the row's
+  bucket bounds and overflow bound are its values times: its column's
+  `SCALE_KEY`, 1 for a column without one (or whose value is not a finite
+  positive number). The parquet, segmented and memory readers fill it, so
+  a struct literal of `HistogramRow` must add the field. `Memory` gains
+  `set_histogram_scale(name, labels, ts, scale)`, which sets a series'
+  scale from its row at `ts` on.
 - **Docs:** `SCALE_KEY` says the factor applies to the exporter's bounds
-  in the column's `unit`, and to `OVERFLOW_BOUND_KEY`.
+  in the column's `unit` and to `OVERFLOW_BOUND_KEY`, and that
+  metriken-query divides by it.
 
 ### metriken-query (unreleased)
+
+- **Breaking:** a histogram function divides each value it takes from a
+  bucket by the rows' `scale` (`HistogramRow::scale`, a column's
+  `SCALE_KEY`), so it reads in the histogram's unit: `histogram_quantile`,
+  `histogram_quantiles` and their bands and intervals, a quantile's
+  overflow band, `histogram_mean`, `histogram_sum` and
+  `histogram_heatmap`'s bucket bounds, over an archive, a parquet file or
+  a live `MemoryStore` (whose ingest takes `scale` from each snapshot's
+  histogram metadata). A Prometheus `_seconds` histogram whose smallest
+  bound is 0.005 reads in seconds, where it read ×1000. `histogram_count`
+  and `histogram_irate` count observations and are unchanged. A function
+  whose rows have two scales (two recordings, or a series whose buckets
+  changed scale within the range) is refused with an `EvaluationError`
+  naming the two scales, since their buckets cannot be added; a label
+  matcher selecting series of one scale reads them.
+- **Breaking:** `HistogramHeatmapResult::bucket_bounds` is `Vec<f64>`, in
+  the histogram's unit, where it was `Vec<u64>` in its stored units. In
+  JSON it is an array of finite numbers (`[0.001, 0.002, …]`; a whole
+  number may be written `1000.0`); no bound is infinite.
 
 - **Breaking:** a selector reads only the name it gives. A query naming a
   Prometheus series by its exporter name no longer reads a series stored
   under a converted name with `__prometheus_name__` (metriken-recorder
   0.12.0 to 0.14.0), and answers as a query naming a metric the source
   does not hold when nothing else holds that name; the stored name still
-  reads such a series as stored, in its converted unit. The error for one exporter name stored under two names
-  is gone. Recordings of metriken-recorder 0.15.0 store every series under
+  reads such a series as stored, in its converted unit. The error for one
+  exporter name stored under two names is gone. Recordings of metriken-recorder 0.15.0 store every series under
   the exporter's name, so the exporter's name reads them.
 
 ### metriken-recorder (unreleased)
@@ -131,8 +158,8 @@ Requires metriken-storage's unreleased `prometheus_units` above.
   it to 1, written as `scale`; the overflow bound is multiplied by the same
   factor. A `_seconds` histogram is no longer stored ×1e9: one whose
   smallest bound is 0.005 is stored ×1000 with `scale="1000"` and
-  `unit="seconds"`. metriken-query does not divide by `scale`, so its
-  quantiles read as seconds × 1000. Its `_sum` is in seconds. The overflow
+  `unit="seconds"`; metriken-query divides by `scale`, so its quantiles
+  read in seconds. Its `_sum` is in seconds, unscaled. The overflow
   series is `<exporter name>_overflow` (`rpc_seconds_overflow`).
 - **Breaking:** the collision path is removed: two exporter names that
   would have been stored under one name are stored under their own names,

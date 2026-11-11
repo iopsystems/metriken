@@ -8,7 +8,7 @@
 //! token or `# UNIT` line names (`metriken_storage::prometheus_units`). A
 //! `_count` has no unit. A histogram's bounds are multiplied by a power of
 //! 10 when the smallest is below 1, recorded as `scale`, which metriken-query
-//! does not divide by.
+//! divides every value it takes from a bucket by.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -82,6 +82,13 @@ plain_total {c}
 /// `scrape` once a second through one converter into one archive, sealing
 /// every 5 rows, and opened.
 fn recorded(path: &Path) -> ArchiveReader {
+    record(path, &[("exporter", &scrape)])
+}
+
+/// Each `(source, text)` scraped once a second through its own converter
+/// into one archive as a recording labelled `source`, sealing every 5 rows,
+/// and the archive opened as one reader.
+fn record(path: &Path, recordings: &[(&str, &dyn Fn(u64) -> String)]) -> ArchiveReader {
     let config = WriterConfig {
         seal: SealPolicy {
             max_rows: 5,
@@ -90,18 +97,20 @@ fn recorded(path: &Path) -> ArchiveReader {
         ..WriterConfig::default()
     };
     let mut writer = ArchiveWriter::create(path, config).unwrap();
-    let labels = BTreeMap::from([("source".to_string(), "exporter".to_string())]);
-    let mut source = writer.add_source(labels, BTreeMap::new(), BASE).unwrap();
-    let mut converter = PrometheusConverter::new();
-    for t in 0..TICKS {
-        let ts = BASE + t * S;
-        let snapshot = converter.convert(&scrape(t), ts - S / 2, ts);
-        let staged = source.stage(&snapshot, ts, 0).unwrap();
-        writer.commit(vec![staged]).unwrap();
-        source.maybe_seal().unwrap();
-        source.sync().unwrap();
+    for (name, text) in recordings {
+        let labels = BTreeMap::from([("source".to_string(), name.to_string())]);
+        let mut source = writer.add_source(labels, BTreeMap::new(), BASE).unwrap();
+        let mut converter = PrometheusConverter::new();
+        for t in 0..TICKS {
+            let ts = BASE + t * S;
+            let snapshot = converter.convert(&text(t), ts - S / 2, ts);
+            let staged = source.stage(&snapshot, ts, 0).unwrap();
+            writer.commit(vec![staged]).unwrap();
+            source.maybe_seal().unwrap();
+            source.sync().unwrap();
+        }
+        source.finalize((BASE + (TICKS - 1) * S, 0)).unwrap();
     }
-    source.finalize((BASE + (TICKS - 1) * S, 0)).unwrap();
     writer.join().unwrap();
 
     let recordings = ArchiveReader::from_catalog(
@@ -116,13 +125,18 @@ fn recorded(path: &Path) -> ArchiveReader {
 
 /// `scrape` once a second into a live `MemoryStore`.
 fn live() -> metriken_query::MemoryStore {
+    live_of(&scrape)
+}
+
+/// `text` once a second into a live `MemoryStore`.
+fn live_of(text: &dyn Fn(u64) -> String) -> metriken_query::MemoryStore {
     let store = metriken_query::MemoryStore::builder()
         .sampling_interval_ms(1000)
         .build();
     let mut converter = PrometheusConverter::new();
     for t in 0..TICKS {
         let ts = BASE + t * S;
-        let mut snapshot = converter.convert(&scrape(t), ts - S / 2, ts);
+        let mut snapshot = converter.convert(&text(t), ts - S / 2, ts);
         let Snapshot::V3(v3) = &mut snapshot else {
             panic!("a scrape is a V3 snapshot")
         };
@@ -217,6 +231,34 @@ fn every(source: &dyn MetricsSource, query: &str, name: Option<&str>, want: f64)
         labels.keys().all(|k| !k.starts_with("__prometheus")),
         "{query}: {labels:?}"
     );
+}
+
+/// The bucket band of each point of `query`'s one series.
+fn bands(source: &dyn MetricsSource, query: &str) -> Vec<(f64, f64)> {
+    let (lo, hi) = (BASE / S + 2, BASE / S + TICKS - 1);
+    let QueryResult::Matrix { mut result, .. } = source
+        .query_range(query, lo as f64, hi as f64, 1.0)
+        .unwrap_or_else(|e| panic!("{query}: {e}"))
+    else {
+        panic!("{query}: not a matrix")
+    };
+    assert_eq!(result.len(), 1, "{query}");
+    result
+        .remove(0)
+        .intervals
+        .unwrap_or_else(|| panic!("{query}: no bands"))
+}
+
+/// The bucket bounds of `query`'s heatmap.
+fn heatmap_bounds(source: &dyn MetricsSource, query: &str) -> Vec<f64> {
+    let (lo, hi) = (BASE / S + 2, BASE / S + TICKS - 1);
+    match source
+        .query_range(query, lo as f64, hi as f64, 1.0)
+        .unwrap_or_else(|e| panic!("{query}: {e}"))
+    {
+        QueryResult::HistogramHeatmap { result, .. } => result.bucket_bounds,
+        other => panic!("{query}: not a heatmap: {other:?}"),
+    }
 }
 
 /// The archive and the live store over the same scrapes.
@@ -362,11 +404,12 @@ fn a_seconds_histogram_reads_in_seconds() {
 /// A histogram whose smallest bound is below 1 has its bounds and overflow
 /// bound multiplied by the power of 10 that brings it to 1, recorded as
 /// `scale`, in the exporter's unit: `fast_seconds` (1 ms and 10 ms) is
-/// stored ×1000. Its quantiles read ×1000 too, since metriken-query does not
-/// divide by `scale`; divided, they are in seconds. Its `_sum` is not
-/// scaled.
+/// stored ×1000 with `scale` 1000. metriken-query divides every value it
+/// takes from a bucket by it, recorded and live: the quantiles, their
+/// bands, the mean, the sum and the heatmap's bounds are in seconds. The
+/// count is not scaled, nor is the `_sum` series.
 #[test]
-fn a_histogram_below_one_records_its_scale() {
+fn a_histogram_below_one_reads_in_its_unit() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.dendro");
     let reader = recorded(&path);
@@ -375,18 +418,196 @@ fn a_histogram_below_one_records_its_scale() {
     assert_eq!(h["unit"], "seconds");
     assert_eq!(h[SCALE_KEY], "1000");
     assert_eq!(h[OVERFLOW_BOUND_KEY], "10");
-    let scale: f64 = h[SCALE_KEY].parse().unwrap();
-    let q = matrix(&reader, "histogram_quantile(0.9, fast_seconds)");
-    assert_eq!(q.len(), 1, "{q:?}");
-    for v in &q[0].1 {
-        assert!((v / scale - 0.01).abs() < 1e-12, "{q:?}");
+    let store = live();
+    for source in [&reader as &dyn MetricsSource, &store] {
+        let p50 = "histogram_quantile(0.5, fast_seconds)";
+        every(source, p50, Some("fast_seconds"), 0.001);
+        let p90 = "histogram_quantile(0.9, fast_seconds)";
+        every(source, p90, Some("fast_seconds"), 0.01);
+        let quantiles = "histogram_quantiles([0.5, 0.9], fast_seconds)";
+        let m = matrix(source, quantiles);
+        assert_eq!(m.len(), 2, "{m:?}");
+        for (labels, values) in &m {
+            let want = match labels["quantile"].as_str() {
+                "0.5" => 0.001,
+                _ => 0.01,
+            };
+            assert!(
+                values.iter().all(|v| (v - want).abs() <= want * 1e-9),
+                "{quantiles}: {m:?}"
+            );
+        }
+        // The bucket band of each quantile point, in seconds.
+        for band in bands(source, p90) {
+            assert!(
+                band.0 <= 0.01 + 1e-12 && band.1 >= 0.01 - 1e-12 && band.1 < 0.02,
+                "{p90}: {band:?}"
+            );
+        }
+        // 5 observations of 1 ms and 4 of 10 ms a tick: a mean of 5 ms and
+        // a sum of 45 ms. The overflow is in neither.
+        every(
+            source,
+            "histogram_mean(fast_seconds)",
+            Some("fast_seconds"),
+            0.005,
+        );
+        every(
+            source,
+            "histogram_sum(fast_seconds)",
+            Some("fast_seconds"),
+            0.045,
+        );
+        every(
+            source,
+            "histogram_count(fast_seconds)",
+            Some("fast_seconds"),
+            9.0,
+        );
+        let bounds = heatmap_bounds(source, "histogram_heatmap(fast_seconds)");
+        assert!(!bounds.is_empty());
+        assert!(
+            bounds
+                .iter()
+                .all(|b| (0.001 - 1e-12..=0.01 + 1e-12).contains(b)),
+            "{bounds:?}"
+        );
+        assert!(
+            bounds.iter().any(|b| (b - 0.01).abs() < 1e-12),
+            "{bounds:?}"
+        );
+        every(
+            source,
+            "rate(fast_seconds_sum[3s])",
+            Some("fast_seconds_sum"),
+            0.02,
+        );
     }
-    every(
-        &reader,
-        "rate(fast_seconds_sum[3s])",
-        Some("fast_seconds_sum"),
-        0.02,
+}
+
+/// `fast_seconds` with buckets at 1 ms and 10 ms (stored ×1000).
+fn fast_ms(t: u64) -> String {
+    format!(
+        "# TYPE fast_seconds histogram\n\
+         fast_seconds_bucket{{le=\"0.001\"}} {a}\n\
+         fast_seconds_bucket{{le=\"0.01\"}} {b}\n\
+         fast_seconds_bucket{{le=\"+Inf\"}} {b}\n",
+        a = 5 * t,
+        b = 10 * t,
+    )
+}
+
+/// `fast_seconds` with buckets at 0.1 s and 1 s (stored ×10).
+fn fast_tenths(t: u64) -> String {
+    format!(
+        "# TYPE fast_seconds histogram\n\
+         fast_seconds_bucket{{le=\"0.1\"}} {a}\n\
+         fast_seconds_bucket{{le=\"1\"}} {b}\n\
+         fast_seconds_bucket{{le=\"+Inf\"}} {b}\n",
+        a = 5 * t,
+        b = 10 * t,
+    )
+}
+
+/// Two recordings of one histogram at one scale pool as before and read in
+/// seconds. At two scales, a function that pools them is refused, naming
+/// the scales; a label matcher selecting one reads it in seconds; the
+/// count, which no scale changes, is not refused.
+#[test]
+fn recordings_at_different_scales_are_refused_when_pooled() {
+    let dir = tempfile::tempdir().unwrap();
+    let same = record(
+        &dir.path().join("same.dendro"),
+        &[("a", &fast_ms), ("b", &fast_ms)],
     );
+    every(
+        &same,
+        "histogram_quantile(0.5, fast_seconds)",
+        Some("fast_seconds"),
+        0.001,
+    );
+
+    let mixed = record(
+        &dir.path().join("mixed.dendro"),
+        &[("a", &fast_ms), ("b", &fast_tenths)],
+    );
+    for query in [
+        "histogram_quantile(0.5, fast_seconds)",
+        "histogram_quantiles([0.5], fast_seconds)",
+        "histogram_mean(fast_seconds)",
+        "histogram_sum(fast_seconds)",
+        "histogram_heatmap(fast_seconds)",
+    ] {
+        let err = mixed
+            .query_range(
+                query,
+                (BASE / S + 2) as f64,
+                (BASE / S + TICKS - 1) as f64,
+                1.0,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{query}: not refused"))
+            .to_string();
+        assert!(err.contains("different scales"), "{query}: {err}");
+        assert!(err.contains("1000") && err.contains("10"), "{query}: {err}");
+    }
+    let one =
+        |source: &str| format!("histogram_quantile(0.5, fast_seconds{{source=\"{source}\"}})");
+    every(&mixed, &one("a"), Some("fast_seconds"), 0.001);
+    every(&mixed, &one("b"), Some("fast_seconds"), 0.1);
+    every(
+        &mixed,
+        "histogram_count(fast_seconds)",
+        Some("fast_seconds"),
+        20.0,
+    );
+}
+
+/// A live store fed one exporter whose buckets change scale mid-run:
+/// before the change and after it each read in seconds, and a function
+/// pooling rows of both is refused.
+#[test]
+fn a_live_series_whose_scale_changes_is_refused_when_pooled() {
+    let text = |t: u64| {
+        if t < 6 {
+            fast_ms(t)
+        } else {
+            fast_tenths(t)
+        }
+    };
+    let store = live_of(&text);
+    let read = |lo: u64, hi: u64| {
+        store.query_range(
+            "histogram_quantile(0.5, fast_seconds)",
+            (BASE / S + lo) as f64,
+            (BASE / S + hi) as f64,
+            1.0,
+        )
+    };
+    let values = |r: Result<QueryResult, metriken_query::QueryError>| -> Vec<f64> {
+        let QueryResult::Matrix { result, .. } = r.unwrap() else {
+            panic!("not a matrix")
+        };
+        result
+            .into_iter()
+            .flat_map(|m| m.values)
+            .map(|(_, v)| v)
+            .collect()
+    };
+    let before = values(read(2, 4));
+    assert!(
+        !before.is_empty() && before.iter().all(|v| (v - 0.001).abs() < 1e-12),
+        "{before:?}"
+    );
+    let after = values(read(8, 11));
+    assert!(
+        !after.is_empty() && after.iter().all(|v| (v - 0.1).abs() < 1e-12),
+        "{after:?}"
+    );
+    let err = read(2, 11)
+        .expect_err("pooled across the change")
+        .to_string();
+    assert!(err.contains("different scales"), "{err}");
 }
 
 /// A histogram's overflow series is `<exporter name>_overflow`, which its

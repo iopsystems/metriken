@@ -1819,8 +1819,10 @@ impl ParquetSource {
                 w
             }
         };
+        let scales: Vec<f64> = col_descs.iter().map(|c| c.scale).collect();
         let cursor = ParquetHistogramCursor {
             pf: Arc::clone(self),
+            scales,
             ts_col_idx,
             start_ns,
             end_ns,
@@ -1966,6 +1968,10 @@ pub struct ColDesc {
     /// [`OVERFLOW_BOUND_KEY`](crate::OVERFLOW_BOUND_KEY)), when it has both
     /// and the bound parses.
     overflow: Option<(String, f64)>,
+    /// A histogram column's [`SCALE_KEY`](crate::SCALE_KEY): the factor
+    /// its bucket bounds are its values times. 1 when the key is absent,
+    /// does not parse, or is not a finite positive number.
+    scale: f64,
 }
 
 /// Resolve one metric's acquisition-window sidecar columns as an ATOMIC
@@ -2073,6 +2079,11 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
             let max_value_power: Option<u8> =
                 meta.get("max_value_power").and_then(|v| v.parse().ok());
             let labels = Labels::from_metadata(meta.iter());
+            let scale = meta
+                .get(crate::SCALE_KEY)
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|s| s.is_finite() && *s > 0.0)
+                .unwrap_or(1.0);
             let overflow = meta.get(crate::OVERFLOW_KEY).and_then(|n| {
                 let bound: f64 = meta.get(crate::OVERFLOW_BOUND_KEY)?.parse().ok()?;
                 Some((n.clone(), bound))
@@ -2143,6 +2154,7 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
                 width_col,
                 occupant: None,
                 overflow,
+                scale,
             })
         })
         .collect::<Vec<_>>();
@@ -3462,6 +3474,8 @@ fn read_gauges(
 /// by (timestamp, series_idx) before being buffered.
 struct ParquetHistogramCursor {
     pf: Arc<ParquetSource>,
+    /// Per series (column), its [`HistogramRow::scale`].
+    scales: Vec<f64>,
     ts_col_idx: usize,
     start_ns: u64,
     end_ns: u64,
@@ -3554,6 +3568,7 @@ impl ParquetHistogramCursor {
                         resumes: false,
                         snapshot: snap.clone(),
                         overflow: overflows.get(&(row, si)).copied(),
+                        scale: self.scales[si],
                     });
                 }
             }

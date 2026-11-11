@@ -52,9 +52,12 @@ pub const STORAGE_KEYS: &[&str] = &[
 /// [`OVERFLOW_BOUND_KEY`], is the exporter's bound, in the column's `unit`
 /// when it has one, times it. Written by metriken-recorder's Prometheus
 /// converter when the factor is not 1, which is when the bounds would
-/// otherwise have been truncated to integers (a smallest bound below 1). A
-/// reader that wants the values in their unit divides by it; metriken-query
-/// does not.
+/// otherwise have been truncated to integers (a smallest bound below 1).
+/// Every reader in this crate hands it to metriken-query as each histogram
+/// row's [`scale`](crate::histogram_stream::HistogramRow::scale), and
+/// metriken-query divides each value it takes from a bucket by it
+/// (quantiles and their bands, means, sums, heatmap bounds), so a query
+/// reads the histogram in its `unit`.
 pub const SCALE_KEY: &str = "scale";
 
 /// The histogram column key naming its overflow series: the metric name of

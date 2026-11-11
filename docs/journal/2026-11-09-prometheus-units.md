@@ -415,5 +415,8 @@ ambiguity error, and the collision path. No compatibility path reads
 recordings made with the rewrite; only unreleased rezolus wrote them.
 
 A histogram whose smallest bound is below 1 is still stored ×10^k with
-`scale` (now in the exporter's unit). No reader in metriken divides by
-`scale`, so such a histogram's quantiles read ×10^k.
+`scale` (now in the exporter's unit), since its buckets hold integers.
+Every reader passes the column's `scale` on each histogram row, and
+metriken-query divides each value it takes from a bucket by it, so the
+histogram reads in its `unit`. A histogram function whose rows have two
+scales is refused: buckets at two scales cannot be added.

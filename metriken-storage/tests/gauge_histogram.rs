@@ -774,7 +774,7 @@ fn mixed_bucket_configs_sum_at_the_coarsest() {
         panic!("a heatmap")
     };
     // One bucket of the coarser configuration holds all eight.
-    assert_eq!(result.bucket_bounds, [7]);
+    assert_eq!(result.bucket_bounds, [7.0]);
     assert_eq!(result.data, [(0, 0, 8.0)]);
 }
 

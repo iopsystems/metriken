@@ -623,12 +623,19 @@ impl MemoryStore {
                     .get(metriken_storage::OVERFLOW_BOUND_KEY)
                     .and_then(|b| b.parse::<f64>().ok()),
             );
+            let scale = histogram
+                .metadata
+                .get(metriken_storage::SCALE_KEY)
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|s| s.is_finite() && *s > 0.0)
+                .unwrap_or(1.0);
             memory.upsert_histogram_sample(&name, labels.clone(), config, ts, snap);
             // A row the store dropped (its time before the series' last)
             // gets no link, which would otherwise name an overflow for a
             // row the series does not have.
-            if let Some((counter, bound)) = overflow {
-                if memory.histogram_last_timestamp(&name, &labels) == Some(ts) {
+            if memory.histogram_last_timestamp(&name, &labels) == Some(ts) {
+                memory.set_histogram_scale(&name, labels.clone(), ts, scale);
+                if let Some((counter, bound)) = overflow {
                     memory.set_histogram_overflow(&name, labels, ts, counter, bound);
                 }
             }

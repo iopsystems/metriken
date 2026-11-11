@@ -12,6 +12,7 @@ use crate::{DataSource, QueryOptions};
 
 mod columns;
 pub(crate) mod json_f64;
+pub(crate) mod scale;
 mod selection;
 pub(crate) use columns::Selector;
 pub use columns::{referenced_metrics, selector_filter};
@@ -331,9 +332,10 @@ impl MatrixSample {
 pub struct HistogramHeatmapResult {
     /// Timestamps in seconds
     pub timestamps: Vec<f64>,
-    /// Bucket boundaries (latency values in the histogram's unit, e.g.,
-    /// nanoseconds)
-    pub bucket_bounds: Vec<u64>,
+    /// Bucket boundaries, in the histogram's unit: a bucket's stored bound
+    /// divided by its series' [`SCALE_KEY`](metriken_storage::SCALE_KEY),
+    /// so `0.001` for a 1 ms bucket of a `_seconds` histogram.
+    pub bucket_bounds: Vec<f64>,
     /// Heatmap data as [time_index, bucket_index, count]
     pub data: Vec<(usize, usize, f64)>,
     /// Minimum count value (for color scaling)
@@ -1516,7 +1518,10 @@ impl QueryEngine {
                 notices: Vec::new(),
             });
         };
-        let result = stream.quantiles(&quantiles, start_ns, end_ns, stride, &metric_name);
+        let (stream, scales) = scale::Scales::watch(stream);
+        let mut result = stream.quantiles(&quantiles, start_ns, end_ns, stride, &metric_name);
+        let scale = scales.scale("histogram_quantiles", &metric_name)?;
+        scale::unscale_samples(&mut result, scale);
         if result.is_empty() {
             return Ok(QueryResult::Matrix {
                 result: vec![],
@@ -1603,12 +1608,17 @@ impl QueryEngine {
                 notices: Vec::new(),
             });
         };
+        let (stream, scales) = scale::Scales::watch(stream);
         let result = stream.heatmap(start_ns, end_ns, stride);
+        let scale = scales.scale("histogram_heatmap", &metric_name)?;
         match result {
-            Some(result) => Ok(QueryResult::HistogramHeatmap {
-                result,
-                notices: Vec::new(),
-            }),
+            Some(mut result) => {
+                scale::unscale_heatmap(&mut result, scale);
+                Ok(QueryResult::HistogramHeatmap {
+                    result,
+                    notices: Vec::new(),
+                })
+            }
             None => Ok(QueryResult::Matrix {
                 result: vec![],
                 notices: Vec::new(),
@@ -1745,11 +1755,18 @@ impl QueryEngine {
             });
         };
         let group = group_by.as_ref();
+        let (stream, scales) = scale::Scales::watch(stream);
         let result = match func {
             "histogram_mean" => stream.mean(group, start_ns, end_ns, stride, &metric_name),
             "histogram_sum" => stream.sum(group, start_ns, end_ns, stride, &metric_name),
             _ => stream.count(group, start_ns, end_ns, stride, &metric_name),
         };
+        // A count does not depend on the buckets' scale.
+        let mut result = result;
+        if func != "histogram_count" {
+            let scale = scales.scale(func, &metric_name)?;
+            scale::unscale_samples(&mut result, scale);
+        }
         if result.is_empty() {
             return Ok(QueryResult::Matrix {
                 result: vec![],

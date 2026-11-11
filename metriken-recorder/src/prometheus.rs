@@ -480,7 +480,7 @@ has_name_and_metadata!(FloatCounter, FloatGauge, SnapshotHistogram);
 /// truncates to 0 in the histogram's integer buckets. That power, when it
 /// is not 1, is written as [`SCALE_KEY`]: a `_seconds` histogram whose
 /// smallest bound is 0.005 is stored ×1000, with `scale` 1000 and `unit`
-/// `seconds`.
+/// `seconds`, and metriken-query reads it back in seconds.
 ///
 /// With a `+Inf` bucket, also returns the overflow, the `+Inf` count less
 /// the highest finite bucket's (at least 0), and writes into the metadata

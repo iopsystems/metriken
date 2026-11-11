@@ -935,6 +935,7 @@ impl Combined {
                     snapshot: cumulative(&self.counts[s]),
                     resumes,
                     overflow: self.overflows[s],
+                    scale: row.scale,
                 })
             }
             Some(Emit::End { .. }) => {
@@ -955,6 +956,7 @@ impl Combined {
                     snapshot: cumulative(counts),
                     resumes: false,
                     overflow: self.overflows[s],
+                    scale: row.scale,
                 })
             }
             None => None,
@@ -1866,6 +1868,9 @@ mod tests {
                 .saturating_mul(3),
         );
         let mut config = None;
+        // The members' rows' scale, NaN when two differ, which a histogram
+        // function refuses.
+        let mut scale: Option<f64> = None;
         let mut series: Vec<Labels> = Vec::new();
         let mut index: HashMap<Labels, usize> = HashMap::new();
         let mut rows: Vec<Vec<Vec<(u64, crate::types::HistogramSnapshot)>>> = Vec::new();
@@ -1894,6 +1899,11 @@ mod tests {
                         if row.timestamp < m.lo || row.timestamp > m.hi {
                             continue;
                         }
+                        scale = match scale {
+                            Some(have) if have != row.scale => Some(f64::NAN),
+                            Some(have) => Some(have),
+                            None => Some(row.scale),
+                        };
                         let s = local[row.series_idx];
                         if by_series.len() <= s {
                             by_series.resize_with(s + 1, Vec::new);
@@ -1996,6 +2006,7 @@ mod tests {
                         // source's rows.
                         resumes: last.is_some(),
                         overflow: None,
+                        scale: scale.unwrap_or(1.0),
                     });
                 }
                 let rs = of(r);
@@ -2012,6 +2023,7 @@ mod tests {
                     snapshot: snapshot(&counts),
                     resumes: false,
                     overflow: None,
+                    scale: scale.unwrap_or(1.0),
                 });
                 last = Some(t);
             }

@@ -930,6 +930,7 @@ mod tests {
                     count: vec![],
                 },
                 overflow: None,
+                scale: 1.0,
             });
             Some(HistogramStream {
                 meta: HistogramStreamMeta {

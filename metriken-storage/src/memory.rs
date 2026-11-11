@@ -37,6 +37,11 @@ pub struct Memory {
     /// ([`set_histogram_overflow`](Self::set_histogram_overflow)). A row
     /// with no entry has no overflow.
     histogram_overflows: HashMap<String, HashMap<Labels, RowLinks>>,
+    /// Per histogram name and series labels: each row timestamp from which
+    /// the series' rows have a [`SCALE_KEY`](crate::SCALE_KEY), the scale
+    /// ([`set_histogram_scale`](Self::set_histogram_scale)). A row before
+    /// every entry has scale 1.
+    histogram_scales: HashMap<String, HashMap<Labels, BTreeMap<u64, f64>>>,
     interval_ms: u64,
     /// The row timestamps a caller declared, if it did. See
     /// [`DataSource::sample_timestamps`]; a source assembled from a table
@@ -62,6 +67,7 @@ impl Memory {
             histograms: HashMap::new(),
             gauge_histograms: HashMap::new(),
             histogram_overflows: HashMap::new(),
+            histogram_scales: HashMap::new(),
             interval_ms,
             sample_timestamps: None,
             duplicated: HashMap::new(),
@@ -190,6 +196,37 @@ impl Memory {
             _ => Arc::from(overflow),
         };
         links.insert(ts, (counter, bound));
+    }
+
+    /// Set the scale of histogram `name`'s series `labels` from its row at
+    /// `ts` on: the factor its bucket bounds and overflow bound are its
+    /// values times, what a histogram column's
+    /// [`SCALE_KEY`](crate::SCALE_KEY) says in a recording. A series no
+    /// call names, and its rows before the first call, have scale 1. A row
+    /// at or after `ts` takes this scale until a later call changes it.
+    pub fn set_histogram_scale(&mut self, name: &str, labels: Labels, ts: u64, scale: f64) {
+        let changes = self
+            .histogram_scales
+            .entry(name.to_string())
+            .or_default()
+            .entry(labels)
+            .or_default();
+        let current = changes.range(..=ts).next_back().map_or(1.0, |(_, s)| *s);
+        if current != scale {
+            changes.insert(ts, scale);
+        }
+    }
+
+    /// A reader of histogram `name`'s rows' scale, `(labels, ts)` to the
+    /// row's [`HistogramRow::scale`].
+    fn scale_reader<'a>(&'a self, name: &str) -> impl FnMut(&Labels, u64) -> f64 + 'a {
+        let changes = self.histogram_scales.get(name);
+        move |labels, ts| {
+            changes
+                .and_then(|c| c.get(labels))
+                .and_then(|c| c.range(..=ts).next_back())
+                .map_or(1.0, |(_, s)| *s)
+        }
     }
 
     /// The series of counter `name`, each one counted in
@@ -542,6 +579,7 @@ fn histogram_rows(
     start_ns: u64,
     end_ns: u64,
     mut overflow: impl FnMut(&Labels, u64) -> Option<Overflow>,
+    mut scale: impl FnMut(&Labels, u64) -> f64,
 ) -> Option<HistogramStream> {
     let mut series_labels: Vec<crate::labels::Labels> = Vec::new();
     let mut config: Option<::histogram::Config> = None;
@@ -575,6 +613,7 @@ fn histogram_rows(
                     count: snap.count.clone(),
                 },
                 overflow: overflow(&hist.labels, *ts),
+                scale: scale(&hist.labels, *ts),
             });
         }
     }
@@ -683,6 +722,7 @@ impl DataSource for Memory {
             start_ns,
             end_ns,
             self.overflow_reader(name),
+            self.scale_reader(name),
         )
     }
 
@@ -699,6 +739,7 @@ impl DataSource for Memory {
             start_ns,
             end_ns,
             |_, _| None,
+            |_, _| 1.0,
         )
     }
 
