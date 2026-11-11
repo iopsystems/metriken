@@ -27,6 +27,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   debug builds. A histogram read across recordings whose coarsest interval
   exceeds `u64::MAX / 3` nanoseconds reads each member to its end instead
   of overflowing.
+- **Fixed:** a selector with `or` between label matchers
+  (`x{job="a" or job="b"}`, promql-parser syntax) read every series of its
+  name: promql-parser 0.8 puts all of its matchers in the branches, and
+  the readers did not apply them. It now selects a series that satisfies every
+  matcher of at least one branch, with a label the series does not carry
+  taken as the empty string (a branch `l=""` selects a series without
+  `l`); a series two branches select appears once. This covers counters on
+  both rate paths, gauges and the range functions, the histogram functions
+  (`histogram_quantile`, `histogram_quantiles`, `histogram_heatmap`,
+  `histogram_irate`, `histogram_mean`, `histogram_count`, `histogram_sum`)
+  and gauge histograms, `columns`, a selector naming a series by its
+  exporter name, and the check for a series two columns of one table hold.
+  Over an archive the selector reads only the recordings one of its
+  branches can match, so a branch on a recording label keeps that
+  recording's cross-cadence timestamps, and the exporter-name lookup is
+  made over those recordings. A conflict in a metric that only `or`
+  selectors name is reported only for a series a branch selects. `rate`
+  and `irate` of such a selector use the per-series path.
+- **Fixed:** `selector_filter` refuses a selector with `or`, whose
+  branches one filter cannot hold, with a `ParseError`. It returned an
+  empty filter, which matches every series.
 
 ### metriken-storage 0.11.1
 

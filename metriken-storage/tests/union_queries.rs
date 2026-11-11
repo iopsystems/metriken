@@ -1991,6 +1991,39 @@ fn a_conflict_is_reported_and_the_earlier_source_answers() {
     }
 }
 
+/// A selector with `or` gives a conflict notice only for a series one of its
+/// branches selects: no branch selecting the conflicting series gives none,
+/// for counters, gauges and histograms, and a branch selecting it gives the
+/// notice a selector without `or` gives.
+#[test]
+fn a_conflict_in_a_series_no_branch_selects_gives_no_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let edited = conflict_archive(dir.path(), "edited.dendro", cycles_edited);
+    let (s, e) = (at(10, 0, 0) as f64 / 1e9, at(10, 3, 0) as f64 / 1e9);
+    for query in [
+        r#"g{zz="x" or zz="y"}"#,
+        r#"avg_over_time(g{zz="x" or zz="y"}[3s])"#,
+        r#"idelta(g{zz="x" or zz="y"}[3s])"#,
+        r#"deriv(g{zz="x" or zz="y"}[3s])"#,
+        r#"deriv(cpu_cycles{zz="x" or zz="y"}[3s])"#,
+        r#"rate(cpu_cycles{zz="x" or zz="y"}[3s])"#,
+        r#"histogram_count(latency{zz="x" or zz="y"})"#,
+        r#"histogram_quantile(0.5, latency{zz="x" or zz="y"})"#,
+    ] {
+        let got = edited.query_range(query, s, e, 1.0).unwrap();
+        assert!(from_matrix(got.clone()).is_empty(), "{query}");
+        assert!(got.notices().is_empty(), "{query}: {:?}", got.notices());
+    }
+    for query in [
+        r#"g{zz="x" or host="a"}"#,
+        r#"rate(cpu_cycles{zz="x" or host="a"}[3s])"#,
+        r#"histogram_count(latency{zz="x" or host="a"})"#,
+    ] {
+        let got = edited.query_range(query, s, e, 1.0).unwrap();
+        assert_eq!(got.notices().len(), 1, "{query}: {:?}", got.notices());
+    }
+}
+
 /// A conflict outside what a query answers gives no notice: a range ending
 /// two seconds before it (the histogram combine reads three intervals past
 /// the end, and S3's context reads ten), one starting ten seconds after it
