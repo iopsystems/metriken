@@ -29,9 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of overflowing.
 - **Fixed:** a selector with `or` between label matchers
   (`x{job="a" or job="b"}`, promql-parser syntax) read every series of its
-  name:
-  promql-parser 0.8 puts all of its matchers in the branches, and the
-  readers did not apply them. It now selects a series that satisfies every
+  name: promql-parser 0.8 puts all of its matchers in the branches, and
+  the readers did not apply them. It now selects a series that satisfies every
   matcher of at least one branch, with a label the series does not carry
   taken as the empty string (a branch `l=""` selects a series without
   `l`); a series two branches select appears once. This covers counters on

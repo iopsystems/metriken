@@ -655,11 +655,12 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
 /// The stored name each selector of `written` reads when it names a
 /// series by its exporter name (`promql::prometheus_names`), decided per
 /// selector name and branch filters over the tables it reaches: those in
-/// `scope` whose recording's labels one of its branches' filters can match. A selector reads its own name when one of
-/// those tables holds it, and otherwise the candidate stored name one of
-/// them holds with a series whose `__prometheus_name__` is that name; an
-/// error when more than one candidate does. Only tables holding the name or
-/// a candidate are consulted.
+/// `scope` whose recording's labels one of its branches' filters can
+/// match. A selector reads its own name when one of those tables holds it,
+/// and otherwise the candidate stored name one of them holds with a series
+/// whose `__prometheus_name__` is that name; an error when more than one
+/// candidate does. Only tables holding the name or a candidate are
+/// consulted.
 fn resolve_names(
     reader: &ArchiveReader,
     scope: Option<&crate::Scope>,
