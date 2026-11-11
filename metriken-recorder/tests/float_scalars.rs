@@ -14,8 +14,8 @@
 //! (decision 2).
 //!
 //! The fixtures' names carry no unit token (`cpu_time_total`, not
-//! `cpu_seconds_total`), so each value is stored as served; unit
-//! normalization is `tests/prometheus_units.rs`.
+//! `cpu_seconds_total`), so no series has a `unit` key; units are
+//! `tests/prometheus_units.rs`.
 
 use std::collections::BTreeMap;
 use std::path::Path;

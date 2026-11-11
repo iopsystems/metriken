@@ -13,7 +13,6 @@ use metriken_storage::recordings::RecordingsSource;
 use metriken_storage::union::UnionSource;
 use metriken_storage::{table_sampler, ArchiveReader, DataSource, UnionChild, UnionError};
 
-use crate::promql::prometheus_names::NameResolution;
 use crate::promql::streaming::conflicts::{Recorded, SourceName};
 use crate::promql::streaming::per_source::{GroupSource, Member, Part, SourceGroups, Tap};
 use crate::promql::{QueryEngine, Selection};
@@ -85,12 +84,8 @@ struct Plan<'a> {
     /// How a recording's labels combine with its series' own
     /// ([`QueryOptions::series_labels`]).
     precedence: Precedence,
-    /// The query's selectors, each with the names it reads: a name given
-    /// by an exporter replaced by its stored name where `names` says so.
+    /// The query's selectors, each with the names it reads.
     selectors: Vec<crate::promql::Selector>,
-    /// The stored name of each selector naming a series by its exporter
-    /// name (see [`resolve_names`]), which the engine reads.
-    names: Arc<NameResolution>,
 }
 
 impl<'a> Plan<'a> {
@@ -139,24 +134,7 @@ impl<'a> Plan<'a> {
             )));
         }
         let labels = reader.series_labels();
-        let written = crate::promql::selectors(query)?;
-        let names = resolve_names(reader, scope, labels, precedence, &written)?;
-        // Each selector with the names it reads.
-        let selectors: Vec<crate::promql::Selector> = written
-            .into_iter()
-            .map(|(given, filter)| {
-                let read = given
-                    .into_iter()
-                    .map(|n| {
-                        names
-                            .get(&(n.clone(), filter.branch_filters()))
-                            .cloned()
-                            .unwrap_or(n)
-                    })
-                    .collect();
-                (read, filter)
-            })
-            .collect();
+        let selectors = crate::promql::selectors(query)?;
         let mut referenced: Vec<String> = selectors
             .iter()
             .flat_map(|(names, _)| names.iter().cloned())
@@ -205,7 +183,6 @@ impl<'a> Plan<'a> {
             scope,
             precedence,
             selectors,
-            names: Arc::new(names),
         })
     }
 
@@ -610,9 +587,7 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
             1 => singles.pop().expect("one"),
             _ => Arc::new(RecordingsSource::new(singles)),
         };
-        return Ok(Some(
-            QueryEngine::new(source).with_names(Arc::clone(&plan.names)),
-        ));
+        return Ok(Some(QueryEngine::new(source)));
     }
     let mut children: Vec<Arc<dyn DataSource>> = Vec::with_capacity(parts.len());
     let mut ordered: Vec<Part> = Vec::with_capacity(parts.len());
@@ -640,93 +615,13 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
         1 => children.pop().expect("one"),
         _ => Arc::new(RecordingsSource::new(children)),
     };
-    Ok(Some(
-        QueryEngine::with_groups(
-            source,
-            SourceGroups {
-                parts: ordered,
-                conflicts,
-            },
-        )
-        .with_names(Arc::clone(&plan.names)),
-    ))
-}
-
-/// The stored name each selector of `written` reads when it names a
-/// series by its exporter name (`promql::prometheus_names`), decided per
-/// selector name and branch filters over the tables it reaches: those in
-/// `scope` whose recording's labels one of its branches' filters can
-/// match. A selector reads its own name when one of those tables holds it,
-/// and otherwise the candidate stored name one of them holds with a series
-/// whose `__prometheus_name__` is that name; an error when more than one
-/// candidate does. Only tables holding the name or a candidate are
-/// consulted.
-fn resolve_names(
-    reader: &ArchiveReader,
-    scope: Option<&crate::Scope>,
-    labels: &SeriesLabels,
-    precedence: Precedence,
-    written: &[crate::promql::Selector],
-) -> Result<NameResolution, QueryError> {
-    let mut names = NameResolution::new();
-    for (given, filter) in written {
-        for name in given {
-            let key = (name.clone(), filter.branch_filters());
-            if names.contains_key(&key) {
-                continue;
-            }
-            let candidates = metriken_storage::prometheus_units::fallback_candidates(name);
-            if reader.owners_of(&candidates).is_empty() {
-                continue;
-            }
-            let mut wanted = candidates.clone();
-            wanted.push(name.clone());
-            let mut reach: Vec<&SamplerReader> = Vec::new();
-            for t in reader.owners_of(&wanted) {
-                let in_scope = match scope {
-                    Some(scope) => scope_span(reader, scope, t)?.is_some(),
-                    None => true,
-                };
-                if in_scope && reaches(labels.of(t), filter, precedence) {
-                    reach.push(t);
-                }
-            }
-            if reach.iter().any(|t| t.holds(name)) {
-                continue;
-            }
-            let label = metriken_storage::PROMETHEUS_NAME_LABEL;
-            let mut found: Vec<String> = candidates
-                .into_iter()
-                .filter(|c| reach.iter().any(|t| t.holds_labeled(c, label, name)))
-                .collect();
-            if found.len() > 1 {
-                // Under `Precedence::Series` a recording-label matcher does
-                // not choose recordings, so none is offered.
-                let holding: Vec<Vec<&metriken_storage::Labels>> = found
-                    .iter()
-                    .map(|c| {
-                        reach
-                            .iter()
-                            .filter(|t| t.holds_labeled(c, label, name))
-                            .map(|t| labels.of(t))
-                            .collect()
-                    })
-                    .collect();
-                let offered = match precedence {
-                    Precedence::Recording => distinguishing_label(&holding),
-                    Precedence::Series => None,
-                };
-                let offered = offered.as_ref().map(|(k, v)| (k.as_str(), v.as_str()));
-                return Err(crate::promql::prometheus_names::ambiguous(
-                    name, &found, offered,
-                ));
-            }
-            if let Some(stored) = found.pop() {
-                names.insert(key, stored);
-            }
-        }
-    }
-    Ok(names)
+    Ok(Some(QueryEngine::with_groups(
+        source,
+        SourceGroups {
+            parts: ordered,
+            conflicts,
+        },
+    )))
 }
 
 /// Whether a recording with labels `extra` can hold a series `selection`
@@ -741,34 +636,6 @@ fn reaches(
         .branch_filters()
         .iter()
         .any(|filter| translate_filter_with(extra, filter, precedence).is_some())
-}
-
-/// A recording label whose values tell apart the recordings holding each
-/// candidate (`holding[i]`, the labels of each recording holding candidate
-/// `i`), with the value the first candidate's first recording has: every
-/// recording holding a candidate carries the key, and no value is carried
-/// by recordings of two candidates. The first such key in order; `None`
-/// when none does. Internal labels (`__recording__`) are not offered.
-fn distinguishing_label(holding: &[Vec<&metriken_storage::Labels>]) -> Option<(String, String)> {
-    let keys: std::collections::BTreeSet<&String> = holding
-        .iter()
-        .flatten()
-        .flat_map(|l| l.inner.keys())
-        .filter(|k| !metriken_storage::is_internal_label(k))
-        .collect();
-    keys.into_iter().find_map(|key| {
-        let mut owner: HashMap<&String, usize> = HashMap::new();
-        for (i, recordings) in holding.iter().enumerate() {
-            for labels in recordings {
-                let value = labels.inner.get(key)?;
-                if *owner.entry(value).or_insert(i) != i {
-                    return None;
-                }
-            }
-        }
-        let value = holding.first()?.first()?.inner.get(key)?;
-        Some((key.clone(), value.clone()))
-    })
 }
 
 /// The span `scope` reads of `table`'s source: `None` when the scope does
@@ -1130,11 +997,7 @@ impl MetricsSource for ArchiveReader {
                 continue;
             };
             let source = LabeledSource::new(r.source(), plan.labels.of(t).clone());
-            out.extend(
-                QueryEngine::new(Arc::new(source))
-                    .with_names(Arc::clone(&plan.names))
-                    .columns(query)?,
-            );
+            out.extend(QueryEngine::new(Arc::new(source)).columns(query)?);
         }
         Ok(out)
     }

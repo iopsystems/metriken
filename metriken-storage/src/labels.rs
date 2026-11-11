@@ -48,12 +48,13 @@ pub const STORAGE_KEYS: &[&str] = &[
 ];
 
 /// The histogram column key holding the factor its values were stored
-/// multiplied by, as an `f64`: a stored bucket bound is the observation, in
-/// the column's `unit` (or the exporter's unit when there is none), times
-/// it. Written by metriken-recorder's Prometheus converter when the factor
-/// is not 1, which is when the bounds would otherwise have been truncated
-/// to integers (a smallest bound below 1). A reader that wants the values
-/// in their unit divides by it; metriken-query does not.
+/// multiplied by, as an `f64`: a stored bucket bound, and the
+/// [`OVERFLOW_BOUND_KEY`], is the exporter's bound, in the column's `unit`
+/// when it has one, times it. Written by metriken-recorder's Prometheus
+/// converter when the factor is not 1, which is when the bounds would
+/// otherwise have been truncated to integers (a smallest bound below 1). A
+/// reader that wants the values in their unit divides by it; metriken-query
+/// does not.
 pub const SCALE_KEY: &str = "scale";
 
 /// The histogram column key naming its overflow series: the metric name of
@@ -87,12 +88,9 @@ pub fn is_storage_key(key: &str) -> bool {
 /// from listings and legends is the consumer's contract, not something done
 /// here, which is why the predicate is public.
 ///
-/// The one `__` key a writer in this workspace emits into column metadata
-/// is [`PROMETHEUS_NAME_LABEL`](crate::PROMETHEUS_NAME_LABEL), the name an
-/// exporter served a renamed series under (metriken-recorder's Prometheus
-/// converter). The loader does not check for others: a key with the
-/// prefix that did arrive would be kept as a label (the loaders strip only
-/// storage keys) and could collide with a label the engine injects.
+/// The loader does not check a column's `__` keys: one that arrives is
+/// kept as a label (the loaders strip only storage keys) and could collide
+/// with a label the engine injects.
 ///
 /// The engine's own internal labels are `__name__` (the series name) and
 /// `__run__` (a histogram whose bucket configuration changed mid-recording).

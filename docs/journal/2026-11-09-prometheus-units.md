@@ -1,8 +1,9 @@
 # Prometheus units: detect a unit in the name, normalize, and keep the original name
 
-**Status:** OPEN. Design 2026-11-09, owner decisions the same day (D1a,
-D2a, D3a, below). Built on branch `feat/prometheus-units` (see "As
-built"); not merged, not released.
+**Status:** SUPERSEDED (see "Reverted", at the end). Design 2026-11-09,
+owner decisions the same day (D1a, D2a, D3a, below). Released in
+metriken-recorder 0.12.0, metriken-storage 0.11.0 and metriken-query
+0.48.0; removed in the releases after metriken-recorder 0.14.0.
 Issue #379. Builds on #384 (float scalars,
 `2026-11-06-float-scalars.md`) and #388 (histogram overflow,
 `2026-11-09-histogram-overflow.md`).
@@ -401,3 +402,18 @@ metriken-charts 0.1.4 (fix; 0.1.3 is #390): its `STORAGE_KEYS` copy
   the `unit` key now gets one for Prometheus series.
 - Legends and the metric catalog hide `__prometheus_name__` already
   through `is_internal_label`; worth one test with a renamed series.
+
+## Reverted
+
+The owner reversed the design: every Prometheus series is stored under the
+exporter's name in the exporter's units, and the `unit` key names that unit
+(`metriken_storage::prometheus_units::UNITS`). The rewrite existed to store
+values as integers in nanoseconds and bytes; scalars have been stored as
+floats since #384, so that reason no longer applied. Removed with it:
+`__prometheus_name__`, metriken-query's exporter-name fallback and its
+ambiguity error, and the collision path. No compatibility path reads
+recordings made with the rewrite; only unreleased rezolus wrote them.
+
+A histogram whose smallest bound is below 1 is still stored ×10^k with
+`scale` (now in the exporter's unit). No reader in metriken divides by
+`scale`, so such a histogram's quantiles read ×10^k.

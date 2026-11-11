@@ -42,15 +42,14 @@ test('a series is named by its first visible label, never an internal one', () =
     assert.deepEqual(visibleLabels(metric), [['cpu', '3'], ['mode', 'user']]);
 });
 
-// A Prometheus series stored under a normalized name keeps the exporter's
-// name in `__prometheus_name__`: never shown, and not a label that tells
-// two series of one result apart.
-test('the exporter name of a renamed series is not shown', () => {
+// An internal label whose value differs between the series of one result
+// is never shown, and is not a label that tells them apart.
+test('an internal label that varies is not shown', () => {
     const metrics = [
-        { __name__: 'rpc_nanoseconds', __prometheus_name__: 'rpc_seconds', op: 'read' },
-        { __name__: 'rpc_nanoseconds', __prometheus_name__: 'rpc_ms', op: 'write' },
+        { __name__: 'rpc_seconds', __incarnation__: 'a', op: 'read' },
+        { __name__: 'rpc_seconds', __incarnation__: 'b', op: 'write' },
     ];
-    assert.equal(isInternalLabel('__prometheus_name__'), true);
+    assert.equal(isInternalLabel('__incarnation__'), true);
     assert.deepEqual(visibleLabels(metrics[0]), [['op', 'read']]);
     assert.deepEqual(varyingLabelKeys(metrics), ['op']);
     assert.deepStrictEqual(metrics.map(seriesNamer(metrics)), ['read', 'write']);

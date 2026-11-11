@@ -75,6 +75,70 @@ from the two histogram heatmap fixes below.
   recording. Before, the panic failed the recording (`Event::Failed`) and
   left the archive unfinalized.
 
+### metriken-storage (unreleased)
+
+- **Breaking:** `prometheus_units` gives a Prometheus series' unit and no
+  longer renames or converts. `UNITS` lists each unit token with the
+  `unit` value written for it: `seconds`; `milliseconds` (from
+  `milliseconds`, `ms`, `msec`); `microseconds` (`microseconds`, `us`);
+  `nanoseconds` (`nanoseconds`, `ns`); `bytes`; `kilobytes` (`kilobytes`,
+  `kb`); `kibibytes` (`kibibytes`, `kib`); `megabytes` (`megabytes`,
+  `mb`); `mebibytes` (`mebibytes`, `mib`); `gigabytes` (`gigabytes`,
+  `gb`); `gibibytes` (`gibibytes`, `gib`); `bits`; `percent`; `ratio`;
+  `celsius`; `hertz`; `cores`. `unit(name, unit_line)` returns the unit of
+  a series served as `name` whose metric's `# UNIT` line is `unit_line`:
+  the line's when it is in `UNITS`, else the name's token, and `None` for
+  a `_count` or `_bucket` sample. Removed: `PROMETHEUS_NAME_LABEL` (and
+  its re-export at the crate root), `normalize`, `Normalized`,
+  `fallback_candidates`, `TOKENS`, `Unit`, and `SamplerReader::holds_labeled`.
+  `unit_of` returns the `unit` value (`Option<&'static str>`) where it
+  returned a `Unit`. `SUFFIXES` and `split_suffix` are unchanged.
+- **Docs:** `SCALE_KEY` says the factor applies to the exporter's bounds
+  in the column's `unit`, and to `OVERFLOW_BOUND_KEY`.
+
+### metriken-query (unreleased)
+
+- **Breaking:** a selector reads only the name it gives. A query naming a
+  Prometheus series by its exporter name no longer reads a series stored
+  under a converted name with `__prometheus_name__` (metriken-recorder
+  0.12.0 to 0.14.0), and answers as a query naming a metric the source
+  does not hold when nothing else holds that name; the stored name still
+  reads such a series as stored, in its converted unit. The error for one exporter name stored under two names
+  is gone. Recordings of metriken-recorder 0.15.0 store every series under
+  the exporter's name, so the exporter's name reads them.
+
+### metriken-recorder (unreleased)
+
+Requires metriken-storage's unreleased `prometheus_units` above.
+
+- **Breaking:** the Prometheus converter stores every series under the
+  name the exporter serves it as, with the value it serves: a
+  `_seconds` series in seconds, a `_ms` series in milliseconds, a `_bits`
+  series in bits, a `_percent` series in 0 to 100. The `unit` key is the
+  unit the name's token or the metric's `# UNIT` line gives, by its name
+  in `metriken_storage::prometheus_units::UNITS` (`seconds`,
+  `milliseconds`, `bytes`, `percent`, …); a `_count` sample and a
+  histogram's overflow series have none. Before, such a series was stored
+  in nanoseconds or bytes under a converted name (`rpc_seconds_sum` as
+  `rpc_nanoseconds_sum`, `rx_bits_total` as `rx_bytes_total`) with the
+  exporter's name in `__prometheus_name__`, and a `_percent` series had
+  `unit="percentage"`. A reader querying the converted names, or
+  matching `__prometheus_name__`, finds nothing in a new recording; one
+  that took a time series' values as nanoseconds reads seconds,
+  milliseconds or microseconds, as the `unit` key says.
+- **Breaking:** a histogram's bounds are the exporter's `le` values,
+  multiplied, when the smallest is below 1, by the power of 10 that brings
+  it to 1, written as `scale`; the overflow bound is multiplied by the same
+  factor. A `_seconds` histogram is no longer stored ×1e9: one whose
+  smallest bound is 0.005 is stored ×1000 with `scale="1000"` and
+  `unit="seconds"`. metriken-query does not divide by `scale`, so its
+  quantiles read as seconds × 1000. Its `_sum` is in seconds. The overflow
+  series is `<exporter name>_overflow` (`rpc_seconds_overflow`).
+- **Breaking:** the collision path is removed: two exporter names that
+  would have been stored under one name are stored under their own names,
+  as every series is, and a collided `_seconds` histogram is scaled like
+  any other. A `# HELP` text is kept under the exporter's name only.
+
 ### metriken-storage 0.12.0
 
 - **Breaking:** `Labels::matches` takes a label the series does not carry

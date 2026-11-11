@@ -12,7 +12,6 @@ use crate::{DataSource, QueryOptions};
 
 mod columns;
 pub(crate) mod json_f64;
-pub(crate) mod prometheus_names;
 mod selection;
 pub(crate) use columns::Selector;
 pub use columns::{referenced_metrics, selector_filter};
@@ -697,17 +696,6 @@ pub(crate) struct QueryEngine {
     /// The process groups among `source`'s recordings that a leaf reads per
     /// member (`streaming::per_source`); `None` when there are none.
     groups: Option<Arc<streaming::per_source::SourceGroups>>,
-    /// Each selector's stored name when it names a series by its exporter
-    /// name, resolved by the caller over what each selector reaches (an
-    /// archive's `Plan`); `None` to resolve over the whole of `source`
-    /// ([`prometheus_names`]).
-    names: Option<Arc<prometheus_names::NameResolution>>,
-    /// Every name `source` holds, listed on the first selector that needs
-    /// them and kept for the engine's life: one query for `MemoryStore` and
-    /// archives; the reader's life for `ParquetReader`,
-    /// `SegmentedParquetReader` and `UnionMetricsSource`, whose names are
-    /// fixed at open.
-    held: std::sync::OnceLock<std::collections::HashSet<String>>,
 }
 
 /// Try to parse an optional stride (in seconds) from the trailing argument.
@@ -765,6 +753,39 @@ impl HistogramGroupBy {
             HistogramGroupBy::By(ls) => streaming::GroupBy::Include(ls),
             HistogramGroupBy::Without(ls) => streaming::GroupBy::Exclude(ls),
         }
+    }
+}
+
+/// Call `f` with the name of each named selector of `expr` and the series
+/// it selects, returning the first error.
+fn each_selector(
+    expr: &Expr,
+    f: &dyn Fn(&str, &Selection) -> Result<(), QueryError>,
+) -> Result<(), QueryError> {
+    let each = |e: &Expr| each_selector(e, f);
+    let selector = |sel: &parser::VectorSelector| match &sel.name {
+        Some(name) => f(name, &Selection::new(Some(name), &sel.matchers)),
+        None => Ok(()),
+    };
+    match expr {
+        Expr::Aggregate(agg) => {
+            each(&agg.expr)?;
+            match agg.param.as_ref() {
+                Some(param) => each(param),
+                None => Ok(()),
+            }
+        }
+        Expr::Unary(u) => each(&u.expr),
+        Expr::Binary(b) => {
+            each(&b.lhs)?;
+            each(&b.rhs)
+        }
+        Expr::Paren(p) => each(&p.expr),
+        Expr::Call(call) => call.args.args.iter().try_for_each(|arg| each(arg)),
+        Expr::VectorSelector(sel) => selector(sel),
+        Expr::MatrixSelector(sel) => selector(&sel.vs),
+        Expr::Subquery(s) => each(&s.expr),
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => Ok(()),
     }
 }
 
@@ -1130,60 +1151,14 @@ impl QueryEngine {
         Self {
             source,
             groups: None,
-            names: None,
-            held: std::sync::OnceLock::new(),
         }
     }
 
-    /// This engine with the stored name of each selector that names a
-    /// series by its exporter name decided by the caller: a selector not in
-    /// `names` reads its own name.
-    #[cfg_attr(not(feature = "archive"), allow(dead_code))]
-    pub(crate) fn with_names(mut self, names: Arc<prometheus_names::NameResolution>) -> Self {
-        self.names = Some(names);
-        self
-    }
-
-    /// The stored name a selector of `name` selecting `selection` reads
-    /// instead, if any ([`prometheus_names`]).
-    fn stored_name(&self, name: &str, selection: &Selection) -> Result<Option<String>, QueryError> {
-        match &self.names {
-            Some(names) => Ok(names
-                .get(&(name.to_string(), selection.branch_filters()))
-                .cloned()),
-            None => {
-                let held = self
-                    .held
-                    .get_or_init(|| prometheus_names::held_names(&*self.source));
-                prometheus_names::stored_name(&*self.source, held, name)
-            }
-        }
-    }
-
-    /// [`stored_name`](Self::stored_name), refusing the selector when the
-    /// series it reads include one that two columns of one table hold
-    /// ([`refuse_duplicated`]).
-    fn selector_name(
-        &self,
-        name: &str,
-        selection: &Selection,
-    ) -> Result<Option<String>, QueryError> {
-        let stored = self.stored_name(name, selection)?;
-        match &stored {
-            Some(stored) => {
-                refuse_duplicated(&*self.source, stored, &selection.clone().renamed(name))?
-            }
-            None => refuse_duplicated(&*self.source, name, selection)?,
-        }
-        Ok(stored)
-    }
-
-    /// `expr`'s selectors pointed at stored names where they name a series
-    /// by its exporter name, and an error for a selector matching a
-    /// series two columns of one table hold.
-    pub(crate) fn resolve_names(&self, expr: &mut Expr) -> Result<(), QueryError> {
-        prometheus_names::resolve_selectors(expr, &|name, selection| {
-            self.selector_name(name, selection)
+    /// An error for a named selector of `expr` matching a series that two
+    /// columns of one table hold ([`refuse_duplicated`]).
+    pub(crate) fn check_selectors(&self, expr: &Expr) -> Result<(), QueryError> {
+        each_selector(expr, &|name, selection| {
+            refuse_duplicated(&*self.source, name, selection)
         })
     }
 
@@ -1197,8 +1172,6 @@ impl QueryEngine {
         Self {
             source,
             groups: Some(Arc::new(groups)),
-            names: None,
-            held: std::sync::OnceLock::new(),
         }
     }
 
@@ -1213,21 +1186,9 @@ impl QueryEngine {
                 Arc::clone(&disorder),
             ))
         };
-        // Filled here, on the engine that lives on, so a reader's engine
-        // lists its names once rather than once per query. An engine with
-        // `names` resolves without them.
-        let held = std::sync::OnceLock::new();
-        if self.names.is_none() {
-            let names = self
-                .held
-                .get_or_init(|| prometheus_names::held_names(&*self.source));
-            let _ = held.set(names.clone());
-        }
         let engine = QueryEngine {
             source: wrap(&self.source),
             groups: self.groups.as_ref().map(|g| Arc::new(g.wrapped(&wrap))),
-            names: self.names.clone(),
-            held,
         };
         (engine, disorder)
     }
@@ -1356,14 +1317,12 @@ impl QueryEngine {
     }
 
     /// A histogram function's selector: its metric name and the series it
-    /// selects, the stored name and the `__prometheus_name__` matcher when
-    /// it names a series by its exporter name.
+    /// selects, refused when they include a series that two columns of one
+    /// table hold ([`refuse_duplicated`]).
     fn parse_metric_selector(&self, selector: &str) -> Result<(String, Selection), QueryError> {
         let (name, selection) = self.parse_metric_selector_as_written(selector)?;
-        Ok(match self.selector_name(&name, &selection)? {
-            Some(stored) => (stored, selection.renamed(&name)),
-            None => (name, selection),
-        })
+        refuse_duplicated(&*self.source, &name, &selection)?;
+        Ok((name, selection))
     }
 
     fn parse_metric_selector_as_written(
@@ -1949,7 +1908,7 @@ impl QueryEngine {
         match parser::parse(query_str) {
             Ok(mut parsed) => {
                 name_selectors(&mut parsed);
-                self.resolve_names(&mut parsed)?;
+                self.check_selectors(&parsed)?;
                 expr(&parsed)
             }
             Err(err) => {
