@@ -9,24 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### metriken-storage (unreleased)
 
-- **Fixed:** `Labels::matches` takes a label the series does not carry as
-  `""`, as Prometheus does: `l=""` matches a series without `l`, as do
+- **Breaking:** `Labels::matches` takes a label the series does not carry
+  as `""`, as Prometheus does: `l=""` matches a series without `l`, as do
   `l=~"a|"` and `l!="a"`, and `l!=""` and `l!~".*"` do not. A label the
   series lacked failed `=` and `=~` and passed `!=` and `!~` whatever the
-  operand. This applies to every reader's filter (parquet, segmented,
-  memory, an archive's recording labels through `LabeledSource`) and to an
-  overlay's `SourceSelector::Matching`, which now selects a source without
-  `k` for `k=""`.
+  operand, so `l!~".*"` selected the series without `l`; nothing now tells
+  an absent label from an empty value. This applies to every reader's
+  filter (parquet, segmented, memory, an archive's recording labels
+  through `LabeledSource`) and to an overlay's `SourceSelector::Matching`,
+  which now selects a source without `k` for `k=""`.
+- **Changed:** a `__run__` matcher on a segmented histogram follows the same
+  rule. With one run, whose series carry no `__run__`, a matcher keeps the
+  run when it selects `"0"` or an absent label (`__run__=""`,
+  `__run__!="1"`, `__run__=~"0|"`); with several, a matcher other than `=`
+  reads the first run it selects. Before, only `__run__="<n>"` was read.
+- **Docs:** `ColumnRelabel` says a matcher of any operator on a key the
+  relabelling supplies must be taken off the segment filter.
 
 ### metriken-query (unreleased)
 
-- **Fixed:** a selector that matches the empty string selects the series
+- **Breaking:** a matcher that matches the empty string selects the series
   that lack the label, through every source: `x{l=""}` selects the series
   of `x` without `l`, `x{l=~"a|"}` those with `l="a"` and those without,
   and `x{l!~".*"}` none. Only a selector with `or` did this before. The
   filtered listings (`counter_labels_matching` and its siblings) follow
-  the same rule. A selector with `or` reads with every matcher its
-  branches share, including one that matches `""`.
+  the same rule. Requires metriken-storage 0.12.0.
+- **Changed:** a selector with `or` selects the same series, and reads
+  with every matcher its branches share, including one that matches `""`.
+  Its branch filters include those matchers too, so an archive no longer
+  reaches a recording whose labels contradict every branch, and a query
+  refused as reading a metric of two kinds across recordings can now
+  succeed.
 
 ### metriken-storage 0.11.2
 

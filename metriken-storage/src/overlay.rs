@@ -38,8 +38,9 @@ pub enum SourceSelector {
     /// ends (`=~` and `!~`; `!=` is `!` with the value escaped as a regex),
     /// and any other value is compared whole after one leading `=` is
     /// removed. A source without `k` has the value `""` for `k`, so `k=""`
-    /// and `k!="v"` match it and `k!=""` does not. A pattern that does not compile matches no value, so
-    /// `~` with it selects no source and `!` selects every source.
+    /// and `k!="v"` match it and `k!=""` does not. A pattern that does not
+    /// compile matches no value, so `~` with it selects no source and `!`
+    /// selects every source.
     ///
     /// [`MatchOp::encode`]: crate::MatchOp::encode
     Matching(Labels),

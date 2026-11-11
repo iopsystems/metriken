@@ -67,6 +67,18 @@ pub type SegmentBytes = Result<Option<Bytes>, Box<dyn Error + Send + Sync>>;
 /// Identity that varies with time: what a column's samples are attributed
 /// to depends on when they were taken.
 ///
+/// Whether the `__run__` matcher `encoded` (as [`MatchOp::encode`] writes
+/// it) selects a series of run `run`, or one with no `__run__` for `None`.
+///
+/// [`MatchOp::encode`]: crate::MatchOp::encode
+fn run_selected(encoded: &str, run: Option<usize>) -> bool {
+    let series = match run {
+        Some(run) => Labels::from([("__run__", run.to_string().as_str())]),
+        None => Labels::default(),
+    };
+    series.matches(&Labels::from([("__run__", encoded)]))
+}
+
 /// A table's column is a slot, and a slot changes hands — a task exits and
 /// another lands in its place. The column's own labels say what the slot
 /// meant when the segment was written, or, once identity leaves column
@@ -82,6 +94,9 @@ pub type SegmentBytes = Result<Option<Bytes>, Box<dyn Error + Send + Sync>>;
 /// nothing. [`segment_filter`](Self::segment_filter) is where the
 /// implementation turns such a filter into one the columns can answer, and
 /// the reader applies the original filter to the relabelled runs afterwards.
+/// A matcher of any operator on a supplied key must be taken off the
+/// segment filter: a column that lacks the key compares as `""`, so a
+/// negated matcher left on it, such as `k!=""`, fails every column.
 pub trait ColumnRelabel: Send + Sync {
     /// Every label set a column of metric `name` with `labels` presents as
     /// over the recording, in first-appearance order. `None` leaves the
@@ -1731,16 +1746,17 @@ impl SegmentedSource {
     ) -> Option<HistogramStream> {
         let (runs, identity) = self.histogram_state(kind);
         if runs.run_count(name) <= 1 {
-            // No conflict, so the segments' own labels carry no `__run__` and
-            // `Labels::matches` would fail closed on one. A dashboard can
-            // legitimately pin `__run__="0"` to keep one query working across
-            // an A/B pair where only the other side drifted, and run 0 IS this
-            // single run — strip it. Any other run genuinely has no data here.
+            // No conflict, so the segments' own labels carry no `__run__`.
+            // The one run is run 0, and its series carry no `__run__`: a
+            // `__run__` matcher keeps it when it selects either `"0"` or an
+            // absent label. A dashboard can pin `__run__="0"` to keep one
+            // query working across an A/B pair where only the other side
+            // drifted.
             let mut effective = filter.clone();
-            match effective.inner.remove("__run__") {
-                None => {}
-                Some(v) if v == "0" => {}
-                Some(_) => return None,
+            if let Some(v) = effective.inner.remove("__run__") {
+                if !run_selected(&v, Some(0)) && !run_selected(&v, None) {
+                    return None;
+                }
             }
             let seg_filter = self.segment_filter(name, &effective);
             let streams: Vec<HistogramStream> = self
@@ -1762,9 +1778,10 @@ impl SegmentedSource {
         // config is its own run, disambiguated by a `__run__` label; an
         // unqualified selector (no explicit `__run__`) resolves to the
         // FIRST run rather than mixing configs — split, warn, never coerce.
+        // A `__run__` matcher reads the first run it selects.
         let (want_run, inner_filter) = match filter.inner.get("__run__") {
             Some(v) => {
-                let want: usize = v.parse().ok()?;
+                let want = (0..runs.run_count(name)).find(|&run| run_selected(v, Some(run)))?;
                 let mut f = filter.clone();
                 f.inner.remove("__run__");
                 (want, f)

@@ -1486,9 +1486,11 @@ mod tests {
         ] {
             assert_eq!(values(query), want, "{query}");
             let filter = crate::selector_filter(query.trim_start_matches('x'));
-            if let Ok(filter) = filter {
+            if query.contains(" or ") {
+                assert!(filter.is_err(), "{query}: `or` has no single filter");
+            } else {
                 assert_eq!(
-                    MetricsSource::gauge_labels_matching(&reader, "x", &filter).len(),
+                    MetricsSource::gauge_labels_matching(&reader, "x", &filter.unwrap()).len(),
                     want.len(),
                     "{query}: listing"
                 );

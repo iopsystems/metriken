@@ -1821,6 +1821,19 @@ pub(crate) mod tests {
         let run1 = mean(&r, "histogram_mean(latency{__run__=\"1\"})", 4.0);
         assert_eq!(run0, mean(&only_a, "histogram_mean(latency)", 2.0));
         assert_eq!(run1, mean(&only_b, "histogram_mean(latency)", 4.0));
+        // A matcher other than `=` reads the first run it selects.
+        assert_eq!(
+            mean(&r, "histogram_mean(latency{__run__!=\"0\"})", 4.0),
+            run1
+        );
+        assert_eq!(
+            mean(&r, "histogram_mean(latency{__run__=~\"1|2\"})", 4.0),
+            run1
+        );
+        assert_eq!(
+            mean(&r, "histogram_mean(latency{__run__=~\"0|1\"})", 2.0),
+            run0
+        );
         assert!(
             (run0 - run1).abs() > 1.0,
             "bucket 20 must resolve differently under gp=2 ({run0}) and gp=3 ({run1}); \
@@ -1944,6 +1957,13 @@ pub(crate) mod tests {
             format!("{unpinned:?}"),
             "pinning run 0 must not change the result, nor add a __run__ label"
         );
+        // The single run's series carry no `__run__`, so a matcher that
+        // selects an absent label selects it too.
+        for selector in ["__run__=\"\"", "__run__!=\"1\"", "__run__=~\"0|\""] {
+            let q = format!("histogram_mean(latency{{{selector}}})");
+            let got = r.query_range(&q, 1.0, 4.0, 1.0).unwrap();
+            assert_eq!(format!("{got:?}"), format!("{unpinned:?}"), "{q}");
+        }
 
         // Any other run genuinely has no data, at both entry points.
         assert!(r
