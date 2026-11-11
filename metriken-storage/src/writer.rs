@@ -279,12 +279,13 @@ impl ArchiveWriter {
     ///
     /// [`SourceRecorder::finalize`] seals the source's streams, deletes the
     /// rows of every stream listed for it after the stream's newest segment
-    /// (every row of a stream with no segment), and marks it complete, so a reader of the finalized archive meets no rows it
-    /// cannot decode. The segments a listed stream sealed before it failed
-    /// are kept. Until finalize, a reader that materializes the live WAL
-    /// tail fails on those rows. When the listed stream is a long table's
-    /// occupant stream, the table's series for occupants first described in
-    /// the deleted rows read without their labels.
+    /// (every row of a stream with no segment), and marks it complete, so a
+    /// reader of the finalized archive meets no rows it cannot decode. The
+    /// segments a listed stream sealed before it failed are kept. Until
+    /// finalize, a reader that materializes the live WAL tail fails on those
+    /// rows. When the listed stream is a long table's occupant stream, the
+    /// table's series for occupants first described in the deleted rows read
+    /// without their labels.
     ///
     /// A panic in the encoder is caught and recorded like an error when it
     /// unwinds. Under `panic = "abort"`, or with a panic hook that exits the
@@ -1677,10 +1678,10 @@ impl SourceRecorder {
 
     /// Seal every stream's tail and mark the source complete. `last` is the
     /// last tick's `(ts, wall_offset)`. In an archive made by
-    /// [`ArchiveWriter::create_isolated`], the rows after the newest segment
-    /// of each stream that failed to encode, at this seal or before, are
-    /// deleted before the source is marked complete. The segments the stream sealed before the failure are
-    /// kept, and the stream stays listed by
+    /// [`ArchiveWriter::create_isolated`], the rows after the newest segment of
+    /// each stream that failed to encode, at this seal or before, are deleted
+    /// before the source is marked complete. The segments the stream sealed
+    /// before the failure are kept, and the stream stays listed by
     /// [`ArchiveWriter::encode_failures`].
     pub fn finalize(mut self, last: (u64, i64)) -> Result<(), Error> {
         let batch: Vec<String> = self.accounts.keys().cloned().collect();

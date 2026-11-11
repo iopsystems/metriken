@@ -301,20 +301,19 @@ pub enum Event {
         version: Option<String>,
     },
     /// The source's rows could not be recorded, so the source stopped
-    /// recording: no more passes, scrapes or frames are taken from it. Its
-    /// rows in a table could not be written into a segment (the encoder
-    /// could not encode them), or its rows could not be staged, or a
-    /// streamed frame from it could not be read or decoded. For rows that
-    /// could not be encoded, each failed table's rows after its newest
-    /// segment are deleted and its segments are kept; rows that could not
-    /// be staged, read or decoded were never written. The recording is then
-    /// finalized. The other sources keep recording. When no source is `Pending`, `Activating` or `Active`, the
+    /// recording: no more passes, scrapes or frames are taken from it. Its rows
+    /// in a table could not be written into a segment (the encoder could not
+    /// encode them), or its rows could not be staged, or a streamed frame from
+    /// it could not be read or decoded. For rows that could not be encoded,
+    /// each failed table's rows after its newest segment are deleted and its
+    /// segments are kept; rows that could not be staged, read or decoded were
+    /// never written. The recording is then finalized. The other sources keep
+    /// recording. When no source is `Pending`, `Activating` or `Active`, the
     /// recording fails ([`Event::Failed`], after this event); the check runs
-    /// again when a source is refused, so a refusal that leaves none
-    /// `Pending`, `Activating` or `Active` ends it too. `reason` names each
-    /// failed table and the encoder's error, or what could not be staged or
-    /// read. At most once per source; its
-    /// state is then [`SourceState::Failed`].
+    /// again when a source is refused, so a refusal that leaves none `Pending`,
+    /// `Activating` or `Active` ends it too. `reason` names each failed table
+    /// and the encoder's error, or what could not be staged or read. At most
+    /// once per source; its state is then [`SourceState::Failed`].
     SourceFailed { source: SourceId, reason: String },
     /// The archive failed, or a source failed ([`Event::SourceFailed`]) and
     /// no source is left `Pending`, `Activating` or `Active`. The recorder
@@ -2795,6 +2794,7 @@ impl Driver {
         // A slot whose rows could not be staged fails at the next commit,
         // and is reported once, as failed.
         if self.is_unstageable(i) {
+            debug!("{}: refused while failing: {reason}", self.slots[i].label());
             return;
         }
         let slot = &mut self.slots[i];
