@@ -30,6 +30,12 @@ pub const READABLE_ENCODERS: &[&str] = &[ENCODER_VERSION];
 /// two sources can record a group of the same name, one long and one wide.
 pub(crate) type LongStreams = Arc<Mutex<HashSet<(i64, String)>>>;
 
+/// The streams the writer's encoder could not encode, per source id: each
+/// stream's latest error. Shared between the encoder (which records on
+/// dendro's writer thread) and the writer (which reports and discards).
+pub(crate) type EncodeFailures =
+    Arc<Mutex<std::collections::BTreeMap<i64, std::collections::BTreeMap<String, String>>>>;
+
 /// The segment encoder: a long table's rows become a long segment, an
 /// occupant stream's rows an occupant segment, anything else a wide table.
 pub struct Encoder {
@@ -37,21 +43,67 @@ pub struct Encoder {
     sort_long: bool,
     /// Writer properties for every segment this encoder seals.
     props: parquet::file::properties::WriterProperties,
+    /// When set, a stream that fails to encode (an error or a panic) is
+    /// recorded here and given no segment, rather than returned as an
+    /// error: dendro stops its writer thread, and every source's recording
+    /// with it, on an encoder error.
+    failures: Option<EncodeFailures>,
 }
 
 impl Encoder {
     /// The writer's encoder: `long` is shared with its recorders, which
-    /// decide which streams are long as they ingest.
+    /// decide which streams are long as they ingest; `failures`, when set,
+    /// collects the streams that fail to encode (see the field).
     #[cfg_attr(not(feature = "write"), allow(dead_code))]
     pub(crate) fn new(
         long: LongStreams,
         sort_long: bool,
         props: parquet::file::properties::WriterProperties,
+        failures: Option<EncodeFailures>,
     ) -> Self {
         Self {
             long,
             sort_long,
             props,
+            failures,
+        }
+    }
+
+    /// `encode()` for the stream `ctx` names. With [`failures`] set, an
+    /// error or a panic is recorded there and the stream gets no segment,
+    /// and a success clears what was recorded for the stream: dendro's
+    /// `split_seal` encodes a split's first part with `encode`, and when
+    /// that part fails it seals the whole run with `encode`, which can
+    /// succeed.
+    ///
+    /// [`failures`]: Self::failures
+    fn isolate(
+        &self,
+        ctx: &EncodeContext<'_>,
+        encode: impl FnOnce() -> EncodeResult,
+    ) -> EncodeResult {
+        let Some(failures) = &self.failures else {
+            return encode();
+        };
+        let result = caught(encode);
+        let mut failures = failures.lock().unwrap_or_else(|e| e.into_inner());
+        match result {
+            Ok(segment) => {
+                if let Some(streams) = failures.get_mut(&ctx.source_id) {
+                    streams.remove(ctx.stream);
+                    if streams.is_empty() {
+                        failures.remove(&ctx.source_id);
+                    }
+                }
+                Ok(segment)
+            }
+            Err(error) => {
+                failures
+                    .entry(ctx.source_id)
+                    .or_default()
+                    .insert(ctx.stream.to_string(), error);
+                Ok(None)
+            }
         }
     }
 
@@ -82,6 +134,7 @@ impl Encoder {
             long: Arc::new(Mutex::new(long)),
             sort_long: false,
             props: sealed_props(default_compression()),
+            failures: None,
         }
     }
 
@@ -138,6 +191,56 @@ pub(crate) fn boxed(e: impl std::fmt::Display) -> Box<dyn std::error::Error + Se
 
 impl SegmentEncoder for Encoder {
     fn encode(&self, ctx: &EncodeContext<'_>, rows: &[DWalRow]) -> EncodeResult {
+        self.isolate(ctx, || self.encode_rows(ctx, rows))
+    }
+
+    fn version(&self) -> Option<&str> {
+        Some(ENCODER_VERSION)
+    }
+
+    /// A part of a split seal (dendro's `seal_capped`), after `before`.
+    ///
+    /// The writer puts a group's schema, a long table's columns and a
+    /// sampler cell's metadata only on the first row since the last seal
+    /// that needs them, so a part that starts after that row would decode
+    /// with no schema (its rows skipped) or with columns that lost their
+    /// labels. The part is anchored as the writer would have anchored it
+    /// had it sealed there, from what `before` carried, and then encoded.
+    fn encode_after(
+        &self,
+        ctx: &EncodeContext<'_>,
+        before: &[DWalRow],
+        rows: &[DWalRow],
+    ) -> EncodeResult {
+        let encode = || self.encode_rows_after(ctx, before, rows);
+        if self.failures.is_none() {
+            return encode();
+        }
+        // A part that fails gives no segment and is not recorded: dendro's
+        // `split_seal` then seals the stream's rows as one segment with
+        // `encode`, which records the failure if those fail too.
+        Ok(caught(encode).unwrap_or(None))
+    }
+}
+
+/// `encode()`, with an error or a panic as its message.
+fn caught(encode: impl FnOnce() -> EncodeResult) -> Result<Option<Segment>, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(encode)) {
+        Ok(Ok(segment)) => Ok(segment),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(payload) => {
+            let what = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a panic with no message".to_string());
+            Err(format!("the encoder panicked: {what}"))
+        }
+    }
+}
+
+impl Encoder {
+    fn encode_rows(&self, ctx: &EncodeContext<'_>, rows: &[DWalRow]) -> EncodeResult {
         let stream = ctx.stream;
         let Some(last) = rows.last() else {
             return Ok(None);
@@ -207,19 +310,7 @@ impl SegmentEncoder for Encoder {
         }))
     }
 
-    fn version(&self) -> Option<&str> {
-        Some(ENCODER_VERSION)
-    }
-
-    /// A part of a split seal (dendro's `seal_capped`), after `before`.
-    ///
-    /// The writer puts a group's schema, a long table's columns and a
-    /// sampler cell's metadata only on the first row since the last seal
-    /// that needs them, so a part that starts after that row would decode
-    /// with no schema (its rows skipped) or with columns that lost their
-    /// labels. The part is anchored as the writer would have anchored it
-    /// had it sealed there, from what `before` carried, and then encoded.
-    fn encode_after(
+    fn encode_rows_after(
         &self,
         ctx: &EncodeContext<'_>,
         before: &[DWalRow],
@@ -228,7 +319,7 @@ impl SegmentEncoder for Encoder {
         let stream = ctx.stream;
         // An occupant stream's rows each carry their own labels.
         if occupants::table_of(stream).is_some() {
-            return self.encode(ctx, rows);
+            return self.encode_rows(ctx, rows);
         }
         let long = self
             .long
@@ -244,8 +335,8 @@ impl SegmentEncoder for Encoder {
         }
         .map_err(boxed)?;
         match anchored {
-            Some(rows) => self.encode(ctx, &rows),
-            None => self.encode(ctx, rows),
+            Some(rows) => self.encode_rows(ctx, &rows),
+            None => self.encode_rows(ctx, rows),
         }
     }
 }
@@ -446,5 +537,114 @@ mod encode_after_tests {
             .encode(&EncodeContext::new(1, "s/g"), &part)
             .unwrap()
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod isolate_tests {
+    use super::*;
+
+    fn encoder(failures: Option<EncodeFailures>) -> Encoder {
+        Encoder::new(
+            LongStreams::default(),
+            false,
+            sealed_props(default_compression()),
+            failures,
+        )
+    }
+
+    /// The closure panics, standing in for an encoder panic, since no known
+    /// input makes the encoder panic.
+    #[test]
+    fn an_isolating_encoder_records_a_panic_and_gives_no_segment() {
+        let failures = EncodeFailures::default();
+        let encoder = encoder(Some(Arc::clone(&failures)));
+        let ctx = EncodeContext::new(7, "t");
+        let out = encoder.isolate(&ctx, || panic!("boom"));
+        assert!(matches!(out, Ok(None)));
+        let recorded = failures.lock().unwrap();
+        assert_eq!(
+            recorded[&7]["t"], "the encoder panicked: boom",
+            "{recorded:?}"
+        );
+    }
+
+    #[test]
+    fn an_encoder_that_does_not_isolate_returns_the_error() {
+        let encoder = encoder(None);
+        let ctx = EncodeContext::new(7, "t");
+        let out = encoder.isolate(&ctx, || Err("bad".into()));
+        assert_eq!(out.err().map(|e| e.to_string()).as_deref(), Some("bad"));
+    }
+}
+
+#[cfg(test)]
+mod encode_after_isolation_tests {
+    use super::*;
+
+    /// A row whose payload is not msgpack, so neither encode path decodes it.
+    fn garbage(ts: i64) -> DWalRow {
+        DWalRow {
+            stream: "s".to_string(),
+            ts,
+            wall_offset: 0,
+            row: vec![0xc1],
+        }
+    }
+
+    /// A later part of a split seal that fails gives no segment and records
+    /// nothing; the same rows through `encode`, as dendro's fallback seals
+    /// them, record the failure.
+    #[test]
+    fn a_failed_part_of_a_split_is_left_to_the_whole_run_seal() {
+        let failures = EncodeFailures::default();
+        let encoder = Encoder::new(
+            LongStreams::default(),
+            false,
+            sealed_props(default_compression()),
+            Some(Arc::clone(&failures)),
+        );
+        let ctx = EncodeContext::new(3, "s");
+        let (before, rows) = ([garbage(1)], [garbage(2)]);
+        assert!(matches!(
+            encoder.encode_after(&ctx, &before, &rows),
+            Ok(None)
+        ));
+        assert!(
+            failures.lock().unwrap().is_empty(),
+            "a part records nothing"
+        );
+        assert!(matches!(encoder.encode(&ctx, &rows), Ok(None)));
+        assert!(failures.lock().unwrap()[&3].contains_key("s"));
+    }
+}
+
+#[cfg(test)]
+mod clear_on_success_tests {
+    use super::*;
+
+    /// A failed first part of a split, then the whole run sealed as one
+    /// segment: the stream is not listed as failed.
+    #[test]
+    fn a_success_after_a_failure_clears_the_stream() {
+        let failures = EncodeFailures::default();
+        let encoder = Encoder::new(
+            LongStreams::default(),
+            false,
+            sealed_props(default_compression()),
+            Some(Arc::clone(&failures)),
+        );
+        let ctx = EncodeContext::new(5, "s");
+        assert!(matches!(
+            encoder.isolate(&ctx, || Err("part".into())),
+            Ok(None)
+        ));
+        assert!(failures.lock().unwrap()[&5].contains_key("s"));
+        assert!(matches!(encoder.isolate(&ctx, || Ok(None)), Ok(None)));
+        assert!(
+            failures.lock().unwrap().is_empty(),
+            "{:?}",
+            failures.lock().unwrap()
+        );
     }
 }

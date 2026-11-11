@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### metriken-storage 0.11.2
 
+- **Added:** `ArchiveWriter::create_isolated`: an archive in which a
+  stream whose rows the encoder cannot write into a segment (an error or
+  a panic) fails only its own source. An encoder result dendro rejects (a
+  segment that does not cover its rows) still stops the writer. Such a
+  stream gets no segment, its rows stay in the WAL, and the writer keeps
+  running; with `ArchiveWriter::create`, dendro stops its writer thread at
+  that seal and every source's later commits and syncs return the error,
+  as before. `ArchiveWriter::encode_failures` lists a source's failed
+  streams (`EncodeFailure`) once the writer thread has run the seal
+  (`SourceRecorder::sync` waits for it); a later seal of the stream that
+  succeeds takes it off the list. `SourceRecorder::finalize` in such an
+  archive discards each failed stream, with its table or occupant stream,
+  before it marks the source complete, so a reader of the finalized
+  archive meets no rows it cannot decode. Until then, a reader that
+  materializes the live WAL tail fails on those rows. dendro's eviction
+  deletes a stream's segments and WAL rows older than a cutoff, so the
+  unsealed rows cannot be removed without the segments sealed before
+  them: a discarded stream's earlier segments go too. A panic in the
+  encoder is caught and recorded like an error when it unwinds. Under
+  `panic = "abort"`, or with a panic hook that exits the process, it ends
+  the process.
 - **Fixed:** `MultiParquetSource::interval` with no files, and
   `SegmentedSource::interval` with no segment present, answer 1.0, as
   `RecordingsSource` and `UnionSource` do with no children. They answered
@@ -48,6 +69,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Fixed:** `selector_filter` refuses a selector with `or`, whose
   branches one filter cannot hold, with a `ParseError`. It returned an
   empty filter, which matches every series.
+
+### metriken-recorder 0.13.1
+
+Requires metriken-storage 0.11.2.
+
+- **Fixed:** a source whose rows the encoder cannot write into a segment
+  stops recording, and the others record on. Before, the seal's error
+  stopped the archive's writer and the recorder failed the recording
+  (`Event::Failed`) for every source. The source's failed tables are
+  removed from its recording, their earlier segments included, and the
+  recording is finalized with its other tables; its tasks are stopped,
+  `Event::SourceFailed` names it and each failed table with the encoder's
+  error, and its state is `SourceState::Failed`. A failure found at the
+  seal `Recorder::finish` makes, or at the seal that ends a recording at a
+  producer change (no new recording is then added), is handled the same
+  way. A patch to such a source is an `Error::Source`. A V1 or V2
+  snapshot from a local source naming one metric of a sampler twice is
+  one such input.
+- **Changed:** a caller with several sources now gets
+  `Event::SourceFailed` for such a source and the recording continues.
+  When no source is `Pending`, `Activating` or `Active`, the recording
+  fails (`Event::Failed`, after the `SourceFailed`), and
+  `Recorder::finish` returns `Error::Archive`. The check runs again when a
+  source is refused, so a refusal that leaves none `Pending`, `Activating`
+  or `Active` ends it too; the recordings still open then, of sources
+  refused on a reconnect, are finalized first. A refusal alone never fails
+  the recording.
+- **Known limit:** an error staging one source's pass (decoding a
+  streamed frame, or `SourceRecorder::stage` and `stage_streamed`) still
+  fails the recording for every source, as does any error from the
+  archive itself: a commit, a seal's transaction, retention's eviction,
+  a finalize or the final join.
 
 ### metriken-storage 0.11.1
 
