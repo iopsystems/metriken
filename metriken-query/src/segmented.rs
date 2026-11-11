@@ -1821,6 +1821,27 @@ pub(crate) mod tests {
         let run1 = mean(&r, "histogram_mean(latency{__run__=\"1\"})", 4.0);
         assert_eq!(run0, mean(&only_a, "histogram_mean(latency)", 2.0));
         assert_eq!(run1, mean(&only_b, "histogram_mean(latency)", 4.0));
+        // A matcher other than `=` reads the run it selects, at the query and
+        // in `columns()`; one that selects both runs reads neither.
+        for (selector, want, at) in [
+            ("__run__!=\"0\"", run1, 4.0),
+            ("__run__=~\"1|2\"", run1, 4.0),
+            ("__run__!~\"1\"", run0, 2.0),
+        ] {
+            let q = format!("histogram_mean(latency{{{selector}}})");
+            assert_eq!(mean(&r, &q, at), want, "{q}");
+            assert!(!r.columns(&q).unwrap().is_empty(), "{q}: columns");
+        }
+        let both = r
+            .query_range("histogram_mean(latency{__run__=~\"0|1\"})", 1.0, 5.0, 1.0)
+            .unwrap();
+        let QueryResult::Matrix { result, .. } = both else {
+            panic!("not a matrix");
+        };
+        assert!(
+            result.is_empty(),
+            "two runs are not read as one: {result:?}"
+        );
         assert!(
             (run0 - run1).abs() > 1.0,
             "bucket 20 must resolve differently under gp=2 ({run0}) and gp=3 ({run1}); \
@@ -1944,6 +1965,30 @@ pub(crate) mod tests {
             format!("{unpinned:?}"),
             "pinning run 0 must not change the result, nor add a __run__ label"
         );
+        // `__run__` routes as "0" for the one run: a matcher selecting "0"
+        // reads it, at the query and in `columns()`, and one that does not
+        // reads nothing.
+        for (selector, kept) in [
+            ("__run__!=\"1\"", true),
+            ("__run__=~\"0|\"", true),
+            ("__run__!=\"\"", true),
+            ("__run__=\"\"", false),
+            ("__run__!=\"0\"", false),
+        ] {
+            let q = format!("histogram_mean(latency{{{selector}}})");
+            let got = r.query_range(&q, 1.0, 4.0, 1.0).unwrap();
+            let cols = r.columns(&q).unwrap();
+            if kept {
+                assert_eq!(format!("{got:?}"), format!("{unpinned:?}"), "{q}");
+                assert!(cols.contains("latency:buckets"), "{q}: {cols:?}");
+            } else {
+                assert!(cols.is_empty(), "{q}: {cols:?}");
+                let crate::QueryResult::Matrix { result, .. } = got else {
+                    panic!("{q}: not a matrix");
+                };
+                assert!(result.is_empty(), "{q}: {result:?}");
+            }
+        }
 
         // Any other run genuinely has no data, at both entry points.
         assert!(r

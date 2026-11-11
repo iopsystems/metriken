@@ -142,16 +142,17 @@ impl Labels {
 ///
 /// A filter ([`Labels::matches`]) holds one matcher per label, encoded in the
 /// value: [`MatchOp::encode`] writes it and [`Labels::matches`] reads it.
+/// The value of a label the series does not carry is `""`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MatchOp {
     /// `=`: the value equals the operand.
     Equal,
-    /// `!=`: the value does not equal the operand, or the label is absent.
+    /// `!=`: the value does not equal the operand.
     NotEqual,
     /// `=~`: the value matches the operand, a regular expression anchored at
     /// both ends.
     Regex,
-    /// `!~`: the value does not match the operand, or the label is absent.
+    /// `!~`: the value does not match the operand.
     NotRegex,
 }
 
@@ -277,32 +278,20 @@ impl From<&mut dyn Iterator<Item = (&str, &str)>> for Labels {
 impl Labels {
     /// Whether this label set satisfies every matcher of the filter `other`,
     /// one per label, encoded as [`MatchOp::encode`] writes them. A label
-    /// this set does not carry fails `=` and `=~` and passes `!=` and `!~`.
+    /// this set does not carry has the value `""`, as in Prometheus: it
+    /// passes `=""`, `!="a"` and any `=~` whose pattern matches `""`, and
+    /// fails `!=""` and any `!~` whose pattern matches `""`.
     pub fn matches(&self, other: &Labels) -> bool {
-        for (label, value) in other.inner.iter() {
+        other.inner.iter().all(|(label, value)| {
+            let v = self.inner.get(label).map(String::as_str).unwrap_or("");
             if let Some(pattern) = value.strip_prefix('!') {
-                if let Some(v) = self.inner.get(label) {
-                    if match_pattern(v, pattern) {
-                        return false;
-                    }
-                }
+                !match_pattern(v, pattern)
             } else if let Some(pattern) = value.strip_prefix('~') {
-                let Some(v) = self.inner.get(label) else {
-                    return false;
-                };
-                if !match_pattern(v, pattern) {
-                    return false;
-                }
-            } else if let Some(v) = self.inner.get(label) {
-                let operand = value.strip_prefix('=').unwrap_or(value);
-                if v != operand {
-                    return false;
-                }
+                match_pattern(v, pattern)
             } else {
-                return false;
+                v == value.strip_prefix('=').unwrap_or(value)
             }
-        }
-        true
+        })
     }
 }
 
@@ -358,14 +347,22 @@ mod tests {
         }
     }
 
-    /// A series without the label: only the negative operators match it.
+    /// A series without the label has the value `""`, as in Prometheus.
     #[test]
-    fn an_absent_label_matches_only_a_negative_matcher() {
+    fn an_absent_label_matches_as_the_empty_string() {
         let none = Labels::from([("other", "a")]);
         assert!(!none.matches(&filter(MatchOp::Equal, "a")));
-        assert!(!none.matches(&filter(MatchOp::Regex, ".*")));
+        assert!(none.matches(&filter(MatchOp::Equal, "")));
         assert!(none.matches(&filter(MatchOp::NotEqual, "a")));
+        assert!(!none.matches(&filter(MatchOp::NotEqual, "")));
+        assert!(none.matches(&filter(MatchOp::Regex, ".*")));
+        assert!(none.matches(&filter(MatchOp::Regex, "a|")));
+        assert!(!none.matches(&filter(MatchOp::Regex, "a")));
+        assert!(!none.matches(&filter(MatchOp::Regex, ".+")));
         assert!(none.matches(&filter(MatchOp::NotRegex, "a")));
+        assert!(none.matches(&filter(MatchOp::NotRegex, ".+")));
+        assert!(!none.matches(&filter(MatchOp::NotRegex, ".*")));
+        assert!(!none.matches(&filter(MatchOp::NotRegex, "a|")));
     }
 
     /// A pattern that does not compile matches nothing, so `!~` with it

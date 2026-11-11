@@ -37,9 +37,10 @@ pub enum SourceSelector {
     /// writes it. `~re` and `!re` are regular expressions anchored at both
     /// ends (`=~` and `!~`; `!=` is `!` with the value escaped as a regex),
     /// and any other value is compared whole after one leading `=` is
-    /// removed. `k=v` and `k=~re` do not match a source without `k`; `!=`
-    /// and `!~` do. A pattern that does not compile matches no value, so
-    /// `~` with it selects no source and `!` selects every source.
+    /// removed. A source without `k` has the value `""` for `k`, so `k=""`
+    /// and `k!="v"` match it and `k!=""` does not. A pattern that does not
+    /// compile matches no value, so `~` with it selects no source and `!`
+    /// selects every source.
     ///
     /// [`MatchOp::encode`]: crate::MatchOp::encode
     Matching(Labels),
@@ -275,6 +276,31 @@ mod tests {
         );
         let other = map(&[("source", "b")]);
         assert_eq!(overlay.apply(&other, Some("u2")), other);
+    }
+
+    /// A selector's matcher takes a label the source does not carry as
+    /// `""`: `host=""` selects a source without `host`, and `host!=""`
+    /// does not.
+    #[test]
+    fn a_selector_takes_an_absent_label_as_empty() {
+        let selecting = |op: crate::MatchOp, operand: &str| {
+            LabelOverlay::new(vec![entry(
+                SourceSelector::Matching(Labels::from(map(&[("host", &op.encode(operand))]))),
+                &[("arm", "x")],
+            )])
+            .unwrap()
+        };
+        let without = map(&[("source", "a")]);
+        let with = map(&[("source", "a"), ("host", "h")]);
+        let set = |overlay: &LabelOverlay, stored: &BTreeMap<String, String>| {
+            overlay.apply(stored, None).contains_key("arm")
+        };
+        let empty = selecting(crate::MatchOp::Equal, "");
+        assert!(set(&empty, &without));
+        assert!(!set(&empty, &with));
+        let present = selecting(crate::MatchOp::NotEqual, "");
+        assert!(!set(&present, &without));
+        assert!(set(&present, &with));
     }
 
     /// An entry setting or removing a label the reader or engine assigns,
