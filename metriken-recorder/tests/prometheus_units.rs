@@ -652,3 +652,76 @@ fn a_description_is_kept_under_the_exporters_name() {
         BTreeMap::from([("rpc_ms".to_string(), "Latency.".to_string())])
     );
 }
+
+/// `metric_unit` answers a metric's `unit` storage key, recorded and live:
+/// a `_seconds` gauge, counter and histogram are `seconds`, a `_ms` gauge
+/// `milliseconds`, a `# UNIT` line's metric its line's unit; a `_count`, a
+/// name without a unit and a name the source does not hold are `None`.
+#[test]
+fn metric_unit_is_the_stored_unit() {
+    let dir = tempfile::tempdir().unwrap();
+    let reader = recorded(&dir.path().join("a.dendro"));
+    let store = live();
+    for source in [&reader as &dyn MetricsSource, &store] {
+        for (name, want) in [
+            ("lag_seconds", Some("seconds")),
+            ("busy_seconds_total", Some("seconds")),
+            ("rpc_seconds", Some("seconds")),
+            ("rpc_seconds_sum", Some("seconds")),
+            ("wait_ms", Some("milliseconds")),
+            ("mem_bytes", Some("bytes")),
+            ("cpu_percent", Some("percent")),
+            ("queue", Some("seconds")),
+            ("q_ms", Some("milliseconds")),
+            ("rpc_seconds_count", None),
+            ("rpc_seconds_overflow", None),
+            ("plain_total", None),
+            ("absent_seconds", None),
+        ] {
+            assert_eq!(source.metric_unit(name).as_deref(), want, "{name}");
+        }
+    }
+}
+
+/// `lag` with a `# UNIT` line, in `unit`, served with label `src`.
+fn lag_in(src: &'static str, unit: &'static str) -> impl Fn(u64) -> String {
+    move |_| format!("# TYPE lag gauge\n# UNIT lag {unit}\nlag{{src=\"{src}\"}} 1\n")
+}
+
+/// A metric whose series carry two units, in two recordings of an archive
+/// or two endpoints feeding one live store, has no one unit: `None`; so
+/// does one whose series are partly without a unit. Two recordings in one
+/// unit answer it.
+#[test]
+fn a_metric_with_two_units_has_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (lag_in("a", "seconds"), lag_in("b", "ms"));
+    let mixed = record(&dir.path().join("mixed.dendro"), &[("a", &a), ("b", &b)]);
+    assert_eq!(mixed.metric_unit("lag"), None);
+    // A recording whose `lag` has no unit beside one in seconds.
+    let plain = |_: u64| "# TYPE lag gauge\nlag{src=\"p\"} 1\n".to_string();
+    let partly = record(
+        &dir.path().join("partly.dendro"),
+        &[("a", &a), ("p", &plain)],
+    );
+    assert_eq!(partly.metric_unit("lag"), None);
+    let same = record(&dir.path().join("same.dendro"), &[("a", &a), ("c", &a)]);
+    assert_eq!(same.metric_unit("lag").as_deref(), Some("seconds"));
+
+    let store = metriken_query::MemoryStore::builder()
+        .sampling_interval_ms(1000)
+        .build();
+    let (mut ca, mut cb) = (PrometheusConverter::new(), PrometheusConverter::new());
+    for t in 0..3 {
+        let ts = BASE + t * S;
+        for (c, text) in [(&mut ca, a(t)), (&mut cb, b(t))] {
+            let mut snapshot = c.convert(&text, ts - S / 2, ts);
+            let Snapshot::V3(v3) = &mut snapshot else {
+                panic!("a scrape is a V3 snapshot")
+            };
+            v3.systemtime = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(ts);
+            store.ingest_snapshot(snapshot);
+        }
+    }
+    assert_eq!(store.metric_unit("lag"), None);
+}

@@ -279,6 +279,25 @@ impl DataSource for LazySource {
             .unwrap_or_default()
     }
 
+    /// Loads the source only when the catalog holds `name`, as
+    /// [`duplicated_series`](Self::duplicated_series) does.
+    fn metric_units(&self, name: &str) -> Vec<Option<String>> {
+        let held = [
+            &self.catalog.counters,
+            &self.catalog.gauges,
+            &self.catalog.histograms,
+            &self.catalog.gauge_histograms,
+        ]
+        .into_iter()
+        .any(|names| names.contains(name));
+        if !held {
+            return Vec::new();
+        }
+        self.loaded()
+            .map(|s| s.metric_units(name))
+            .unwrap_or_default()
+    }
+
     fn file_metadata(&self) -> HashMap<String, String> {
         self.catalog.metadata.clone()
     }

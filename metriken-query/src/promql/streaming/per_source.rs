@@ -1524,6 +1524,9 @@ impl DataSource for Tap {
     fn duplicated_series(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.inner.duplicated_series(name)
     }
+    fn metric_units(&self, name: &str) -> Vec<Option<String>> {
+        self.inner.metric_units(name)
+    }
     fn file_metadata(&self) -> HashMap<String, String> {
         self.inner.file_metadata()
     }
@@ -1815,6 +1818,9 @@ impl DataSource for GroupSource {
     }
     fn duplicated_series(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.listing(|s| s.duplicated_series(name))
+    }
+    fn metric_units(&self, name: &str) -> Vec<Option<String>> {
+        metriken_storage::source::merge_units(self.sources.iter().map(|s| s.metric_units(name)))
     }
     fn file_metadata(&self) -> HashMap<String, String> {
         self.sources[0].file_metadata()

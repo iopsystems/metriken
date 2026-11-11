@@ -100,6 +100,14 @@ from the two histogram heatmap fixes below.
   a struct literal of `HistogramRow` must add the field. `Memory` gains
   `set_histogram_scale(name, labels, ts, scale)`, which sets a series'
   scale from its row at `ts` on.
+- **Added:** `DataSource::metric_units(name)`, the distinct values of the
+  `unit` storage key on metric `name`'s columns, sorted, `None` for a
+  column without one; empty by default and for a name the source does not
+  hold. The parquet, segmented, lazy, labeled, recordings and union
+  sources and `Memory` answer it, `ArchiveReader::metric_units` merges it
+  over every table holding the name, and `source::merge_units` merges
+  several sources' answers. `Memory::set_unit(name, labels, unit)` records
+  a series' unit, the latest call holding.
 - **Docs:** `SCALE_KEY` says the factor applies to the exporter's bounds
   in the column's `unit` and to `OVERFLOW_BOUND_KEY`, and that
   metriken-query divides by it.
@@ -120,6 +128,15 @@ from the two histogram heatmap fixes below.
   changed scale within the range) is refused with an `EvaluationError`
   naming the two scales, since their buckets cannot be added; a label
   matcher selecting series of one scale reads them.
+- **Added:** `MetricsSource::metric_unit(name)`, the `unit` storage key of
+  metric `name` (for a Prometheus series, a value of
+  `metriken_storage::prometheus_units::UNITS`), for a catalog to format a
+  metric by. `Some` only when every column of `name`, in every recording
+  and table, carries one and the same unit; `None` when the source does
+  not hold `name`, a column has none, or two differ. Answered by
+  `ArchiveReader`, `ParquetReader`, `SegmentedParquetReader`,
+  `UnionMetricsSource` and `MemoryStore`, whose ingest records each
+  series' unit from its snapshot metadata; `None` by default.
 - **Breaking:** `HistogramHeatmapResult::bucket_bounds` is `Vec<f64>`, in
   the histogram's unit, where it was `Vec<u64>` in its stored units. In
   JSON it is an array of finite numbers (`[0.001, 0.002, …]`; a whole

@@ -104,6 +104,7 @@ impl Selection {
     /// A filter for each branch, of its matchers: a series a branch
     /// selects passes that branch's filter. For a selector without `or`,
     /// `filter` alone. Empty when no branch can select the selector's name.
+    #[cfg_attr(not(feature = "archive"), allow(dead_code))]
     pub(crate) fn branch_filters(&self) -> Vec<Labels> {
         match &self.branches {
             None => vec![self.filter.clone()],

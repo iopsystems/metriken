@@ -530,6 +530,9 @@ struct OpenState {
     /// one kind carries within one segment (see
     /// [`DataSource::duplicated_series`]), sorted and deduplicated.
     duplicated: HashMap<String, Vec<BTreeMap<String, String>>>,
+    /// name -> the distinct `unit` values of its columns in every segment
+    /// folded in ([`DataSource::metric_units`]), sorted.
+    units: HashMap<String, Vec<Option<String>>>,
 }
 
 impl OpenState {
@@ -545,6 +548,23 @@ impl OpenState {
         let columns = SegmentColumns::of(seg).map_err(|e| format!("segment {idx}: {e}"))?;
         self.listing
             .fold(idx, &columns, relabel, memo, &mut unresolved);
+        let names: std::collections::BTreeSet<&String> = [
+            &columns.counters,
+            &columns.gauges,
+            &columns.histograms,
+            &columns.gauge_histograms,
+            &columns.float_counters,
+            &columns.float_gauges,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|(name, _)| name)
+        .collect();
+        for name in names {
+            let held = self.units.entry(name.clone()).or_default();
+            let merged = crate::source::merge_units([std::mem::take(held), seg.metric_units(name)]);
+            *held = merged;
+        }
         // A label set two columns carry is a duplicate where the segment's
         // statistics show the columns hold values in one row; a series
         // whose bound or value type changed mid-segment is two columns
@@ -2092,6 +2112,10 @@ impl DataSource for SegmentedSource {
 
     fn duplicated_series(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.state.duplicated.get(name).cloned().unwrap_or_default()
+    }
+
+    fn metric_units(&self, name: &str) -> Vec<Option<String>> {
+        self.state.units.get(name).cloned().unwrap_or_default()
     }
 
     fn file_metadata(&self) -> HashMap<String, String> {

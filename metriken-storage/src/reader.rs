@@ -2397,6 +2397,19 @@ impl ArchiveReader {
         )
     }
 
+    /// The distinct `unit` storage key values of metric `name`'s columns,
+    /// of any kind, in every table of every recording holding it, sorted
+    /// ([`DataSource::metric_units`]). Opens those tables.
+    pub fn metric_units(&self, name: &str) -> Vec<Option<String>> {
+        crate::source::merge_units(
+            self.tables
+                .iter()
+                .filter(|t| t.holds(name))
+                .filter_map(|t| t.reader())
+                .map(|r| r.source().metric_units(name)),
+        )
+    }
+
     /// The label sets of gauge `name`, as [`counter_labels`](Self::counter_labels).
     pub fn gauge_labels(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.labeled_listing(|t| t.names.gauges.contains(name), MetricKind::Gauge, name)

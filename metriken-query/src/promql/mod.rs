@@ -1263,6 +1263,10 @@ impl QueryEngine {
         self.source.file_metadata()
     }
 
+    pub(crate) fn metric_units(&self, name: &str) -> Vec<Option<String>> {
+        self.source.metric_units(name)
+    }
+
     /// Look up a single metadata value by key without cloning the full map.
     pub(crate) fn metadata_get(&self, key: &str) -> Option<String> {
         self.source.metadata_get(key)

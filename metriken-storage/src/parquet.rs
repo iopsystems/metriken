@@ -347,6 +347,10 @@ impl DataSource for MultiParquetSource {
         self.injected_labels(|pf| pf.duplicated_series(name))
     }
 
+    fn metric_units(&self, name: &str) -> Vec<Option<String>> {
+        crate::source::merge_units(self.files.iter().map(|(pf, _)| pf.metric_units(name)))
+    }
+
     fn column_map(
         &self,
     ) -> std::collections::HashMap<String, std::collections::HashMap<Labels, String>> {
@@ -868,6 +872,10 @@ pub struct ParquetSource {
     columns: OnceLock<Vec<ColDesc>>,
     /// [`ParquetSource::duplicated`], computed on first use from `meta`.
     duplicated: OnceLock<Vec<(String, Labels)>>,
+    /// Per metric name, its columns' distinct `unit` values
+    /// ([`DataSource::metric_units`]), computed on first use from the
+    /// columns, so a lookup per name is not a scan of every column.
+    units: OnceLock<HashMap<String, Vec<Option<String>>>>,
     /// The `timestamp` and `duration` column positions, resolved once.
     ///
     /// `Schema::index_of` scans the fields by name and, when the name is
@@ -1054,6 +1062,10 @@ impl DataSource for FileSource {
 
     fn duplicated_series(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
         self.0.duplicated_of(name)
+    }
+
+    fn metric_units(&self, name: &str) -> Vec<Option<String>> {
+        self.0.units_of(name)
     }
 
     fn file_metadata(&self) -> std::collections::HashMap<String, String> {
@@ -1442,6 +1454,28 @@ impl ParquetSource {
         sets
     }
 
+    /// Metric `name`'s columns' distinct `unit` values
+    /// ([`DataSource::metric_units`]).
+    pub(crate) fn units_of(&self, name: &str) -> Vec<Option<String>> {
+        self.units
+            .get_or_init(|| {
+                let mut out: HashMap<String, Vec<Option<String>>> = HashMap::new();
+                for col in self.columns() {
+                    let units = out.entry(col.name.clone()).or_default();
+                    if !units.contains(&col.unit) {
+                        units.push(col.unit.clone());
+                    }
+                }
+                for units in out.values_mut() {
+                    units.sort();
+                }
+                out
+            })
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// The label sets of metric `name` in [`duplicated`](Self::duplicated).
     fn duplicated_of(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
         let mut sets: Vec<std::collections::BTreeMap<String, String>> = self
@@ -1540,6 +1574,7 @@ impl ParquetSource {
             pool: None,
             columns: OnceLock::new(),
             duplicated: OnceLock::new(),
+            units: OnceLock::new(),
             fixed_cols: OnceLock::new(),
             occupant_col: OnceLock::new(),
             page_meta: OnceLock::new(),
@@ -1558,6 +1593,7 @@ impl ParquetSource {
             pool: None,
             columns: OnceLock::new(),
             duplicated: OnceLock::new(),
+            units: OnceLock::new(),
             fixed_cols: OnceLock::new(),
             occupant_col: OnceLock::new(),
             page_meta: OnceLock::new(),
@@ -1576,6 +1612,7 @@ impl ParquetSource {
             pool: None,
             columns: OnceLock::new(),
             duplicated: OnceLock::new(),
+            units: OnceLock::new(),
             fixed_cols: OnceLock::new(),
             occupant_col: OnceLock::new(),
             page_meta: OnceLock::new(),
@@ -1595,6 +1632,7 @@ impl ParquetSource {
             pool: Some(pool),
             columns: OnceLock::new(),
             duplicated: OnceLock::new(),
+            units: OnceLock::new(),
             fixed_cols: OnceLock::new(),
             occupant_col: OnceLock::new(),
             page_meta: OnceLock::new(),
@@ -1626,6 +1664,7 @@ impl ParquetSource {
             pool: Some(pool),
             columns: OnceLock::new(),
             duplicated: OnceLock::new(),
+            units: OnceLock::new(),
             fixed_cols: OnceLock::new(),
             occupant_col: OnceLock::new(),
             page_meta: OnceLock::new(),
@@ -1647,6 +1686,7 @@ impl ParquetSource {
             pool: Some(pool),
             columns: OnceLock::new(),
             duplicated: OnceLock::new(),
+            units: OnceLock::new(),
             fixed_cols: OnceLock::new(),
             occupant_col: OnceLock::new(),
             page_meta: OnceLock::new(),
@@ -1972,6 +2012,8 @@ pub struct ColDesc {
     /// its bucket bounds are its values times. 1 when the key is absent,
     /// does not parse, or is not a finite positive number.
     scale: f64,
+    /// The column's `unit` storage key, if it has one.
+    unit: Option<String>,
 }
 
 /// Resolve one metric's acquisition-window sidecar columns as an ATOMIC
@@ -2155,6 +2197,7 @@ fn parse_schema(pf: &ParquetSource, ts_col_idx: usize) -> Vec<ColDesc> {
                 occupant: None,
                 overflow,
                 scale,
+                unit: meta.get("unit").cloned(),
             })
         })
         .collect::<Vec<_>>();

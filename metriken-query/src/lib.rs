@@ -323,6 +323,16 @@ fn matching(
         .collect()
 }
 
+/// The one unit of `units` ([`DataSource::metric_units`]), as
+/// [`MetricsSource::metric_unit`] answers: `Some` only when it is a single
+/// `Some`.
+pub(crate) fn one_unit(mut units: Vec<Option<String>>) -> Option<String> {
+    match units.len() {
+        1 => units.pop().flatten(),
+        _ => None,
+    }
+}
+
 /// Public trait expressing the full read-only capability of a metrics source.
 ///
 /// Implement this trait to expose a uniform interface for PromQL queries,
@@ -446,6 +456,18 @@ pub trait MetricsSource: Send + Sync {
     /// Look up a single metadata value by key. Avoids cloning the full
     /// metadata map when callers only need one entry.
     fn metadata_get(&self, key: &str) -> Option<String>;
+
+    /// The unit of metric `name`: the `unit` storage key its columns carry
+    /// (`seconds`, `bytes`, `percent`, …; for a Prometheus series, a value
+    /// of `metriken_storage::prometheus_units::UNITS`). `Some` only when
+    /// every column of `name`, of every series in every recording and
+    /// table the source holds, carries the same unit; `None` when the
+    /// source does not hold `name`, when a column has no unit, or when two
+    /// columns' units differ. `None` by default.
+    fn metric_unit(&self, name: &str) -> Option<String> {
+        let _ = name;
+        None
+    }
 
     /// Key-value metadata from the file footer.
     fn file_metadata(&self) -> std::collections::HashMap<String, String>;

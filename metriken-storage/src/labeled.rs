@@ -629,6 +629,10 @@ impl DataSource for LabeledSource {
         self.relabel_listing(self.inner.duplicated_series(name))
     }
 
+    fn metric_units(&self, name: &str) -> Vec<Option<String>> {
+        self.inner.metric_units(name)
+    }
+
     fn file_metadata(&self) -> HashMap<String, String> {
         self.inner.file_metadata()
     }

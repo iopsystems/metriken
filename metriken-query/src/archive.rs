@@ -911,6 +911,10 @@ fn precedence(opts: &QueryOptions) -> Precedence {
 }
 
 impl MetricsSource for ArchiveReader {
+    fn metric_unit(&self, name: &str) -> Option<String> {
+        crate::one_unit(ArchiveReader::metric_units(self, name))
+    }
+
     // ── Query methods: one engine over the recordings the query reaches. ──
     fn query_range_opts(
         &self,
