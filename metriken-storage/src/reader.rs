@@ -960,6 +960,9 @@ pub struct SamplerReader {
     /// WAL tail is materialized at open — so one read is enough, and the
     /// viewer holds its readers for the life of the process.
     row_timestamps: std::sync::OnceLock<Vec<u64>>,
+    /// Each metric name's columns' distinct `unit` values
+    /// ([`units`](SamplerReader::units)), read once.
+    units: std::sync::OnceLock<HashMap<String, Vec<Option<String>>>>,
 }
 
 impl SamplerReader {
@@ -1094,42 +1097,70 @@ impl SamplerReader {
         out
     }
 
-    /// The distinct `unit` values of metric `name`'s columns in the first
-    /// sealed segment, in store order, whose footer holds a column of
-    /// `name`: one footer read per segment tried, and the segmented reader
-    /// not built. `None` when no sealed segment holds `name` (its rows are
-    /// all in the WAL) or the segments cannot be read.
-    fn footer_units(&self, name: &str) -> Option<Vec<Option<String>>> {
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    /// Each metric name this table holds, with the distinct `unit` values
+    /// of its columns in the first part of the table, in store order, that
+    /// holds a column of it: a sealed segment, or the live WAL tail the
+    /// store materializes as its last part. Built on the first call and
+    /// kept for the reader's life, as its names are (fixed at open; a live
+    /// archive is re-opened to see what it gained since). Building it reads
+    /// the parts in order, each footer once, until every name the table
+    /// holds has been found, usually the first segment alone, and does not
+    /// build the table's reader. A name found in no part (the segments
+    /// cannot be read) is absent; [`ArchiveReader::metric_units`] then asks
+    /// the reader.
+    fn units(&self) -> &HashMap<String, Vec<Option<String>>> {
+        self.units.get_or_init(|| {
+            use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-        let store = match self.segments.store() {
-            Ok(Some(store)) => store,
-            Ok(None) => return None,
-            Err(e) => {
-                tracing::warn!("fetching segments for {}: {e}", self.sampler);
-                return None;
-            }
-        };
-        for idx in 0..store.len() {
-            let Ok(Some(bytes)) = store.bytes(idx) else {
-                continue;
+            let mut out: HashMap<String, Vec<Option<String>>> = HashMap::new();
+            // A name can be held as two kinds; it is one name here.
+            let wanted = [
+                &self.names.counters,
+                &self.names.gauges,
+                &self.names.histograms,
+                &self.names.gauge_histograms,
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+            let store = match self.segments.store() {
+                Ok(Some(store)) => store,
+                Ok(None) => return out,
+                Err(e) => {
+                    tracing::warn!("fetching segments for {}: {e}", self.sampler);
+                    return out;
+                }
             };
-            let Ok(builder) = ParquetRecordBatchReaderBuilder::try_new(bytes) else {
-                continue;
-            };
-            let units: Vec<Option<String>> = builder
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| f.metadata())
-                .filter(|meta| meta.get("metric").map(String::as_str) == Some(name))
-                .map(|meta| meta.get("unit").cloned())
-                .collect();
-            if !units.is_empty() {
-                return Some(crate::source::merge_units([units]));
+            for idx in 0..store.len() {
+                if out.len() >= wanted {
+                    break;
+                }
+                let Ok(Some(bytes)) = store.bytes(idx) else {
+                    continue;
+                };
+                let Ok(builder) = ParquetRecordBatchReaderBuilder::try_new(bytes) else {
+                    continue;
+                };
+                let mut here: HashMap<String, Vec<Option<String>>> = HashMap::new();
+                for field in builder.schema().fields() {
+                    let meta = field.metadata();
+                    let Some(name) = meta.get("metric") else {
+                        continue;
+                    };
+                    if out.contains_key(name) || !self.names.holds(name) {
+                        continue;
+                    }
+                    here.entry(name.clone())
+                        .or_default()
+                        .push(meta.get("unit").cloned());
+                }
+                for (name, units) in here {
+                    out.insert(name, crate::source::merge_units([units]));
+                }
             }
-        }
-        None
+            out
+        })
     }
 
     /// The label sets of `name`, a metric of `kind`, as the table's
@@ -2189,6 +2220,7 @@ impl ArchiveReader {
                     occupant_segments: std::sync::Mutex::new(OccupantSegments::new()),
                     keep: std::sync::atomic::AtomicBool::new(false),
                     row_timestamps: std::sync::OnceLock::new(),
+                    units: std::sync::OnceLock::new(),
                 }));
             }
 
@@ -2349,6 +2381,7 @@ impl ArchiveReader {
                     occupant_segments: std::sync::Mutex::new(OccupantSegments::new()),
                     keep: std::sync::atomic::AtomicBool::new(false),
                     row_timestamps: std::sync::OnceLock::new(),
+                    units: std::sync::OnceLock::new(),
                 }));
             }
             sources.push(SourceInfo::new(
@@ -2439,15 +2472,18 @@ impl ArchiveReader {
     /// of any kind, in every table of every recording holding it, sorted
     /// ([`DataSource::metric_units`]).
     ///
-    /// Each table holding `name` answers from the footer of its first
-    /// sealed segment holding a column of `name`, without building its
-    /// reader: one footer read per segment tried, usually one per table.
-    /// A unit that changed in a later segment of the same table is not
-    /// seen. A table whose rows of `name` are all in the WAL builds its
-    /// reader and answers from it.
+    /// Each table holding `name` answers from a map of its names' units
+    /// built on the table's first such call and kept for the reader's life:
+    /// the footer of the first part of the table, sealed segment or the
+    /// live WAL tail, holding a column of each name, read once per table,
+    /// usually the first segment alone, without building the table's
+    /// reader. A unit that changed in a later part of the same table is not
+    /// seen. A table whose parts cannot be read answers from its reader.
     pub fn metric_units(&self, name: &str) -> Vec<Option<String>> {
         crate::source::merge_units(self.tables.iter().filter(|t| t.holds(name)).map(|t| {
-            t.footer_units(name)
+            t.units()
+                .get(name)
+                .cloned()
                 .or_else(|| t.reader().map(|r| r.source().metric_units(name)))
                 .unwrap_or_default()
         }))

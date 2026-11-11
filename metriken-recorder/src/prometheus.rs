@@ -511,6 +511,16 @@ fn convert_histogram(
 
     let scale = histogram_scale(unit, finite_buckets.iter().map(|b| b.less_than));
     let scaled = |bound: f64| (bound * scale).round();
+    if let Some(b) = finite_buckets
+        .iter()
+        .find(|b| b.less_than != 0.0 && scaled(b.less_than) == 0.0)
+    {
+        debug!(
+            "{metric_name}: bound {} rounds to 0 at scale {scale}, below the histogram's \
+             resolution; its observations are counted at 0",
+            b.less_than
+        );
+    }
 
     // max_value_power must cover the largest scaled value
     let max_scaled = finite_buckets
@@ -592,6 +602,12 @@ const MAX_SCALE: f64 = 1e9;
 /// smallest power of 10, at most [`MAX_SCALE`], that makes every finite
 /// bound an integer within a relative 1e-9: `0.1, 0.25, 0.5` take 100.
 /// The overflow bound is the highest finite bound, so it is one of them.
+///
+/// A time histogram's resolution is therefore 1 ns: a bound below it (a
+/// `_ns` bound of 0.4, a `_us` bound below 0.0005, a `_ms` bound below
+/// 5e-7, a `_seconds` bound below 5e-10) rounds to 0, its observations are
+/// counted at 0, and `convert_histogram` logs it at `debug`. Any other
+/// histogram's bound below 5e-10 rounds to 0 at [`MAX_SCALE`] likewise.
 fn histogram_scale(unit: Option<&str>, bounds: impl Iterator<Item = f64> + Clone) -> f64 {
     match unit {
         Some("seconds") => return 1e9,
@@ -835,6 +851,9 @@ mod tests {
         assert_eq!(scale(Some("milliseconds"), &[0.5]), 1e6);
         assert_eq!(scale(Some("microseconds"), &[0.5]), 1e3);
         assert_eq!(scale(Some("nanoseconds"), &[100.0]), 1.0);
+        // Below a time unit's 1 ns resolution: the scale stays fixed, and
+        // the bound rounds to 0.
+        assert_eq!(scale(Some("nanoseconds"), &[0.4, 0.8]), 1.0);
         assert_eq!(scale(None, &[1.0, 5.0, 10.0]), 1.0);
         assert_eq!(scale(None, &[0.1, 0.25, 0.5]), 100.0);
         assert_eq!(scale(None, &[0.0003, 0.0006]), 10_000.0);

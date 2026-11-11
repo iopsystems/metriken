@@ -408,9 +408,9 @@ metriken-charts 0.1.4 (fix; 0.1.3 is #390): its `STORAGE_KEYS` copy
 The owner reversed the design: every Prometheus series is stored under the
 exporter's name in the exporter's units, and the `unit` key names that unit
 (`metriken_storage::prometheus_units::UNITS`). The owner's reason: store
-series as the exporter serves them, without renaming or rescaling, so a
-metric's name is the one its exporter documents and no reader has to know
-a rename to find it. Removed with it:
+series as the exporter serves them, without renaming them or changing the
+values a query returns, so a metric's name is the one its exporter
+documents and no reader has to know a rename to find it. Removed with it:
 `__prometheus_name__`, metriken-query's exporter-name fallback and its
 ambiguity error, and the collision path. No compatibility path reads
 recordings made with the rewrite; only unreleased rezolus wrote them.

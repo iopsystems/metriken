@@ -53,6 +53,8 @@ from the two histogram heatmap fixes below.
 
 ### metriken-recorder (unreleased)
 
+Requires metriken-storage's unreleased `prometheus_units` (below).
+
 - **Breaking:** a recording no longer fails when its last source fails or
   is refused. When a source fails (`Event::SourceFailed`) or is refused and
   no source is left `Pending`, `Activating` or `Active`, the recorder emits
@@ -74,8 +76,6 @@ from the two histogram heatmap fixes below.
   (`Event::SourceFailed`, "its pass panicked: …"); the other sources keep
   recording. Before, the panic failed the recording (`Event::Failed`) and
   left the archive unfinalized.
-Requires metriken-storage's unreleased `prometheus_units` above.
-
 - **Breaking:** the Prometheus converter stores every series under the
   name the exporter serves it as, with the value it serves: a
   `_seconds` series in seconds, a `_ms` series in milliseconds, a `_bits`
@@ -101,7 +101,11 @@ Requires metriken-storage's unreleased `prometheus_units` above.
   histogram takes the smallest power of 10, at most 1e9, that makes every
   finite bound an integer (0.1, 0.25, 0.5 take 100; 0.0003 takes 10_000).
   The overflow bound takes the same scale. Two bounds that land in one
-  bucket of the `histogram` crate add their observations there.
+  bucket of the `histogram` crate add their observations there. A time
+  histogram's resolution is 1 ns: a bound below half a nanosecond (a
+  `_ns` bound of 0.4, a `_us` bound below 0.0005, a `_ms` bound below
+  5e-7) rounds to 0, its observations are counted at 0, and the converter
+  logs it at `debug`; so does any bound below 5e-10 at the cap.
   metriken-query divides by `scale`, so the histogram reads in its unit.
   Its `_sum` is in the exporter's unit, unscaled. The overflow series is
   `<exporter name>_overflow` (`rpc_seconds_overflow`).

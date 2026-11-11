@@ -465,12 +465,13 @@ pub trait MetricsSource: Send + Sync {
     /// source does not hold `name`, when a column has no unit, or when two
     /// columns' units differ.
     ///
-    /// An `ArchiveReader` reads one segment footer per table holding
-    /// `name` (more when the name first appears in a later segment) and
-    /// builds no table reader, except for a table whose rows of `name` are
-    /// all in the WAL; a unit that changed in a later segment of one table
-    /// is not seen. `None` by default, so a source wrapping another must
-    /// forward it.
+    /// An `ArchiveReader` answers from a map of each table's names' units,
+    /// built on the table's first call and kept: the footers of the
+    /// table's parts in order (sealed segments, then the live WAL tail)
+    /// until every name it holds is found, usually the first segment
+    /// alone, without building the table's reader. A unit that changed in
+    /// a later part of one table is not seen. `None` by default, so a
+    /// source wrapping another must forward it.
     fn metric_unit(&self, name: &str) -> Option<String> {
         let _ = name;
         None
