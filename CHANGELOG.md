@@ -15,15 +15,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   series lacked failed `=` and `=~` and passed `!=` and `!~` whatever the
   operand, so `l!~".*"` selected the series without `l`; nothing now tells
   an absent label from an empty value. This applies to every reader's
-  filter (parquet, segmented, memory, an archive's recording labels
-  through `LabeledSource`) and to an overlay's `SourceSelector::Matching`,
-  which now selects a source without `k` for `k=""`.
+  filter (parquet, segmented, memory, an archive's recording labels through
+  `LabeledSource`), except a segmented histogram's `__run__` (below), and
+  to an overlay's `SourceSelector::Matching`, which now selects a source
+  without `k` for `k=""`.
 - **Changed:** a `__run__` matcher of any operator selects a segmented
   histogram's runs, decided against each run's number (`"0"` for a
   histogram with one run), as `columns()` decides it: `__run__!="1"` and
   `__run__=~"0|"` read the one run, `__run__=""` reads none. A matcher that
   selects several runs, whose configs differ, reads none and logs a
-  warning. Before, a query read only `__run__="<n>"`.
+  warning. Before, a query read only `__run__="<n>"`. The filtered listing
+  of a histogram with one run still lists it without `__run__`, so takes
+  `__run__` as absent.
 - **Docs:** `ColumnRelabel` says a matcher of any operator on a key the
   relabelling supplies must be taken off the segment filter.
 

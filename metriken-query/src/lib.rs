@@ -514,7 +514,10 @@ pub trait MetricsSource: Send + Sync {
     }
 
     /// The label sets of histogram `name` that `filter` matches, as
-    /// [`counter_labels_matching`](Self::counter_labels_matching).
+    /// [`counter_labels_matching`](Self::counter_labels_matching). In a
+    /// segmented archive, a `__run__` matcher that selects several runs of
+    /// a histogram lists them all, though a query with it reads none; a
+    /// histogram with one run is listed without `__run__`.
     fn histogram_labels_matching(
         &self,
         name: &str,
