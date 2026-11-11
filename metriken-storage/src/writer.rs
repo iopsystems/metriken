@@ -90,6 +90,7 @@ pub struct ArchiveWriter {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct EncodeFailure {
+    /// The stream's name: a table, or a long table's `<table>/occupants`.
     pub stream: String,
     /// The encoder's error, from the stream's latest attempt.
     pub error: String,
@@ -278,8 +279,12 @@ impl ArchiveWriter {
     ///
     /// [`SourceRecorder::finalize`] seals the source's streams, discards
     /// every stream listed for it (see [`SourceRecorder::discard_streams`]),
-    /// and marks it complete, so a reader is never handed rows it cannot
-    /// decode.
+    /// and marks it complete, so a reader of the finalized archive meets no
+    /// rows it cannot decode. Until then, a reader that materializes the
+    /// live WAL tail fails on those rows.
+    ///
+    /// A panic in the encoder is caught and recorded like an error, except
+    /// in a build with `panic = "abort"`, where it aborts the process.
     ///
     /// [`encode_failures`]: Self::encode_failures
     pub fn create_isolated(path: &Path, config: WriterConfig) -> Result<Self, Error> {
@@ -1645,9 +1650,10 @@ impl SourceRecorder {
     /// Remove `streams` from this source: every row and segment of each,
     /// and of its table's occupant stream (or, for an occupant stream, of
     /// its table), and stop sealing them. For a stream whose rows cannot be
-    /// encoded (see [`ArchiveWriter::create_isolated`]): its unsealed rows
-    /// cannot be told apart from its sealed ones by dendro's retention, so
-    /// both go.
+    /// encoded (see [`ArchiveWriter::create_isolated`]). dendro's eviction
+    /// deletes a stream's segments and WAL rows older than a cutoff, so the
+    /// unsealed rows cannot be removed without the segments sealed before
+    /// them.
     pub fn discard_streams(&mut self, streams: &[String]) -> Result<(), Error> {
         let mut gone: HashSet<String> = HashSet::new();
         for stream in streams {

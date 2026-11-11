@@ -306,10 +306,13 @@ pub enum Event {
     /// passes, scrapes or frames are taken from it. Each failed table is
     /// removed from its recording, its earlier segments included, and the
     /// recording is finalized with its other tables. The other sources keep
-    /// recording. `reason` names each failed table and the encoder's error.
-    /// At most once per source; its state is then [`SourceState::Failed`].
+    /// recording; when none is left, every source having failed, the
+    /// recording fails ([`Event::Failed`], after this event). `reason` names
+    /// each failed table and the encoder's error. At most once per source;
+    /// its state is then [`SourceState::Failed`].
     SourceFailed { source: SourceId, reason: String },
-    /// The archive failed. The recorder has stopped ticking; what is on disk
+    /// The archive failed, or every source failed
+    /// ([`Event::SourceFailed`]). The recorder has stopped ticking; what is on disk
     /// holds every tick committed before the failure. [`Recorder::finish`]
     /// returns this error.
     Failed { error: String },
@@ -434,7 +437,8 @@ pub fn default_timeout(interval: Duration) -> Duration {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
-    /// The archive failed mid-run ([`Event::Failed`]), or at finalize.
+    /// The archive failed mid-run ([`Event::Failed`]), or at finalize; or
+    /// every source failed.
     Archive(String),
     /// No such source, one that was refused before it was recorded, or one
     /// that failed ([`Event::SourceFailed`]).
@@ -1583,8 +1587,9 @@ impl Driver {
             .await;
         match result {
             Some(Ok(dropped)) => {
-                for (i, reason) in dropped {
-                    self.drop_failed(i, reason);
+                self.drop_failed(dropped).await;
+                if self.failed.is_some() {
+                    return;
                 }
             }
             Some(Err(e)) => return self.fail(e).await,
@@ -1622,23 +1627,32 @@ impl Driver {
             .collect()
     }
 
-    /// Slot `i`'s recording was finalized without the tables its encoder
-    /// refused ([`drop_unencodable`]): stop recording it, and say why.
-    fn drop_failed(&mut self, i: usize, reason: String) {
-        let slot = &mut self.slots[i];
-        warn!(
-            "{}: its rows could not be written into a segment ({reason}); it stopped \
-             recording, and the other sources go on",
-            slot.label()
-        );
-        slot.state = SourceState::Failed;
-        slot.added = false;
-        #[cfg(feature = "http")]
-        if let Kind::Endpoint(ep) = &mut slot.kind {
-            ep.abort_tasks();
+    /// Each `(slot, reason)`'s recording was finalized without the tables
+    /// its encoder refused ([`drop_unencodable`]): stop recording the slot,
+    /// and emit [`Event::SourceFailed`]. When every source has then failed,
+    /// fail the recording with the last one's reason.
+    async fn drop_failed(&mut self, dropped: Vec<(usize, String)>) {
+        let mut last = None;
+        for (i, reason) in dropped {
+            let slot = &mut self.slots[i];
+            let label = slot.label();
+            warn!("{label}: its rows could not be written into a segment ({reason}); it stopped recording");
+            slot.state = SourceState::Failed;
+            slot.added = false;
+            #[cfg(feature = "http")]
+            if let Kind::Endpoint(ep) = &mut slot.kind {
+                ep.abort_tasks();
+            }
+            let source = slot.id;
+            last = Some(format!("{label}: {reason}"));
+            self.emitter.must(Event::SourceFailed { source, reason });
         }
-        let source = slot.id;
-        self.emitter.must(Event::SourceFailed { source, reason });
+        if let Some(last) = last {
+            if self.slots.iter().all(|s| s.state == SourceState::Failed) {
+                self.fail(format!("every source failed; the last: {last}"))
+                    .await;
+            }
+        }
     }
 
     /// Stage `snapshot` for slot `i`.
@@ -1945,7 +1959,10 @@ impl Driver {
     /// epoch, anchor, served interval, restarts and replies), take the
     /// handshake, add a source with the caller's labels, metadata and patches,
     /// and ask the probe hook about the new producer on the following ticks.
-    /// `Ok(false)` when the commit failed, which `commit` has reported.
+    /// `Ok(false)` when the commit failed, or the source failed at it
+    /// (`commit` reported both), or the old recording's final seal found a
+    /// table it could not encode: the source is then dropped as a failure
+    /// found at a commit drops it, and no new recording is added.
     #[cfg(feature = "http")]
     async fn new_source(&mut self, i: usize, handshake: &Handshake) -> Result<bool, String> {
         // The new producer is on the port, so the hook is not asked about
@@ -1972,12 +1989,11 @@ impl Driver {
             .await
             .unwrap_or_else(|| Err("the archive is closed".to_string()))?;
         if !unencodable.is_empty() {
-            warn!(
-                "{}: the recording that ended at the producer change was finalized without \
-                 tables that could not be written into a segment ({})",
-                self.slots[i].label(),
-                unencodable_reason(&unencodable)
-            );
+            // A failure found one tick earlier would have dropped the
+            // source; one found at this seal drops it the same way.
+            self.drop_failed(vec![(i, unencodable_reason(&unencodable))])
+                .await;
+            return Ok(false);
         }
         let old = std::mem::take(&mut self.slots[i].maps);
         self.forget_labels(i, &old.labels);
@@ -2178,8 +2194,9 @@ impl Driver {
         self.drop_archive().await;
         match finalized {
             Some(Ok(dropped)) => {
-                for (i, reason) in dropped {
-                    self.drop_failed(i, reason);
+                self.drop_failed(dropped).await;
+                if let Some(e) = &self.failed {
+                    return Err(Error::Archive(e.clone()));
                 }
                 Ok(Summary {
                     sources: self.slots.iter().map(Slot::summary).collect(),

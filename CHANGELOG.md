@@ -29,10 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`EncodeFailure`) once the writer thread has run the seal
   (`SourceRecorder::sync` waits for it).
   `SourceRecorder::finalize` in such an archive discards each failed
-  stream before it marks the source complete, so no reader is handed rows
-  it cannot decode. `SourceRecorder::discard_streams` removes streams
-  from a source; dendro's retention cannot tell a stream's unsealed rows
-  from its sealed ones, so its earlier segments go too.
+  stream before it marks the source complete, so a reader of the
+  finalized archive meets no rows it cannot decode. Until then, a reader
+  that materializes the live WAL tail fails on those rows.
+  `SourceRecorder::discard_streams` removes streams from a source. dendro's
+  eviction deletes a stream's segments and WAL rows older than a cutoff,
+  so the unsealed rows cannot be removed without the segments sealed
+  before them: a discarded stream's earlier segments go too. Under
+  `panic = "abort"`, an encoder panic aborts the process.
 
 ### metriken-query 0.48.2
 
@@ -75,10 +79,20 @@ Requires metriken-storage 0.11.2.
   recording is finalized with its other tables; its tasks are stopped,
   `Event::SourceFailed` names it and each failed table with the encoder's
   error, and its state is `SourceState::Failed`. A failure found at the
-  seal `Recorder::finish` makes is handled the same way. A patch to such
-  a source is an `Error::Source`. An error writing the archive itself
-  still fails the recording. A V1 or V2 snapshot from a local source
-  naming one metric of a sampler twice is one such input.
+  seal `Recorder::finish` makes, or at the seal that ends a recording at a
+  producer change (no new recording is then added), is handled the same
+  way. A patch to such a source is an `Error::Source`. A V1 or V2
+  snapshot from a local source naming one metric of a sampler twice is
+  one such input.
+- **Changed:** a caller with several sources now gets
+  `Event::SourceFailed` for such a source and the recording continues;
+  when every source has failed, it still gets `Event::Failed` (after the
+  last `SourceFailed`), and `Recorder::finish` returns `Error::Archive`.
+- **Known limit:** an error staging one source's pass (decoding a
+  streamed frame, or `SourceRecorder::stage` and `stage_streamed`) still
+  fails the recording for every source, as does any error from the
+  archive itself: a commit, a seal's transaction, retention's eviction,
+  a finalize or the final join.
 
 ### metriken-storage 0.11.1
 

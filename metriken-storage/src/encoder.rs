@@ -511,3 +511,40 @@ mod encode_after_tests {
             .is_none());
     }
 }
+
+#[cfg(test)]
+mod isolate_tests {
+    use super::*;
+
+    fn encoder(failures: Option<EncodeFailures>) -> Encoder {
+        Encoder::new(
+            LongStreams::default(),
+            false,
+            sealed_props(default_compression()),
+            failures,
+        )
+    }
+
+    /// No input makes the encoder panic, so the panic is the closure's.
+    #[test]
+    fn an_isolating_encoder_records_a_panic_and_gives_no_segment() {
+        let failures = EncodeFailures::default();
+        let encoder = encoder(Some(Arc::clone(&failures)));
+        let ctx = EncodeContext::new(7, "t");
+        let out = encoder.isolate(&ctx, || panic!("boom"));
+        assert!(matches!(out, Ok(None)));
+        let recorded = failures.lock().unwrap();
+        assert_eq!(
+            recorded[&7]["t"], "the encoder panicked: boom",
+            "{recorded:?}"
+        );
+    }
+
+    #[test]
+    fn an_encoder_that_does_not_isolate_returns_the_error() {
+        let encoder = encoder(None);
+        let ctx = EncodeContext::new(7, "t");
+        let out = encoder.isolate(&ctx, || Err("bad".into()));
+        assert_eq!(out.err().map(|e| e.to_string()).as_deref(), Some("bad"));
+    }
+}

@@ -2677,3 +2677,58 @@ fn an_unencodable_stream_fails_only_its_source_in_an_isolated_archive() {
     .unwrap();
     assert_eq!(readers.len(), 2);
 }
+
+/// A stream that sealed segments and then failed: the finalized archive
+/// holds no table for it, and the source is complete and readable.
+#[test]
+fn a_stream_that_sealed_and_then_failed_is_removed_with_its_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sealed-then-failed.dendro");
+    let config = WriterConfig {
+        seal: SealPolicy {
+            max_rows: 2,
+            ..SealPolicy::default()
+        },
+        ..WriterConfig::default()
+    };
+    let mut writer = ArchiveWriter::create_isolated(&path, config).unwrap();
+    let mut source = writer
+        .add_source(
+            [("source".to_string(), "late".to_string())].into(),
+            BTreeMap::new(),
+            BASE,
+        )
+        .unwrap();
+    let id = source.source_id();
+    // Ticks 1-4 encode, sealed as two segments; from tick 5 every row names
+    // `x` twice.
+    for t in 1..=8 {
+        let ts = BASE + t * S;
+        let staged = source.stage(&sampler_snapshot(t, t >= 5), ts, 0).unwrap();
+        writer.commit(vec![staged]).unwrap();
+        source.maybe_seal().unwrap();
+        source.sync().unwrap();
+        if t == 4 {
+            assert!(
+                writer.encode_failures(id).is_empty(),
+                "sealed through tick 4"
+            );
+        }
+    }
+    assert_eq!(writer.encode_failures(id).len(), 1);
+    source.finalize((BASE + 8 * S, 0)).unwrap();
+    writer.join().unwrap();
+
+    let catalog = DendroCatalog::open(&path).unwrap();
+    let sources = catalog.sources().unwrap();
+    assert_eq!(sources.len(), 1);
+    assert!(sources[0].complete);
+    assert!(
+        !catalog.tables(id).unwrap().iter().any(|t| t == "s"),
+        "{:?}",
+        catalog.tables(id).unwrap()
+    );
+    assert_eq!(catalog.segment_span(id, "s").unwrap().1.rows, 0);
+    assert_eq!(catalog.live_wal_span(id, "s").unwrap().rows, 0);
+    ArchiveReader::from_catalog(Box::new(catalog), None, BufferPool::new(64 << 20), None).unwrap();
+}

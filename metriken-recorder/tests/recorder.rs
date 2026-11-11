@@ -1610,6 +1610,50 @@ async fn a_source_whose_rows_cannot_be_sealed_at_finish_is_dropped_there() {
     assert_eq!(recordings(&path, "dup")["dup"].rows, 0);
 }
 
+/// When the only source fails, nothing is left recording: the recording
+/// fails, after the source's own event.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recording_whose_every_source_failed_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("all-failed.dendro");
+    let anchor = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let mut cfg = RecorderConfig::new(&path, INTERVAL);
+    cfg.writer = metriken_storage::WriterConfig {
+        seal: dendro::seal::SealPolicy {
+            max_rows: 2,
+            ..dendro::seal::SealPolicy::default()
+        },
+        ..metriken_storage::WriterConfig::default()
+    };
+    let (recorder, _ids, mut rx) =
+        Recorder::start_local(cfg, vec![Box::new(Duplicating { anchor, n: 0 })])
+            .await
+            .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut seen = Vec::new();
+    while !seen.iter().any(|e| matches!(e, Event::Failed { .. })) {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(e @ (Event::SourceFailed { .. } | Event::Failed { .. }))) => seen.push(e),
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => panic!("no Failed within 30 s: {seen:?}"),
+        }
+    }
+    let [Event::SourceFailed { source, .. }, Event::Failed { error }] = &seen[..] else {
+        panic!("SourceFailed then Failed: {seen:?}");
+    };
+    assert_eq!(*source, SourceId(0));
+    assert!(error.contains("every source failed"), "{error}");
+    assert!(error.contains("table dup"), "{error}");
+    let finished = recorder.finish(Stop::Now, CancellationToken::new()).await;
+    assert!(
+        matches!(&finished, Err(Error::Archive(e)) if e == error),
+        "{finished:?}"
+    );
+}
+
 /// With `retain`, rows older than the newest minus the retention are
 /// evicted; `Committed` still reports the first stamp ever staged.
 #[tokio::test(flavor = "multi_thread")]
