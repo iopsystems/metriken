@@ -123,7 +123,9 @@ pub use reader::{ArchiveReader, LabeledRecordings};
 #[cfg(feature = "stream")]
 pub use stream::FrameProducer;
 #[cfg(feature = "write")]
-pub use writer::{ArchiveWriter, SourceRecorder, StreamDecoder, StreamedGroup, WriterConfig};
+pub use writer::{
+    ArchiveWriter, EncodeFailure, SourceRecorder, StreamDecoder, StreamedGroup, WriterConfig,
+};
 
 pub use buffer_pool::{BufferPool, BufferPoolStats};
 pub use labels::{

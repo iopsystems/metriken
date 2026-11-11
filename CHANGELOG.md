@@ -19,6 +19,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Docs:** `DataSource` states the time order a read returns a series'
   samples in, which metriken-query 0.48.1 checks, and that `interval`
   implementations return a finite, non-negative value.
+- **Added:** `ArchiveWriter::create_isolated`: an archive in which a
+  stream whose rows the encoder cannot write into a segment (an error or
+  a panic) fails only its own source. Such a stream gets no segment, its
+  rows stay in the WAL, and the writer keeps running; with
+  `ArchiveWriter::create`, dendro stops its writer thread at that seal and
+  every source's later commits and syncs return the error, as before.
+  `ArchiveWriter::encode_failures` lists a source's failed streams
+  (`EncodeFailure`) once the writer thread has run the seal
+  (`SourceRecorder::sync` waits for it).
+  `SourceRecorder::finalize` in such an archive discards each failed
+  stream before it marks the source complete, so no reader is handed rows
+  it cannot decode. `SourceRecorder::discard_streams` removes streams
+  from a source; dendro's retention cannot tell a stream's unsealed rows
+  from its sealed ones, so its earlier segments go too.
 
 ### metriken-query 0.48.2
 
@@ -48,6 +62,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Fixed:** `selector_filter` refuses a selector with `or`, whose
   branches one filter cannot hold, with a `ParseError`. It returned an
   empty filter, which matches every series.
+
+### metriken-recorder 0.13.1
+
+Requires metriken-storage 0.11.2.
+
+- **Fixed:** a source whose rows the encoder cannot write into a segment
+  stops recording, and the others record on. Before, the seal's error
+  stopped the archive's writer and the recorder failed the recording
+  (`Event::Failed`) for every source. The source's failed tables are
+  removed from its recording, their earlier segments included, and the
+  recording is finalized with its other tables; its tasks are stopped,
+  `Event::SourceFailed` names it and each failed table with the encoder's
+  error, and its state is `SourceState::Failed`. A failure found at the
+  seal `Recorder::finish` makes is handled the same way. A patch to such
+  a source is an `Error::Source`. An error writing the archive itself
+  still fails the recording. A V1 or V2 snapshot from a local source
+  naming one metric of a sampler twice is one such input.
 
 ### metriken-storage 0.11.1
 

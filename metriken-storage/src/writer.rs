@@ -37,7 +37,7 @@ use metriken_model::{GroupSnapshot, Snapshot};
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
 use crate::encoder::boxed;
-use crate::encoder::LongStreams;
+use crate::encoder::{EncodeFailures, LongStreams};
 pub use crate::encoder::{Encoder, ENCODER_VERSION};
 use crate::{default_compression, segment_props as sealed_props};
 pub use crate::{Compression, ZstdLevel};
@@ -81,6 +81,18 @@ pub struct ArchiveWriter {
     inner: Writer,
     long: LongStreams,
     config: Arc<WriterConfig>,
+    /// Set by [`create_isolated`](ArchiveWriter::create_isolated).
+    failures: Option<EncodeFailures>,
+}
+
+/// A stream of one source whose rows could not be encoded as a segment, in
+/// an archive written by [`ArchiveWriter::create_isolated`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EncodeFailure {
+    pub stream: String,
+    /// The encoder's error, from the stream's latest attempt.
+    pub error: String,
 }
 
 /// One tick's rows for one source, as [`SourceRecorder::stage`] produced
@@ -246,19 +258,60 @@ const LONG_ROW_FIELDS: usize = 4;
 
 impl ArchiveWriter {
     /// Create a new archive at `path`.
+    ///
+    /// A stream whose rows cannot be encoded as a segment stops dendro's
+    /// writer thread at its seal, and later commits and syncs, any
+    /// source's, return that error.
     pub fn create(path: &Path, config: WriterConfig) -> Result<Self, Error> {
+        Self::create_with(path, config, None)
+    }
+
+    /// Create a new archive at `path` in which a stream whose rows cannot be
+    /// encoded fails only its own source.
+    ///
+    /// Such a stream is given no segment at its seal, and its rows stay in
+    /// the WAL; the writer keeps running. [`encode_failures`] lists the
+    /// streams of a source that failed so far. A seal runs on dendro's
+    /// writer thread after [`SourceRecorder::maybe_seal`] returns, so its
+    /// failure is listed only once the writer has run it;
+    /// [`SourceRecorder::sync`] waits for that.
+    ///
+    /// [`SourceRecorder::finalize`] seals the source's streams, discards
+    /// every stream listed for it (see [`SourceRecorder::discard_streams`]),
+    /// and marks it complete, so a reader is never handed rows it cannot
+    /// decode.
+    ///
+    /// [`encode_failures`]: Self::encode_failures
+    pub fn create_isolated(path: &Path, config: WriterConfig) -> Result<Self, Error> {
+        Self::create_with(path, config, Some(EncodeFailures::default()))
+    }
+
+    fn create_with(
+        path: &Path,
+        config: WriterConfig,
+        failures: Option<EncodeFailures>,
+    ) -> Result<Self, Error> {
         let long: LongStreams = Arc::default();
         let encoder = Encoder::new(
             Arc::clone(&long),
             config.sort_long,
             sealed_props(config.compression),
+            failures.clone(),
         );
         let inner = Writer::create(path, Box::new(encoder)).map_err(boxed)?;
         Ok(Self {
             inner,
             long,
             config: Arc::new(config),
+            failures,
         })
+    }
+
+    /// The streams of source `source_id` whose rows failed to encode so
+    /// far, in an archive made by [`create_isolated`](Self::create_isolated);
+    /// empty in any other. A stream stays listed after it is discarded.
+    pub fn encode_failures(&self, source_id: i64) -> Vec<EncodeFailure> {
+        encode_failures_of(self.failures.as_ref(), source_id)
     }
 
     /// Start recording a source: its labels, metadata, and the wall-clock
@@ -280,6 +333,7 @@ impl ArchiveWriter {
         Ok(SourceRecorder {
             source_key: writer.stagger_key().to_string(),
             writer,
+            failures: self.failures.clone(),
             long: Arc::clone(&self.long),
             config: Arc::clone(&self.config),
             groups: HashMap::new(),
@@ -303,6 +357,26 @@ impl ArchiveWriter {
     pub fn join(&mut self) -> Result<(), Error> {
         self.inner.join().map_err(boxed)
     }
+}
+
+fn encode_failures_of(failures: Option<&EncodeFailures>, source_id: i64) -> Vec<EncodeFailure> {
+    let Some(failures) = failures else {
+        return Vec::new();
+    };
+    failures
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&source_id)
+        .map(|streams| {
+            streams
+                .iter()
+                .map(|(stream, error)| EncodeFailure {
+                    stream: stream.clone(),
+                    error: error.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// A group's schema, as this writer lays it out.
@@ -750,6 +824,9 @@ struct SamplerState {
 /// ingest keeps per group.
 pub struct SourceRecorder {
     writer: SourceWriter,
+    /// The archive's, when it was made by
+    /// [`ArchiveWriter::create_isolated`].
+    failures: Option<EncodeFailures>,
     /// V1/V2 only: per sampler table, the last row's dedup key and the
     /// metrics whose metadata this segment's WAL already carries.
     samplers: HashMap<String, SamplerState>,
@@ -1565,14 +1642,55 @@ impl SourceRecorder {
         Ok(())
     }
 
+    /// Remove `streams` from this source: every row and segment of each,
+    /// and of its table's occupant stream (or, for an occupant stream, of
+    /// its table), and stop sealing them. For a stream whose rows cannot be
+    /// encoded (see [`ArchiveWriter::create_isolated`]): its unsealed rows
+    /// cannot be told apart from its sealed ones by dendro's retention, so
+    /// both go.
+    pub fn discard_streams(&mut self, streams: &[String]) -> Result<(), Error> {
+        let mut gone: HashSet<String> = HashSet::new();
+        for stream in streams {
+            let table = occupants::table_of(stream).unwrap_or(stream).to_string();
+            gone.insert(occupants::stream_of(&table));
+            gone.insert(table);
+        }
+        if gone.is_empty() {
+            return Ok(());
+        }
+        for stream in &gone {
+            self.accounts.remove(stream);
+            self.opened.remove(stream);
+            self.groups.remove(stream);
+            self.samplers.remove(stream);
+        }
+        self.writer
+            .evict_streams_before(i64::MAX, Box::new(move |s: &str| gone.contains(s)))
+            .map_err(boxed)?;
+        Ok(())
+    }
+
     /// Seal every stream's tail and mark the source complete. `last` is the
-    /// last tick's `(ts, wall_offset)`.
+    /// last tick's `(ts, wall_offset)`. In an archive made by
+    /// [`ArchiveWriter::create_isolated`], each stream that failed to
+    /// encode, at this seal or before, is discarded first
+    /// ([`discard_streams`](Self::discard_streams)), and stays listed by
+    /// [`ArchiveWriter::encode_failures`].
     pub fn finalize(mut self, last: (u64, i64)) -> Result<(), Error> {
         let batch: Vec<String> = self.accounts.keys().cloned().collect();
         if !batch.is_empty() {
             self.writer
                 .seal_capped(batch, self.config.seal.max_rows)
                 .map_err(boxed)?;
+        }
+        if self.failures.is_some() {
+            self.writer.sync().map_err(boxed)?;
+            let failed: Vec<String> =
+                encode_failures_of(self.failures.as_ref(), self.writer.source_id())
+                    .into_iter()
+                    .map(|f| f.stream)
+                    .collect();
+            self.discard_streams(&failed)?;
         }
         self.writer.finalize((last.0 as i64, last.1)).map_err(boxed)
     }

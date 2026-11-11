@@ -30,6 +30,12 @@ pub const READABLE_ENCODERS: &[&str] = &[ENCODER_VERSION];
 /// two sources can record a group of the same name, one long and one wide.
 pub(crate) type LongStreams = Arc<Mutex<HashSet<(i64, String)>>>;
 
+/// The streams the writer's encoder could not encode, per source id: each
+/// stream's latest error. Shared between the encoder (which records on
+/// dendro's writer thread) and the writer (which reports and discards).
+pub(crate) type EncodeFailures =
+    Arc<Mutex<std::collections::BTreeMap<i64, std::collections::BTreeMap<String, String>>>>;
+
 /// The segment encoder: a long table's rows become a long segment, an
 /// occupant stream's rows an occupant segment, anything else a wide table.
 pub struct Encoder {
@@ -37,22 +43,63 @@ pub struct Encoder {
     sort_long: bool,
     /// Writer properties for every segment this encoder seals.
     props: parquet::file::properties::WriterProperties,
+    /// When set, a stream that fails to encode (an error or a panic) is
+    /// recorded here and given no segment, rather than returned as an
+    /// error: dendro stops its writer thread, and every source's recording
+    /// with it, on an encoder error.
+    failures: Option<EncodeFailures>,
 }
 
 impl Encoder {
     /// The writer's encoder: `long` is shared with its recorders, which
-    /// decide which streams are long as they ingest.
+    /// decide which streams are long as they ingest; `failures`, when set,
+    /// collects the streams that fail to encode (see the field).
     #[cfg_attr(not(feature = "write"), allow(dead_code))]
     pub(crate) fn new(
         long: LongStreams,
         sort_long: bool,
         props: parquet::file::properties::WriterProperties,
+        failures: Option<EncodeFailures>,
     ) -> Self {
         Self {
             long,
             sort_long,
             props,
+            failures,
         }
+    }
+
+    /// `encode()` for the stream `ctx` names. With [`failures`] set, an
+    /// error or a panic is recorded there and the stream gets no segment.
+    ///
+    /// [`failures`]: Self::failures
+    fn isolate(
+        &self,
+        ctx: &EncodeContext<'_>,
+        encode: impl FnOnce() -> EncodeResult,
+    ) -> EncodeResult {
+        let Some(failures) = &self.failures else {
+            return encode();
+        };
+        let error = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(encode)) {
+            Ok(Ok(segment)) => return Ok(segment),
+            Ok(Err(e)) => e.to_string(),
+            Err(payload) => {
+                let what = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "a panic with no message".to_string());
+                format!("the encoder panicked: {what}")
+            }
+        };
+        failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(ctx.source_id)
+            .or_default()
+            .insert(ctx.stream.to_string(), error);
+        Ok(None)
     }
 
     /// The encoder for an archive this process is not writing: a copy, a
@@ -82,6 +129,7 @@ impl Encoder {
             long: Arc::new(Mutex::new(long)),
             sort_long: false,
             props: sealed_props(default_compression()),
+            failures: None,
         }
     }
 
@@ -138,6 +186,33 @@ pub(crate) fn boxed(e: impl std::fmt::Display) -> Box<dyn std::error::Error + Se
 
 impl SegmentEncoder for Encoder {
     fn encode(&self, ctx: &EncodeContext<'_>, rows: &[DWalRow]) -> EncodeResult {
+        self.isolate(ctx, || self.encode_rows(ctx, rows))
+    }
+
+    fn version(&self) -> Option<&str> {
+        Some(ENCODER_VERSION)
+    }
+
+    /// A part of a split seal (dendro's `seal_capped`), after `before`.
+    ///
+    /// The writer puts a group's schema, a long table's columns and a
+    /// sampler cell's metadata only on the first row since the last seal
+    /// that needs them, so a part that starts after that row would decode
+    /// with no schema (its rows skipped) or with columns that lost their
+    /// labels. The part is anchored as the writer would have anchored it
+    /// had it sealed there, from what `before` carried, and then encoded.
+    fn encode_after(
+        &self,
+        ctx: &EncodeContext<'_>,
+        before: &[DWalRow],
+        rows: &[DWalRow],
+    ) -> EncodeResult {
+        self.isolate(ctx, || self.encode_rows_after(ctx, before, rows))
+    }
+}
+
+impl Encoder {
+    fn encode_rows(&self, ctx: &EncodeContext<'_>, rows: &[DWalRow]) -> EncodeResult {
         let stream = ctx.stream;
         let Some(last) = rows.last() else {
             return Ok(None);
@@ -207,19 +282,7 @@ impl SegmentEncoder for Encoder {
         }))
     }
 
-    fn version(&self) -> Option<&str> {
-        Some(ENCODER_VERSION)
-    }
-
-    /// A part of a split seal (dendro's `seal_capped`), after `before`.
-    ///
-    /// The writer puts a group's schema, a long table's columns and a
-    /// sampler cell's metadata only on the first row since the last seal
-    /// that needs them, so a part that starts after that row would decode
-    /// with no schema (its rows skipped) or with columns that lost their
-    /// labels. The part is anchored as the writer would have anchored it
-    /// had it sealed there, from what `before` carried, and then encoded.
-    fn encode_after(
+    fn encode_rows_after(
         &self,
         ctx: &EncodeContext<'_>,
         before: &[DWalRow],
@@ -228,7 +291,7 @@ impl SegmentEncoder for Encoder {
         let stream = ctx.stream;
         // An occupant stream's rows each carry their own labels.
         if occupants::table_of(stream).is_some() {
-            return self.encode(ctx, rows);
+            return self.encode_rows(ctx, rows);
         }
         let long = self
             .long
@@ -244,8 +307,8 @@ impl SegmentEncoder for Encoder {
         }
         .map_err(boxed)?;
         match anchored {
-            Some(rows) => self.encode(ctx, &rows),
-            None => self.encode(ctx, rows),
+            Some(rows) => self.encode_rows(ctx, &rows),
+            None => self.encode_rows(ctx, rows),
         }
     }
 }

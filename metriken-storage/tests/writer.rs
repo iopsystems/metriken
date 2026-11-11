@@ -2557,3 +2557,123 @@ fn a_live_copy_builds_its_encoder_in_the_copys_snapshot() {
     }
     writer.join().unwrap();
 }
+
+/// A V2 snapshot naming counter `x` of sampler `s` once, or twice with
+/// `twice`: two cells for one column in one row, which the encoder cannot
+/// write as a segment.
+fn sampler_snapshot(t: u64, twice: bool) -> metriken_exposition::Snapshot {
+    use metriken_exposition::{Counter, SnapshotV2};
+    let metadata: HashMap<String, String> = [("sampler".to_string(), "s".to_string())].into();
+    let mut counters = vec![Counter::new("x".into(), t, metadata.clone())];
+    if twice {
+        counters.push(Counter::new("x".into(), t + 1, metadata));
+    }
+    Snapshot::V2(SnapshotV2 {
+        systemtime: SystemTime::now(),
+        duration: Duration::ZERO,
+        metadata: HashMap::new(),
+        counters,
+        gauges: Vec::new(),
+        histograms: Vec::new(),
+        gauge_histograms: Vec::new(),
+    })
+}
+
+/// `ArchiveWriter::create` or `ArchiveWriter::create_isolated`.
+type Create =
+    fn(&Path, WriterConfig) -> Result<ArchiveWriter, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Two sources, the second of which writes rows the encoder refuses,
+/// committed and sealed every tick at 2 rows a segment. Returns the writer,
+/// the two sources, and per tick whether the commit, both seal checks and
+/// a sync of the first source succeeded.
+fn record_one_unencodable(
+    path: &Path,
+    create: Create,
+) -> (ArchiveWriter, SourceRecorder, SourceRecorder, Vec<bool>) {
+    let config = WriterConfig {
+        seal: SealPolicy {
+            max_rows: 2,
+            ..SealPolicy::default()
+        },
+        ..WriterConfig::default()
+    };
+    let mut writer = create(path, config).unwrap();
+    let mut add = |name: &str| {
+        writer
+            .add_source(
+                [("source".to_string(), name.to_string())].into(),
+                BTreeMap::new(),
+                BASE,
+            )
+            .unwrap()
+    };
+    let (mut good, mut bad) = (add("good"), add("bad"));
+    let mut ok = Vec::new();
+    for t in 1..=6 {
+        let ts = BASE + t * S;
+        let staged = vec![
+            good.stage(&sampler_snapshot(t, false), ts, 0).unwrap(),
+            bad.stage(&sampler_snapshot(t, true), ts, 0).unwrap(),
+        ];
+        let committed = writer.commit(staged).is_ok();
+        let sealed = good.maybe_seal().is_ok() && bad.maybe_seal().is_ok();
+        ok.push(committed && sealed && good.sync().is_ok());
+    }
+    (writer, good, bad, ok)
+}
+
+#[test]
+fn an_unencodable_stream_stops_a_plain_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plain.dendro");
+    let (_writer, _, _, ok) = record_one_unencodable(&path, ArchiveWriter::create);
+    assert!(
+        ok.contains(&false),
+        "the control: without isolation the bad source's seal stops the writer"
+    );
+}
+
+#[test]
+fn an_unencodable_stream_fails_only_its_source_in_an_isolated_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("isolated.dendro");
+    let (mut writer, good, bad, ok) = record_one_unencodable(&path, ArchiveWriter::create_isolated);
+    assert!(ok.iter().all(|ok| *ok), "every tick committed: {ok:?}");
+    let (good_id, bad_id) = (good.source_id(), bad.source_id());
+    let failed = writer.encode_failures(bad_id);
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0].stream, "s");
+    assert!(
+        failed[0].error.contains("same length"),
+        "{}",
+        failed[0].error
+    );
+    assert!(writer.encode_failures(good_id).is_empty());
+    good.finalize((BASE + 6 * S, 0)).unwrap();
+    bad.finalize((BASE + 6 * S, 0)).unwrap();
+    writer.join().unwrap();
+
+    let catalog = DendroCatalog::open(&path).unwrap();
+    for source in catalog.sources().unwrap() {
+        assert!(source.complete, "{:?}", source.labels);
+        let sealed = catalog.segment_span(source.id, "s").unwrap().1;
+        let live = catalog.live_wal_span(source.id, "s").unwrap();
+        let rows = if source.id == good_id { 6 } else { 0 };
+        assert_eq!(
+            (sealed.rows, live.rows),
+            (rows, 0),
+            "{:?}: the good source's rows sealed, the bad one's removed",
+            source.labels
+        );
+    }
+    // A reader opens every source, so no unencodable row was left behind.
+    let readers = ArchiveReader::from_catalog(
+        Box::new(DendroCatalog::open(&path).unwrap()),
+        None,
+        BufferPool::new(64 << 20),
+        None,
+    )
+    .unwrap();
+    assert_eq!(readers.len(), 2);
+}

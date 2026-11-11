@@ -12,7 +12,7 @@ use metriken_model::wire::{HANDSHAKE_FRAME_INTERVAL, HANDSHAKE_UPDATE_FLOOR};
 use metriken_model::Snapshot;
 use metriken_storage::layers::{self, Entry, Layer};
 use metriken_storage::writer::Staged;
-use metriken_storage::{ArchiveWriter, SourceRecorder, WriterConfig};
+use metriken_storage::{ArchiveWriter, EncodeFailure, SourceRecorder, WriterConfig};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -178,6 +178,10 @@ pub enum SourceState {
     /// Answered and cannot be recorded. Never retried. A source refused on
     /// a reconnect keeps the rows it had.
     Refused,
+    /// Its rows could not be written into a segment
+    /// ([`Event::SourceFailed`]): it stopped recording, and its recording is
+    /// finalized without the tables that failed.
+    Failed,
 }
 
 /// How [`Recorder::finish`] ends the recording.
@@ -215,7 +219,8 @@ pub enum Stop {
 /// emits without limit, are counted in `Lagged` instead once 1,024 events
 /// are queued (a restart or a producer change is still written into the
 /// archive). The others (`Active`, `Pending`, `Refused`, `LabelsNotApplied`,
-/// `Failed`) come at most a few per source, so the queue stays bounded. Events still
+/// `SourceFailed`, `Failed`) come at most a few per source, so the queue
+/// stays bounded. Events still
 /// queued when the recorder stops are sent from a task of their own until
 /// the receiver is dropped. A caller that ignores events drops the
 /// receiver.
@@ -296,6 +301,14 @@ pub enum Event {
         epoch: String,
         version: Option<String>,
     },
+    /// The source's rows in a table could not be written into a segment
+    /// (the encoder refused them), so the source stopped recording: no more
+    /// passes, scrapes or frames are taken from it. Each failed table is
+    /// removed from its recording, its earlier segments included, and the
+    /// recording is finalized with its other tables. The other sources keep
+    /// recording. `reason` names each failed table and the encoder's error.
+    /// At most once per source; its state is then [`SourceState::Failed`].
+    SourceFailed { source: SourceId, reason: String },
     /// The archive failed. The recorder has stopped ticking; what is on disk
     /// holds every tick committed before the failure. [`Recorder::finish`]
     /// returns this error.
@@ -423,7 +436,8 @@ pub fn default_timeout(interval: Duration) -> Duration {
 pub enum Error {
     /// The archive failed mid-run ([`Event::Failed`]), or at finalize.
     Archive(String),
-    /// No such source, or one that was refused before it was recorded.
+    /// No such source, one that was refused before it was recorded, or one
+    /// that failed ([`Event::SourceFailed`]).
     Source(String),
     /// A label or metadata key the recorder or dendro writes itself.
     Reserved(String),
@@ -642,12 +656,13 @@ impl Recorder {
         driver.first_enrich().await;
 
         let path = cfg.path.clone();
-        let writer = tokio::task::spawn_blocking(move || ArchiveWriter::create(&path, cfg.writer))
-            .await
-            .map_err(|e| StartError::Create(format!("the writer did not start: {e}")))?
-            .map_err(|e| {
-                StartError::Create(format!("failed to create {}: {e}", cfg.path.display()))
-            })?;
+        let writer =
+            tokio::task::spawn_blocking(move || ArchiveWriter::create_isolated(&path, cfg.writer))
+                .await
+                .map_err(|e| StartError::Create(format!("the writer did not start: {e}")))?
+                .map_err(|e| {
+                    StartError::Create(format!("failed to create {}: {e}", cfg.path.display()))
+                })?;
         driver.archive = Some(Archive {
             recs: BTreeMap::new(),
             staged: Vec::new(),
@@ -1523,7 +1538,9 @@ impl Driver {
     }
 
     /// Commit the tick's staged rows as one transaction, run every source's
-    /// seal check, apply retention, and report each source that committed.
+    /// seal check, apply retention, drop each source a seal found
+    /// unencodable ([`drop_failed`](Self::drop_failed)), and report each
+    /// source that committed.
     async fn commit(&mut self, maintain: bool) {
         let retain = self.settings.retain;
         let cutoffs: Vec<(usize, u64)> = match retain {
@@ -1539,8 +1556,9 @@ impl Driver {
                 .collect(),
             _ => Vec::new(),
         };
+        let lasts = self.lasts();
         let result = self
-            .blocking(move |a| -> Result<(), String> {
+            .blocking(move |a| -> Result<Vec<(usize, String)>, String> {
                 a.writer
                     .commit(std::mem::take(&mut a.staged))
                     .map_err(|e| e.to_string())?;
@@ -1560,11 +1578,15 @@ impl Driver {
                         }
                     }
                 }
-                Ok(())
+                drop_unencodable(a, &lasts)
             })
             .await;
         match result {
-            Some(Ok(())) => {}
+            Some(Ok(dropped)) => {
+                for (i, reason) in dropped {
+                    self.drop_failed(i, reason);
+                }
+            }
             Some(Err(e)) => return self.fail(e).await,
             None => {
                 if let Some(e) = self.failed.clone() {
@@ -1575,7 +1597,7 @@ impl Driver {
             }
         }
         for slot in &mut self.slots {
-            if !std::mem::take(&mut slot.committed_this_tick) {
+            if !std::mem::take(&mut slot.committed_this_tick) || slot.state == SourceState::Failed {
                 continue;
             }
             let (Some(first_ts), Some((ts, wall_offset))) = (slot.first_ts, slot.last_stamp) else {
@@ -1589,6 +1611,34 @@ impl Driver {
                 wall_ns: Stamp { ts, wall_offset }.wall_ns(),
             });
         }
+    }
+
+    /// Each slot's last staged `(ts, wall_offset)`, for a finalize.
+    fn lasts(&self) -> BTreeMap<usize, (u64, i64)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| Some((i, s.last_stamp?)))
+            .collect()
+    }
+
+    /// Slot `i`'s recording was finalized without the tables its encoder
+    /// refused ([`drop_unencodable`]): stop recording it, and say why.
+    fn drop_failed(&mut self, i: usize, reason: String) {
+        let slot = &mut self.slots[i];
+        warn!(
+            "{}: its rows could not be written into a segment ({reason}); it stopped \
+             recording, and the other sources go on",
+            slot.label()
+        );
+        slot.state = SourceState::Failed;
+        slot.added = false;
+        #[cfg(feature = "http")]
+        if let Kind::Endpoint(ep) = &mut slot.kind {
+            ep.abort_tasks();
+        }
+        let source = slot.id;
+        self.emitter.must(Event::SourceFailed { source, reason });
     }
 
     /// Stage `snapshot` for slot `i`.
@@ -1830,6 +1880,12 @@ impl Driver {
                 slot.label()
             )));
         }
+        if slot.state == SourceState::Failed {
+            return Err(Error::Source(format!(
+                "{} failed and its recording is finalized",
+                slot.label()
+            )));
+        }
         slot.pinned.extend(patch.keys().cloned());
         slot.patches.push(patch.clone());
         if !slot.added {
@@ -1899,17 +1955,30 @@ impl Driver {
         }
         self.apply_restart(i, true, false).await;
         self.commit(false).await;
-        if self.failed.is_some() {
+        if self.failed.is_some() || self.slots[i].state == SourceState::Failed {
             return Ok(false);
         }
         let (_, ts, wall_offset) = self.stamp_now();
         let last = self.slots[i].last_stamp.unwrap_or((ts, wall_offset));
-        self.blocking(move |a| match a.recs.remove(&i) {
-            Some(rec) => rec.finalize(last).map_err(|e| e.to_string()),
-            None => Ok(()),
-        })
-        .await
-        .unwrap_or_else(|| Err("the archive is closed".to_string()))?;
+        let unencodable = self
+            .blocking(move |a| match a.recs.remove(&i) {
+                Some(rec) => {
+                    let id = rec.source_id();
+                    rec.finalize(last).map_err(|e| e.to_string())?;
+                    Ok(a.writer.encode_failures(id))
+                }
+                None => Ok(Vec::new()),
+            })
+            .await
+            .unwrap_or_else(|| Err("the archive is closed".to_string()))?;
+        if !unencodable.is_empty() {
+            warn!(
+                "{}: the recording that ended at the producer change was finalized without \
+                 tables that could not be written into a segment ({})",
+                self.slots[i].label(),
+                unencodable_reason(&unencodable)
+            );
+        }
         let old = std::mem::take(&mut self.slots[i].maps);
         self.forget_labels(i, &old.labels);
         let slot = &mut self.slots[i];
@@ -2069,8 +2138,8 @@ impl Driver {
             return Err(Error::Archive(e.clone()));
         }
 
-        let sources: Vec<SourceSummary> = self.slots.iter().map(Slot::summary).collect();
         if self.slots.iter().all(|s| s.first_wall_ns.is_none()) {
+            let sources: Vec<SourceSummary> = self.slots.iter().map(Slot::summary).collect();
             self.remove_archive().await;
             return Ok(Summary {
                 sources,
@@ -2085,25 +2154,38 @@ impl Driver {
             .enumerate()
             .map(|(i, s)| (i, s.last_stamp.unwrap_or(fallback)))
             .collect();
+        // A stream can first fail at the seal `finalize` makes; the source
+        // is then dropped as a seal during the recording drops it.
         let finalized = self
-            .blocking(move |a| -> Result<(), String> {
+            .blocking(move |a| -> Result<Vec<(usize, String)>, String> {
                 let mut first_err = None;
+                let mut dropped = Vec::new();
                 for (i, rec) in std::mem::take(&mut a.recs) {
                     let last = lasts.get(&i).copied().unwrap_or(fallback);
+                    let id = rec.source_id();
                     if let Err(e) = rec.finalize(last) {
                         first_err.get_or_insert(e.to_string());
                     }
+                    let unencodable = a.writer.encode_failures(id);
+                    if !unencodable.is_empty() {
+                        dropped.push((i, unencodable_reason(&unencodable)));
+                    }
                 }
                 let joined = a.writer.join().map_err(|e| e.to_string());
-                first_err.map_or(joined, Err)
+                first_err.map_or(joined, Err).map(|()| dropped)
             })
             .await;
         self.drop_archive().await;
         match finalized {
-            Some(Ok(())) => Ok(Summary {
-                sources,
-                discarded: false,
-            }),
+            Some(Ok(dropped)) => {
+                for (i, reason) in dropped {
+                    self.drop_failed(i, reason);
+                }
+                Ok(Summary {
+                    sources: self.slots.iter().map(Slot::summary).collect(),
+                    discarded: false,
+                })
+            }
             Some(Err(e)) => Err(Error::Archive(e)),
             None => Err(Error::Archive(
                 self.failed
@@ -2136,6 +2218,42 @@ impl Driver {
         self.drop_archive().await;
         remove_files(&self.path);
     }
+}
+
+/// Finalize and remove each recording with a stream its encoder refused
+/// ([`ArchiveWriter::create_isolated`]); `finalize` discards those streams.
+/// Returns each one's slot and the reason, for [`Driver::drop_failed`]. A
+/// recording that failed is never committed to again, so what it holds stays
+/// decodable; an error here is the archive's, and fails the recording.
+fn drop_unencodable(
+    a: &mut Archive,
+    lasts: &BTreeMap<usize, (u64, i64)>,
+) -> Result<Vec<(usize, String)>, String> {
+    let failed: Vec<usize> = a
+        .recs
+        .iter()
+        .filter(|(_, rec)| !a.writer.encode_failures(rec.source_id()).is_empty())
+        .map(|(i, _)| *i)
+        .collect();
+    let mut dropped = Vec::new();
+    for i in failed {
+        let rec = a.recs.remove(&i).expect("listed above");
+        let id = rec.source_id();
+        // A stream fails at a seal, so the source has staged a row.
+        let last = lasts.get(&i).copied().unwrap_or((0, 0));
+        rec.finalize(last).map_err(|e| e.to_string())?;
+        dropped.push((i, unencodable_reason(&a.writer.encode_failures(id))));
+    }
+    Ok(dropped)
+}
+
+/// One line naming each stream that failed to encode, and why.
+fn unencodable_reason(failures: &[EncodeFailure]) -> String {
+    failures
+        .iter()
+        .map(|f| format!("table {} could not be encoded: {}", f.stream, f.error))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// What is wrong with `labels` against the label sets already added, or
@@ -2387,6 +2505,10 @@ impl Driver {
     }
 
     async fn on_stream_event(&mut self, i: usize, event: StreamEvent) -> Result<(), String> {
+        // Its pump is aborted; these were queued before.
+        if self.slots[i].state == SourceState::Failed {
+            return Ok(());
+        }
         let wall = wall_now_ns();
         let id = self.slots[i].id;
         let label = self.slots[i].label();
