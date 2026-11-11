@@ -54,6 +54,10 @@ metriken-exposition = { path = "../metriken-exposition", features = ["stream-tok
 metriken-query = { path = "../metriken-query" }
 metriken-storage = { path = "../metriken-storage", features = ["write"] }
 parquet = { workspace = true, features = ["arrow"] }
+# `an_archive_error_fails_the_recording` drops the archive's `wal` table
+# from a second connection mid-run, so the next commit fails. The same
+# SQLite version and build dendro uses.
+rusqlite = { version = "0.41", features = ["bundled"] }
 tempfile.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "test-util"] }
 # `scrape_log`: what a scrape's warning reads like in tracing-subscriber's
