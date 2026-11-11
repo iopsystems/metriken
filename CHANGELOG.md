@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-### metriken-storage (unreleased)
+### metriken-storage 0.12.0
 
 - **Breaking:** `Labels::matches` takes a label the series does not carry
   as `""`, as Prometheus does: `l=""` matches a series without `l`, as do
@@ -39,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   series for occupants first described in the deleted rows read without
   their labels. Requires dendro 0.7.1.
 
-### metriken-query (unreleased)
+### metriken-query 0.49.0
 
 - **Breaking:** a matcher that matches the empty string selects the series
   that lack the label, through every source: `x{l=""}` selects the series
@@ -54,16 +54,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused as reading a metric of two kinds across recordings can now
   succeed.
 
-### metriken-recorder (unreleased)
+### metriken-recorder 0.14.0
 
+- **Breaking:** requires metriken-storage 0.12.0, whose `WriterConfig`
+  `RecorderConfig::writer` holds.
 - **Changed:** a source whose rows cannot be staged, or whose streamed frame
   cannot be read or decoded, fails alone (`Event::SourceFailed`) at the next
   commit, as a source whose rows cannot be encoded does; before, the whole
   recording failed. The rows it staged before are committed. An error from
   the archive itself still fails the recording.
 - **Changed:** a failed source keeps the segments its failed tables sealed
-  before the failure (metriken-storage's change above). Requires the
-  metriken-storage release with that change.
+  before the failure (metriken-storage 0.12.0's change above).
 
 ### metriken-storage 0.11.2
 
