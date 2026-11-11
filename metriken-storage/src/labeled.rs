@@ -265,7 +265,7 @@ impl LabeledSource {
     /// declares no interval reports 1 s; pass the spacing measured from the
     /// table's rows.
     pub fn with_interval(mut self, interval: f64) -> Self {
-        self.interval = Some(interval).filter(|i| *i > 0.0);
+        self.interval = Some(interval).filter(|i| i.is_finite() && *i > 0.0);
         self
     }
 
@@ -1006,6 +1006,15 @@ mod tests {
                 labels(&[("exported_host", "lb"), ("host", "lb"), ("source", "svc")]).inner,
             ]
         );
+    }
+
+    /// A non-finite interval is ignored, as one at or below zero is: the
+    /// source answers its own.
+    #[test]
+    fn a_non_finite_interval_is_ignored() {
+        for interval in [f64::INFINITY, f64::NAN, 0.0] {
+            assert_eq!(labeled().with_interval(interval).interval(), 1.0);
+        }
     }
 
     /// With an interval, every counter series returned carries it, on the

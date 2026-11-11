@@ -1586,9 +1586,10 @@ fn create_hist_source(cumulative_per_cpu: &[u64]) -> Memory {
     source
 }
 
-/// A histogram function over a source with no files returns no series.
+/// A histogram function over a source with no files fails with
+/// `MetricNotFound` instead of panicking on the read start.
 #[test]
-fn histogram_functions_over_a_source_with_no_files_return_nothing() {
+fn histogram_functions_over_a_source_with_no_files_find_no_metric() {
     use metriken_storage::parquet::MultiParquetSource;
     let engine = QueryEngine::new(Arc::new(MultiParquetSource { files: Vec::new() }));
     for query in [
@@ -1597,7 +1598,7 @@ fn histogram_functions_over_a_source_with_no_files_return_nothing() {
     ] {
         let result = engine.query_range(query, 1000.0, 1003.0, 1.0);
         assert!(
-            !matches!(&result, Ok(QueryResult::Matrix { result, .. }) if !result.is_empty()),
+            matches!(&result, Err(QueryError::MetricNotFound(_))),
             "{query}: {result:?}"
         );
     }

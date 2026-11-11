@@ -38,12 +38,16 @@ pub struct ColumnPosition {
     /// read returns as `CounterValues::Float`. Fits the struct's padding.
     pub float: bool,
 }
+
 /// Metric series a query reads, by name and label filter.
 ///
-/// Every read returns a series' samples in strictly increasing time: no
-/// sample of a series is at or before the one before it. metriken-query
-/// refuses a series read out of that order, as two or more stored series
-/// read as one.
+/// A counter or gauge read returns a series' samples in strictly increasing
+/// time. A histogram stream returns each series' rows in non-decreasing
+/// time; one series may repeat a time where a composite moves rows onto
+/// another recording's clock (`HistogramStream::merge_on_clock`).
+/// metriken-query refuses a series read out of that order, except in a
+/// batched counter scan, and reports it as two or more stored series read
+/// as one.
 pub trait DataSource: Send + Sync {
     /// A source emits every sample at the timestamp it was recorded with.
     /// These used to take a `raw` flag to ask for that instead of a
@@ -174,8 +178,8 @@ pub trait DataSource: Send + Sync {
         let stream = self.gauge_histogram_stream(name, filter, start_ns, end_ns)?;
         Some(vec![(stream, self.gauge_histogram_interval(name))])
     }
-    /// Sampling interval in seconds: finite, and 1.0 for a source that
-    /// holds no table.
+    /// Sampling interval in seconds. Implementations return a finite,
+    /// non-negative value.
     fn interval(&self) -> f64;
     /// The row spacing, in seconds, of the table holding histogram `name`,
     /// answered as [`counter_interval`](Self::counter_interval) is.

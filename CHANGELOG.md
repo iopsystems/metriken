@@ -10,18 +10,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### metriken-storage 0.11.2
 
 - **Fixed:** `MultiParquetSource::interval` with no files, and
-  `SegmentedSource::interval` with no table present, answer 1.0, as the
-  other sources holding no table do. They answered `f64::MAX`, which a
-  histogram read turned into a multiply overflow panic in debug builds.
-- **Docs:** `DataSource` states that a read returns a series' samples in
-  strictly increasing time, which metriken-query 0.48.1 checks, and that
-  `interval` is finite.
+  `SegmentedSource::interval` with no table present, answer 1.0, as
+  `RecordingsSource` and `UnionSource` do with no children. They answered
+  `f64::MAX`, which a histogram read turned into a multiply overflow panic
+  in debug builds.
+- **Fixed:** `LabeledSource::with_interval` ignores a non-finite interval,
+  as it ignores one at or below zero.
+- **Docs:** `DataSource` states the time order a read returns a series'
+  samples in, which metriken-query 0.48.1 checks, and that `interval`
+  implementations return a finite, non-negative value.
 
 ### metriken-query 0.48.2
 
-- **Fixed:** a histogram read whose interval exceeds `u64::MAX`
-  nanoseconds starts at time 0. It overflowed, which panics in debug
-  builds.
+- **Fixed:** a histogram read whose interval exceeds `u64::MAX / 2`
+  nanoseconds starts at time 0 instead of overflowing, which panicked in
+  debug builds. A histogram read across recordings whose coarsest interval
+  exceeds `u64::MAX / 3` nanoseconds reads to the end of time instead of
+  overflowing.
 
 ### metriken-storage 0.11.1
 
