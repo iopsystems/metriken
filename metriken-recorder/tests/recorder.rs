@@ -1924,8 +1924,10 @@ async fn every_endpoint_refused_at_detection_reports_none_recording() {
 /// since the refusal, so `NoneRecording` is emitted once, not again after
 /// the failure. The stream sends two frames with a column its encoder
 /// cannot seal, and its reconnects are answered 404. The pump waits at
-/// least 1 s before a reconnect, so the refusal comes about 1 s in; the
-/// seal is due 4 s after the first row.
+/// least 1 s before a reconnect, so the refusal comes about 1 s in. The
+/// first segment's age cap is staggered by the label set, which carries the
+/// server's port, so the seal comes between about half of `max_age` and
+/// `max_age` after the first row: 4 s to 8 s here.
 #[tokio::test(flavor = "multi_thread")]
 async fn none_recording_is_emitted_once() {
     let agent = serve(Behaviour {
@@ -1948,7 +1950,7 @@ async fn none_recording_is_emitted_once() {
     let mut cfg = RecorderConfig::new(&path, INTERVAL);
     cfg.writer = metriken_storage::WriterConfig {
         seal: dendro::seal::SealPolicy {
-            max_age: Duration::from_secs(4),
+            max_age: Duration::from_secs(8),
             ..dendro::seal::SealPolicy::default()
         },
         ..metriken_storage::WriterConfig::default()

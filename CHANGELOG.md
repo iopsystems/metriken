@@ -65,15 +65,15 @@ from the two histogram heatmap fixes below.
   no source `Pending` or `Active` (every endpoint refused at detection, or
   none given). It is not emitted once `finish` has begun. A recording in
   which no source delivered a frame, a scrape or a pass is still removed
-  (`Summary::discarded`).
+  (`Summary::discarded`). `Event::Failed` and `Error::Archive` now mean
+  only an archive error: a commit, seal, retention, metadata write or added
+  recording that fails, or the writer task stopping, emits `Event::Failed`,
+  and `finish` then returns `Error::Archive`, as it does for a finalize or
+  join error.
 - **Breaking:** a local source whose `pass` panics fails alone
   (`Event::SourceFailed`, "its pass panicked: …"); the other sources keep
   recording. Before, the panic failed the recording (`Event::Failed`) and
   left the archive unfinalized.
-- An archive error still fails the recording: a commit, seal, retention,
-  metadata write or added recording that fails, or the writer task
-  stopping, emits `Event::Failed`, and `finish` then returns
-  `Error::Archive`, as it does for a finalize or join error.
 
 ### metriken-storage 0.12.0
 

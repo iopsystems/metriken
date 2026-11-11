@@ -306,18 +306,18 @@ pub enum Event {
         version: Option<String>,
     },
     /// The source's rows could not be recorded, so the source stopped
-    /// recording: no more passes, scrapes or frames are taken from it. Its rows
-    /// in a table could not be written into a segment (the encoder could not
-    /// encode them), or its rows could not be staged, or a streamed frame from
-    /// it could not be read or decoded, or its local pass panicked. For rows that could not be encoded,
-    /// each failed table's rows after its newest segment are deleted and its
-    /// segments are kept; rows that could not be staged, read or decoded, and
-    /// a pass that panicked, were never written. The recording is then finalized. The other sources keep
-    /// recording, and the recording does not fail, even when this was the
-    /// last source recording ([`Event::NoneRecording`] follows then).
-    /// `reason` names each failed table and the encoder's error, or what
-    /// could not be staged or read, or the panic's message. At most once per source; its state is
-    /// then [`SourceState::Failed`].
+    /// recording: no more passes, scrapes or frames are taken from it. Its
+    /// rows in a table could not be written into a segment (the encoder could
+    /// not encode them), or its rows could not be staged, or a streamed frame
+    /// from it could not be read or decoded, or its local pass panicked. For
+    /// rows that could not be encoded, each failed table's rows after its
+    /// newest segment are deleted and its segments are kept; rows that could
+    /// not be staged, read or decoded, and a pass that panicked, were never
+    /// written. The recording is then finalized. The other sources keep
+    /// recording ([`Event::NoneRecording`] follows when no source is left
+    /// recording). `reason` names each failed table and the encoder's error,
+    /// or what could not be staged or read, or the panic's message. At most
+    /// once per source; its state is then [`SourceState::Failed`].
     SourceFailed { source: SourceId, reason: String },
     /// No source is `Pending`, `Activating` or `Active`: each was refused or
     /// failed ([`Event::Refused`], [`Event::SourceFailed`]), or none was
@@ -328,8 +328,8 @@ pub enum Event {
     /// recorder keeps ticking with nothing to record, and
     /// [`Recorder::finish`] returns each source's state: it finalizes the
     /// archive with the rows committed so far, or removes it when no source
-    /// delivered a frame, a scrape or a pass ([`Summary::discarded`]). A caller with no other reason
-    /// to stop can finish on this event.
+    /// delivered a frame, a scrape or a pass ([`Summary::discarded`]). A
+    /// caller with no other reason to stop can finish on this event.
     NoneRecording,
     /// The archive failed: a commit, a seal, retention, a metadata write or
     /// adding a recording failed, or the writer task stopped. The recorder
@@ -1791,9 +1791,17 @@ impl Driver {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| source.pass()));
                     match pass {
                         Ok(pass) => (i, Ok((source, pass))),
-                        // The source is dropped: its state after a panic is
-                        // unknown, and it is never asked again.
-                        Err(panic) => (i, Err(panic_message(panic.as_ref()))),
+                        // The source is dropped, under its own guard: its
+                        // state after a panic is unknown, and it is never
+                        // asked again.
+                        Err(panic) => {
+                            let message = panic_message(panic.as_ref());
+                            let _ =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                                    drop(source)
+                                }));
+                            (i, Err(message))
+                        }
                     }
                 })
                 .collect::<Vec<_>>()
