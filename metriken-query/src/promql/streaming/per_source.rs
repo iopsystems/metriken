@@ -2346,6 +2346,134 @@ mod tests {
         assert!(conflicts.notices().is_empty());
     }
 
+    /// [`histogram_source`] with every series' rows at `scale`, as a
+    /// recorded column's `scale` key gives them.
+    fn scaled_source(
+        interval_s: u64,
+        series: &[TestSeries<'_>],
+        scale: f64,
+    ) -> Arc<dyn DataSource> {
+        let source = histogram_source(interval_s, series);
+        let mut memory = crate::memory::Memory::new(interval_s * 1000);
+        for (labels, rows) in series {
+            let labels = Labels::from(*labels);
+            let Some(stream) = source.histogram_stream("h", &labels, 0, u64::MAX) else {
+                continue;
+            };
+            let snapshots: Vec<crate::types::HistogramSnapshot> =
+                stream.rows.map(|r| r.snapshot).collect();
+            memory.push_histogram_series(
+                "h",
+                crate::types::Histogram {
+                    labels: labels.clone(),
+                    config: stream.meta.config,
+                    timestamps: rows.clone(),
+                    snapshots,
+                },
+            );
+            memory.set_histogram_scale("h", labels, 0, scale);
+        }
+        Arc::new(memory)
+    }
+
+    /// Two members of one process group, a fine one to 10 s and a coarse
+    /// one to 20 s, each at `scales[i]`.
+    fn scaled_group(scales: [f64; 2]) -> Vec<Member> {
+        let cpu0: &[(&str, &str)] = &[("cpu", "0")];
+        // The fine member stops at 10 s, so the coarse one's rows answer
+        // after it.
+        let rows: Vec<u64> = (0..=10).map(|s| s * S).collect();
+        let coarse: Vec<u64> = (0..=4).map(|s| s * 5 * S).collect();
+        [
+            scaled_source(1, &[(cpu0, rows)], scales[0]),
+            scaled_source(5, &[(cpu0, coarse)], scales[1]),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(m, source)| Member {
+            raw: Arc::clone(&source),
+            source,
+            lo: 0,
+            hi: u64::MAX,
+            uuid: Some(format!("u{m}")),
+            catalog_index: m,
+            position: m,
+            first_ns: u64::MAX,
+        })
+        .collect()
+    }
+
+    /// The p90 points of a combined stream, divided by its rows' scale as
+    /// `histogram_quantiles` divides them, or the refusal.
+    fn p90(stream: Option<Option<HistogramStream>>) -> Result<Vec<f64>, crate::QueryError> {
+        use crate::promql::scale::{unscale_samples, Scales};
+        use crate::promql::streaming::histogram::HistogramOps;
+        let stream = stream.flatten().expect("a combined stream");
+        let (stream, scales) = Scales::watch(stream);
+        let mut samples = stream.quantiles(&[0.9], 0, 20 * S, None, "h");
+        let scale = scales.scale("histogram_quantiles", "h")?;
+        unscale_samples(&mut samples, scale);
+        Ok(samples
+            .into_iter()
+            .flat_map(|m| m.values)
+            .map(|(_, v)| v)
+            .collect())
+    }
+
+    /// A process group's combined rows keep their members' scale, in the
+    /// streaming combine and the materialized one: members stored ×1000
+    /// read a thousandth of what the same members at scale 1 read.
+    #[test]
+    fn a_combined_histogram_reads_in_its_members_unit() {
+        let read = |scales: [f64; 2], streaming: bool| {
+            let members = scaled_group(scales);
+            let stream = if streaming {
+                combine_histograms(
+                    &members,
+                    "h",
+                    &Labels::default(),
+                    0,
+                    20 * S,
+                    &Default::default(),
+                )
+            } else {
+                combine_histograms_materialized(&members, "h", &Labels::default(), 0, 20 * S)
+            };
+            p90(stream).unwrap()
+        };
+        for streaming in [true, false] {
+            let unit = read([1.0, 1.0], streaming);
+            let scaled = read([1000.0, 1000.0], streaming);
+            assert!(
+                !unit.is_empty() && unit.iter().all(|v| *v > 0.0),
+                "{unit:?}"
+            );
+            let want: Vec<f64> = unit.iter().map(|v| v / 1000.0).collect();
+            assert_eq!(scaled, want, "streaming {streaming}");
+        }
+    }
+
+    /// A process group whose members are stored at two scales is refused
+    /// when a function pools their rows, in either combine.
+    #[test]
+    fn a_combined_histogram_of_two_scales_is_refused() {
+        let members = scaled_group([1000.0, 10.0]);
+        for stream in [
+            combine_histograms(
+                &members,
+                "h",
+                &Labels::default(),
+                0,
+                20 * S,
+                &Default::default(),
+            ),
+            combine_histograms_materialized(&members, "h", &Labels::default(), 0, 20 * S),
+        ] {
+            let err = p90(stream).expect_err("two scales").to_string();
+            assert!(err.contains("different scales"), "{err}");
+        }
+    }
+
     /// A source whose second histogram read is another source's: rows the
     /// first read had are gone or new ones appear, as when a sealed segment
     /// is evicted between the combine's two reads.

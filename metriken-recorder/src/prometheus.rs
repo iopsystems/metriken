@@ -34,9 +34,8 @@ use tracing::{debug, warn};
 /// [`metriken_storage::prometheus_units::UNITS`]: `rpc_seconds` is in
 /// `seconds`, `rpc_ms` in `milliseconds`, `cpu_percent` in `percent` (0 to
 /// 100). A `_count` sample has none. A histogram's bounds are the
-/// exporter's `le` values, multiplied by a power of 10 when the smallest is
-/// below 1, which is then written as [`SCALE_KEY`]; see
-/// `convert_histogram`.
+/// exporter's `le` values multiplied by a scale and rounded, the scale
+/// written as [`SCALE_KEY`]; see `convert_histogram`.
 ///
 /// An exporter label whose key is a storage key
 /// ([`metriken_storage::STORAGE_KEYS`]: `unit`, `scale`, `metric`, …) is
@@ -293,7 +292,7 @@ impl PrometheusConverter {
                 }
                 Value::Histogram(ref buckets) => {
                     if let Some((h, mut metadata, overflow)) =
-                        convert_histogram(buckets, &name, &labels)
+                        convert_histogram(buckets, &name, &labels, unit)
                     {
                         if let Some(unit) = unit {
                             metadata.insert(UNIT_KEY.to_string(), unit.to_string());
@@ -475,12 +474,18 @@ has_name_and_metadata!(FloatCounter, FloatGauge, SnapshotHistogram);
 /// Uses the upper bound (le) of each bucket as the representative value and
 /// computes per-bucket delta counts from the cumulative Prometheus counts.
 ///
-/// Each `le` is in the exporter's unit, and is multiplied by the power of
-/// 10 that makes the smallest positive bound at least 1, so no bound
-/// truncates to 0 in the histogram's integer buckets. That power, when it
-/// is not 1, is written as [`SCALE_KEY`]: a `_seconds` histogram whose
-/// smallest bound is 0.005 is stored ×1000, with `scale` 1000 and `unit`
-/// `seconds`, and metriken-query reads it back in seconds.
+/// The histogram's buckets hold integers, so each `le`, in the exporter's
+/// unit, is multiplied by a scale and rounded to the nearest integer
+/// ([`histogram_scale`]): a fixed one for a time unit (×1e9 for `seconds`,
+/// so the bounds are in nanoseconds, whatever the exporter's smallest
+/// bucket), and otherwise the smallest power of 10 that makes every finite
+/// bound an integer. The scale, when it is not 1, is written as
+/// [`SCALE_KEY`], and metriken-query divides by it, so the histogram reads
+/// in its `unit`. A bound is counted in the `histogram` crate's bucket
+/// holding its rounded value. Two bounds that land in one bucket (the
+/// crate's buckets are exact below 128 and about 1% wide above it, and two
+/// bounds can round to one integer at the cap) have their observations
+/// added in that bucket, so no observation is lost or counted twice.
 ///
 /// With a `+Inf` bucket, also returns the overflow, the `+Inf` count less
 /// the highest finite bucket's (at least 0), and writes into the metadata
@@ -492,6 +497,7 @@ fn convert_histogram(
     buckets: &[HistogramCount],
     metric_name: &str,
     labels: &[(String, String)],
+    unit: Option<&str>,
 ) -> Option<(histogram::Histogram, HashMap<String, String>, Option<f64>)> {
     // Filter to finite boundaries only (+Inf cannot be represented)
     let finite_buckets: Vec<_> = buckets
@@ -503,13 +509,13 @@ fn convert_histogram(
         return None;
     }
 
-    // A power of 10 that keeps every bound above 0.
-    let scale = compute_scale(finite_buckets.iter().map(|b| b.less_than));
+    let scale = histogram_scale(unit, finite_buckets.iter().map(|b| b.less_than));
+    let scaled = |bound: f64| (bound * scale).round();
 
     // max_value_power must cover the largest scaled value
     let max_scaled = finite_buckets
         .iter()
-        .map(|b| (b.less_than * scale) as u64)
+        .map(|b| scaled(b.less_than) as u64)
         .max()
         .unwrap_or(1);
     let max_value_power = if max_scaled == 0 {
@@ -528,7 +534,7 @@ fn convert_histogram(
         let cum_count = bucket.count as u64;
         let delta = cum_count.saturating_sub(prev_count);
         if delta > 0 {
-            let value = (bucket.less_than * scale) as u64;
+            let value = scaled(bucket.less_than) as u64;
             let _ = h.add(value, delta);
         }
         prev_count = cum_count;
@@ -558,7 +564,7 @@ fn convert_histogram(
         metadata.insert(OVERFLOW_KEY.to_string(), overflow_name(metric_name));
         metadata.insert(
             OVERFLOW_BOUND_KEY.to_string(),
-            (top.less_than * scale).to_string(),
+            scaled(top.less_than).to_string(),
         );
     }
 
@@ -571,17 +577,38 @@ fn overflow_name(metric: &str) -> String {
     format!("{metric}_overflow")
 }
 
-/// Compute a power-of-10 scale factor that makes the smallest positive
-/// bound >= 1, preserving precision when converting float boundaries to u64.
-fn compute_scale(bounds: impl Iterator<Item = f64>) -> f64 {
-    let min_le = bounds.filter(|v| *v > 0.0).fold(f64::INFINITY, f64::min);
+/// The largest scale [`histogram_scale`] picks for a histogram without a
+/// time unit: 1e9, nanosecond resolution of a unit of 1.
+const MAX_SCALE: f64 = 1e9;
 
-    if min_le >= 1.0 || min_le == f64::INFINITY {
-        return 1.0;
+/// The factor a histogram's bounds are multiplied by before they are
+/// rounded into its integer buckets ([`SCALE_KEY`]).
+///
+/// A time unit has a fixed scale, its nanoseconds per unit: `seconds` 1e9,
+/// `milliseconds` 1e6, `microseconds` 1e3, `nanoseconds` 1. Every
+/// histogram of one name and unit is then stored at one scale, whichever
+/// buckets its exporter serves, so two endpoints' histograms pool. Any
+/// other histogram (no unit, `bytes`, `ratio`, `percent`, …) takes the
+/// smallest power of 10, at most [`MAX_SCALE`], that makes every finite
+/// bound an integer within a relative 1e-9: `0.1, 0.25, 0.5` take 100.
+/// The overflow bound is the highest finite bound, so it is one of them.
+fn histogram_scale(unit: Option<&str>, bounds: impl Iterator<Item = f64> + Clone) -> f64 {
+    match unit {
+        Some("seconds") => return 1e9,
+        Some("milliseconds") => return 1e6,
+        Some("microseconds") => return 1e3,
+        Some("nanoseconds") => return 1.0,
+        _ => {}
     }
-
+    let integral = |scale: f64| {
+        bounds.clone().all(|b| {
+            // A bound that is not 0 must not round to 0.
+            let v = b * scale;
+            (b == 0.0 || v.round() != 0.0) && (v - v.round()).abs() <= v.abs() * 1e-9
+        })
+    };
     let mut scale = 1.0;
-    while min_le * scale < 1.0 {
+    while scale < MAX_SCALE && !integral(scale) {
         scale *= 10.0;
     }
     scale
@@ -758,11 +785,11 @@ mod tests {
 
     /// A histogram's overflow is the `+Inf` count less the highest finite
     /// bucket's, found by bound whatever the line order, its bound is the
-    /// highest finite `le` as served (no scale when every bound is at least
-    /// 1), and its overflow series is named after the exporter's name. A
-    /// histogram without a `+Inf` bucket has neither.
+    /// highest finite `le` at the buckets' scale (a `_seconds` histogram's
+    /// in nanoseconds), and its overflow series is named after the
+    /// exporter's name. A histogram without a `+Inf` bucket has neither.
     #[test]
-    fn the_overflow_is_above_the_highest_finite_bound_scaled() {
+    fn the_overflow_is_above_the_highest_finite_bound() {
         let mut conv = PrometheusConverter::new();
         let text = "# TYPE lat_seconds histogram
                     lat_seconds_bucket{le=\"10\"} 9
@@ -789,12 +816,57 @@ mod tests {
         };
         let lat = meta("lat_seconds");
         assert_eq!(lat[OVERFLOW_KEY], "lat_seconds_overflow");
-        assert_eq!(lat[OVERFLOW_BOUND_KEY], "10");
+        assert_eq!(lat[OVERFLOW_BOUND_KEY], "10000000000");
         assert_eq!(lat[UNIT_KEY], "seconds");
-        assert!(!lat.contains_key(SCALE_KEY), "{lat:?}");
+        assert_eq!(lat[SCALE_KEY], "1000000000");
         let short = meta("short");
         assert!(!short.contains_key(OVERFLOW_KEY));
         assert!(!short.contains_key(OVERFLOW_BOUND_KEY));
+    }
+
+    /// A time unit takes its fixed scale whatever the bounds; any other
+    /// histogram the smallest power of 10 that makes every bound an integer,
+    /// at most `MAX_SCALE`.
+    #[test]
+    fn a_histogram_scale_makes_every_bound_an_integer() {
+        let scale = |unit, bounds: &[f64]| histogram_scale(unit, bounds.iter().copied());
+        assert_eq!(scale(Some("seconds"), &[0.005, 0.1]), 1e9);
+        assert_eq!(scale(Some("seconds"), &[1.0, 10.0]), 1e9);
+        assert_eq!(scale(Some("milliseconds"), &[0.5]), 1e6);
+        assert_eq!(scale(Some("microseconds"), &[0.5]), 1e3);
+        assert_eq!(scale(Some("nanoseconds"), &[100.0]), 1.0);
+        assert_eq!(scale(None, &[1.0, 5.0, 10.0]), 1.0);
+        assert_eq!(scale(None, &[0.1, 0.25, 0.5]), 100.0);
+        assert_eq!(scale(None, &[0.0003, 0.0006]), 10_000.0);
+        assert_eq!(scale(Some("bytes"), &[0.5, 1024.0]), 10.0);
+        assert_eq!(scale(None, &[0.0, 0.5]), 10.0);
+        assert_eq!(scale(None, &[1e-12]), MAX_SCALE);
+        assert_eq!(scale(None, &[1.0 / 3.0]), MAX_SCALE);
+    }
+
+    /// Each bound is rounded, not truncated, into the buckets: `0.0003` ×
+    /// 10_000 is 3, and `0.1, 0.15` stay two buckets.
+    #[test]
+    fn a_bound_is_rounded_into_its_bucket() {
+        let bucket = |le: f64, count: f64| HistogramCount {
+            less_than: le,
+            count,
+        };
+        let values = |buckets: &[HistogramCount]| -> Vec<(u64, u64)> {
+            let (h, _, _) = convert_histogram(buckets, "x", &[], None).unwrap();
+            h.into_iter()
+                .filter(|b| b.count() > 0)
+                .map(|b| (b.end(), b.count()))
+                .collect()
+        };
+        assert_eq!(
+            values(&[bucket(0.0003, 1.0), bucket(0.0006, 3.0)]),
+            [(3, 1), (6, 2)]
+        );
+        assert_eq!(
+            values(&[bucket(0.1, 1.0), bucket(0.15, 3.0), bucket(0.25, 4.0)]),
+            [(10, 1), (15, 2), (25, 1)]
+        );
     }
 
     /// An exporter's trailing timestamp does not become the acquisition
@@ -1136,7 +1208,7 @@ g_seconds{unit=\"u\"} 5
         assert_eq!(lat.len(), 1, "{all:?}");
         assert_eq!(lat[0]["exported_scale"], "x");
         assert_eq!(lat[0][OVERFLOW_KEY], "lat_seconds_overflow");
-        assert_eq!(lat[0][SCALE_KEY], "10", "{:?}", lat[0]);
+        assert_eq!(lat[0][SCALE_KEY], "1000000000", "{:?}", lat[0]);
         let overflow = find("lat_seconds_overflow");
         assert_eq!(overflow.len(), 1, "{all:?}");
         assert_eq!(overflow[0]["exported_scale"], "x");

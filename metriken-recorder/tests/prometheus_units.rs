@@ -6,8 +6,9 @@
 //! Every series is stored under the exporter's name with the exporter's
 //! values, and the `unit` key of its sealed column is the unit its name's
 //! token or `# UNIT` line names (`metriken_storage::prometheus_units`). A
-//! `_count` has no unit. A histogram's bounds are multiplied by a power of
-//! 10 when the smallest is below 1, recorded as `scale`, which metriken-query
+//! `_count` has no unit. A histogram's bounds are multiplied by a scale and
+//! rounded (a time unit's nanoseconds per unit, else the power of 10 that
+//! makes every bound an integer), recorded as `scale`, which metriken-query
 //! divides every value it takes from a bucket by.
 
 use std::collections::{BTreeMap, HashMap};
@@ -373,8 +374,26 @@ fn the_unit_key_is_the_exporters_unit() {
     }
 }
 
-/// A `_seconds` histogram whose bounds are at least 1 is stored with its
-/// bounds as served and no `scale`, so its quantiles read in seconds.
+/// Every value of `query`'s one series is within 1% of `want`: a time
+/// histogram is stored in nanoseconds, where the `histogram` crate's
+/// buckets above 128 are about 1% wide, and a quantile reads its bucket's
+/// upper edge.
+fn about(source: &dyn MetricsSource, query: &str, want: f64) {
+    let m = matrix(source, query);
+    assert_eq!(m.len(), 1, "{query}: {m:?}");
+    let values = &m[0].1;
+    assert!(!values.is_empty(), "{query}: no points");
+    for v in values {
+        assert!(
+            (v - want).abs() <= want.abs() * 0.01,
+            "{query}: want about {want}, got {values:?}"
+        );
+    }
+}
+
+/// A `_seconds` histogram is stored in nanoseconds whatever its bounds: its
+/// bounds and overflow bound ×1e9, `scale` 1e9, and its quantiles read in
+/// seconds, recorded and live.
 #[test]
 fn a_seconds_histogram_reads_in_seconds() {
     let dir = tempfile::tempdir().unwrap();
@@ -382,32 +401,21 @@ fn a_seconds_histogram_reads_in_seconds() {
     let reader = recorded(&path);
     let columns = sealed_columns(&path);
     let h = &columns[&("rpc_seconds".to_string(), None)];
-    assert!(!h.contains_key(SCALE_KEY), "{h:?}");
-    assert_eq!(h[OVERFLOW_BOUND_KEY], "10");
+    assert_eq!(h["unit"], "seconds");
+    assert_eq!(h[SCALE_KEY], "1000000000");
+    assert_eq!(h[OVERFLOW_BOUND_KEY], "10000000000");
     let store = live();
     for source in [&reader as &dyn MetricsSource, &store] {
-        every(
-            source,
-            "histogram_quantile(0.5, rpc_seconds)",
-            Some("rpc_seconds"),
-            1.0,
-        );
-        every(
-            source,
-            "histogram_quantile(0.9, rpc_seconds)",
-            Some("rpc_seconds"),
-            10.0,
-        );
+        about(source, "histogram_quantile(0.5, rpc_seconds)", 1.0);
+        about(source, "histogram_quantile(0.9, rpc_seconds)", 10.0);
     }
 }
 
-/// A histogram whose smallest bound is below 1 has its bounds and overflow
-/// bound multiplied by the power of 10 that brings it to 1, recorded as
-/// `scale`, in the exporter's unit: `fast_seconds` (1 ms and 10 ms) is
-/// stored ×1000 with `scale` 1000. metriken-query divides every value it
-/// takes from a bucket by it, recorded and live: the quantiles, their
-/// bands, the mean, the sum and the heatmap's bounds are in seconds. The
-/// count is not scaled, nor is the `_sum` series.
+/// A `_seconds` histogram whose bounds are below 1 (1 ms, 10 ms) is stored
+/// ×1e9 with `scale` 1e9, and metriken-query divides every value it takes
+/// from a bucket by it, recorded and live: the quantiles, their bands, the
+/// mean, the sum and the heatmap's bounds are in seconds. The count is not
+/// scaled, nor is the `_sum` series.
 #[test]
 fn a_histogram_below_one_reads_in_its_unit() {
     let dir = tempfile::tempdir().unwrap();
@@ -416,14 +424,13 @@ fn a_histogram_below_one_reads_in_its_unit() {
     let columns = sealed_columns(&path);
     let h = &columns[&("fast_seconds".to_string(), None)];
     assert_eq!(h["unit"], "seconds");
-    assert_eq!(h[SCALE_KEY], "1000");
-    assert_eq!(h[OVERFLOW_BOUND_KEY], "10");
+    assert_eq!(h[SCALE_KEY], "1000000000");
+    assert_eq!(h[OVERFLOW_BOUND_KEY], "10000000");
     let store = live();
     for source in [&reader as &dyn MetricsSource, &store] {
-        let p50 = "histogram_quantile(0.5, fast_seconds)";
-        every(source, p50, Some("fast_seconds"), 0.001);
+        about(source, "histogram_quantile(0.5, fast_seconds)", 0.001);
         let p90 = "histogram_quantile(0.9, fast_seconds)";
-        every(source, p90, Some("fast_seconds"), 0.01);
+        about(source, p90, 0.01);
         let quantiles = "histogram_quantiles([0.5, 0.9], fast_seconds)";
         let m = matrix(source, quantiles);
         assert_eq!(m.len(), 2, "{m:?}");
@@ -433,31 +440,21 @@ fn a_histogram_below_one_reads_in_its_unit() {
                 _ => 0.01,
             };
             assert!(
-                values.iter().all(|v| (v - want).abs() <= want * 1e-9),
+                values.iter().all(|v| (v - want).abs() <= want * 0.01),
                 "{quantiles}: {m:?}"
             );
         }
         // The bucket band of each quantile point, in seconds.
         for band in bands(source, p90) {
             assert!(
-                band.0 <= 0.01 + 1e-12 && band.1 >= 0.01 - 1e-12 && band.1 < 0.02,
+                band.0 <= 0.01 && band.1 >= 0.01 && band.1 < 0.0102,
                 "{p90}: {band:?}"
             );
         }
         // 5 observations of 1 ms and 4 of 10 ms a tick: a mean of 5 ms and
         // a sum of 45 ms. The overflow is in neither.
-        every(
-            source,
-            "histogram_mean(fast_seconds)",
-            Some("fast_seconds"),
-            0.005,
-        );
-        every(
-            source,
-            "histogram_sum(fast_seconds)",
-            Some("fast_seconds"),
-            0.045,
-        );
+        about(source, "histogram_mean(fast_seconds)", 0.005);
+        about(source, "histogram_sum(fast_seconds)", 0.045);
         every(
             source,
             "histogram_count(fast_seconds)",
@@ -467,13 +464,7 @@ fn a_histogram_below_one_reads_in_its_unit() {
         let bounds = heatmap_bounds(source, "histogram_heatmap(fast_seconds)");
         assert!(!bounds.is_empty());
         assert!(
-            bounds
-                .iter()
-                .all(|b| (0.001 - 1e-12..=0.01 + 1e-12).contains(b)),
-            "{bounds:?}"
-        );
-        assert!(
-            bounds.iter().any(|b| (b - 0.01).abs() < 1e-12),
+            bounds.iter().all(|b| (0.00099..=0.0102).contains(b)),
             "{bounds:?}"
         );
         every(
@@ -485,58 +476,126 @@ fn a_histogram_below_one_reads_in_its_unit() {
     }
 }
 
-/// `fast_seconds` with buckets at 1 ms and 10 ms (stored ×1000).
-fn fast_ms(t: u64) -> String {
-    format!(
-        "# TYPE fast_seconds histogram\n\
-         fast_seconds_bucket{{le=\"0.001\"}} {a}\n\
-         fast_seconds_bucket{{le=\"0.01\"}} {b}\n\
-         fast_seconds_bucket{{le=\"+Inf\"}} {b}\n",
-        a = 5 * t,
-        b = 10 * t,
-    )
+/// `name` (no unit) with buckets at `les` and per tick `counts` cumulative
+/// observations at each, and the rest of 10 above the last.
+fn plain_histogram(name: &str, les: &[&str], counts: &[u64], t: u64) -> String {
+    let mut text = format!("# TYPE {name} histogram\n");
+    for (le, c) in les.iter().zip(counts) {
+        text.push_str(&format!("{name}_bucket{{le=\"{le}\"}} {}\n", c * t));
+    }
+    text.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {}\n", 10 * t));
+    text
 }
 
-/// `fast_seconds` with buckets at 0.1 s and 1 s (stored ×10).
-fn fast_tenths(t: u64) -> String {
-    format!(
-        "# TYPE fast_seconds histogram\n\
-         fast_seconds_bucket{{le=\"0.1\"}} {a}\n\
-         fast_seconds_bucket{{le=\"1\"}} {b}\n\
-         fast_seconds_bucket{{le=\"+Inf\"}} {b}\n",
-        a = 5 * t,
-        b = 10 * t,
-    )
+/// A histogram without a time unit takes the smallest power of 10 that
+/// makes every bound an integer, and its bounds are rounded, not truncated:
+/// `0.1, 0.25, 0.5` at 100, so its p50 reads 0.25 exactly, and
+/// `0.0003, 0.0006` at 10_000. The overflow bound takes the same scale.
+#[test]
+fn a_unitless_histogram_reads_its_bounds_exactly() {
+    let text = |t: u64| {
+        plain_histogram("frac", &["0.1", "0.25", "0.5"], &[2, 5, 9], t)
+            + &plain_histogram("tiny", &["0.0003", "0.0006"], &[5, 10], t)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    let reader = record(&path, &[("e", &text)]);
+    let columns = sealed_columns(&path);
+    let frac = &columns[&("frac".to_string(), None)];
+    assert_eq!(
+        (frac[SCALE_KEY].as_str(), frac[OVERFLOW_BOUND_KEY].as_str()),
+        ("100", "50")
+    );
+    assert!(!frac.contains_key("unit"), "{frac:?}");
+    let tiny = &columns[&("tiny".to_string(), None)];
+    assert_eq!(
+        (tiny[SCALE_KEY].as_str(), tiny[OVERFLOW_BOUND_KEY].as_str()),
+        ("10000", "6")
+    );
+    let store = live_of(&text);
+    for source in [&reader as &dyn MetricsSource, &store] {
+        every(source, "histogram_quantile(0.15, frac)", Some("frac"), 0.1);
+        every(source, "histogram_quantile(0.5, frac)", Some("frac"), 0.25);
+        every(source, "histogram_quantile(0.9, frac)", Some("frac"), 0.5);
+        every(
+            source,
+            "histogram_quantile(0.5, tiny)",
+            Some("tiny"),
+            0.0003,
+        );
+        every(
+            source,
+            "histogram_quantile(0.9, tiny)",
+            Some("tiny"),
+            0.0006,
+        );
+    }
 }
 
-/// Two recordings of one histogram at one scale pool as before and read in
-/// seconds. At two scales, a function that pools them is refused, naming
-/// the scales; a label matcher selecting one reads it in seconds; the
-/// count, which no scale changes, is not refused.
+/// A `_ms` histogram is stored ×1e6 (nanoseconds) and reads in
+/// milliseconds.
+#[test]
+fn a_ms_histogram_reads_in_milliseconds() {
+    let text = |t: u64| plain_histogram("wait_ms", &["0.5", "5"], &[5, 10], t);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.dendro");
+    let reader = record(&path, &[("e", &text)]);
+    let h = &sealed_columns(&path)[&("wait_ms".to_string(), None)];
+    assert_eq!(h["unit"], "milliseconds");
+    assert_eq!(h[SCALE_KEY], "1000000");
+    assert_eq!(h[OVERFLOW_BOUND_KEY], "5000000");
+    let store = live_of(&text);
+    for source in [&reader as &dyn MetricsSource, &store] {
+        about(source, "histogram_quantile(0.5, wait_ms)", 0.5);
+        about(source, "histogram_quantile(0.9, wait_ms)", 5.0);
+    }
+}
+
+/// Two endpoints' `lat_seconds`, one with buckets from 5 ms and one from
+/// 100 ms, are both stored at the seconds scale, so a quantile pools them.
+#[test]
+fn seconds_histograms_of_two_endpoints_pool() {
+    let fine = |t: u64| plain_histogram("lat_seconds", &["0.005", "0.05"], &[10, 10], t);
+    let coarse = |t: u64| plain_histogram("lat_seconds", &["0.1", "1"], &[0, 10], t);
+    let dir = tempfile::tempdir().unwrap();
+    let reader = record(
+        &dir.path().join("a.dendro"),
+        &[("fine", &fine), ("coarse", &coarse)],
+    );
+    // 10 observations of 5 ms and 10 of 1 s a tick.
+    about(&reader, "histogram_quantile(0.25, lat_seconds)", 0.005);
+    about(&reader, "histogram_quantile(0.9, lat_seconds)", 1.0);
+}
+
+/// `frac` with buckets at 1 ms and 10 ms, no unit (stored ×1000).
+fn frac_fine(t: u64) -> String {
+    plain_histogram("frac", &["0.001", "0.01"], &[5, 10], t)
+}
+
+/// `frac` with buckets at 0.1 and 1, no unit (stored ×10).
+fn frac_coarse(t: u64) -> String {
+    plain_histogram("frac", &["0.1", "1"], &[5, 10], t)
+}
+
+/// Two recordings of one unitless histogram at two scales: a function that
+/// pools them into one output is refused, naming the scales; one that
+/// groups them by recording divides each group by its own scale; a label
+/// matcher selecting one reads it; the count, which no scale changes, is
+/// not refused.
 #[test]
 fn recordings_at_different_scales_are_refused_when_pooled() {
     let dir = tempfile::tempdir().unwrap();
-    let same = record(
-        &dir.path().join("same.dendro"),
-        &[("a", &fast_ms), ("b", &fast_ms)],
-    );
-    every(
-        &same,
-        "histogram_quantile(0.5, fast_seconds)",
-        Some("fast_seconds"),
-        0.001,
-    );
-
     let mixed = record(
         &dir.path().join("mixed.dendro"),
-        &[("a", &fast_ms), ("b", &fast_tenths)],
+        &[("a", &frac_fine), ("b", &frac_coarse)],
     );
     for query in [
-        "histogram_quantile(0.5, fast_seconds)",
-        "histogram_quantiles([0.5], fast_seconds)",
-        "histogram_mean(fast_seconds)",
-        "histogram_sum(fast_seconds)",
-        "histogram_heatmap(fast_seconds)",
+        "histogram_quantile(0.5, frac)",
+        "histogram_quantiles([0.5], frac)",
+        "histogram_mean(frac)",
+        "histogram_sum(frac)",
+        "histogram_mean by (other) (frac)",
+        "histogram_heatmap(frac)",
     ] {
         let err = mixed
             .query_range(
@@ -545,40 +604,57 @@ fn recordings_at_different_scales_are_refused_when_pooled() {
                 (BASE / S + TICKS - 1) as f64,
                 1.0,
             )
-            .err()
-            .unwrap_or_else(|| panic!("{query}: not refused"))
+            .expect_err(query)
             .to_string();
         assert!(err.contains("different scales"), "{query}: {err}");
-        assert!(err.contains("1000") && err.contains("10"), "{query}: {err}");
+        assert!(
+            err.contains("1000 and 10") || err.contains("10 and 1000"),
+            "{query}: {err}"
+        );
+        assert!(
+            err.contains("time range within one bucket layout"),
+            "{query}: {err}"
+        );
     }
-    let one =
-        |source: &str| format!("histogram_quantile(0.5, fast_seconds{{source=\"{source}\"}})");
-    every(&mixed, &one("a"), Some("fast_seconds"), 0.001);
-    every(&mixed, &one("b"), Some("fast_seconds"), 0.1);
-    every(
-        &mixed,
-        "histogram_count(fast_seconds)",
-        Some("fast_seconds"),
-        20.0,
-    );
+    let one = |source: &str| format!("histogram_quantile(0.5, frac{{source=\"{source}\"}})");
+    every(&mixed, &one("a"), Some("frac"), 0.001);
+    every(&mixed, &one("b"), Some("frac"), 0.1);
+    every(&mixed, "histogram_count(frac)", Some("frac"), 20.0);
+
+    // By recording: each group has one scale, divided by its own. 5
+    // observations at each bound: means of 5.5 ms and 0.55, sums ×10.
+    for (query, a, b) in [
+        ("histogram_mean by (source) (frac)", 0.0055, 0.55),
+        ("histogram_sum by (source) (frac)", 0.055, 5.5),
+    ] {
+        let m = matrix(&mixed, query);
+        assert_eq!(m.len(), 2, "{query}: {m:?}");
+        for (labels, values) in &m {
+            let want = if labels["source"] == "a" { a } else { b };
+            assert!(
+                !values.is_empty() && values.iter().all(|v| (v - want).abs() <= want * 1e-9),
+                "{query}: {labels:?} want {want}, got {values:?}"
+            );
+        }
+    }
 }
 
 /// A live store fed one exporter whose buckets change scale mid-run:
-/// before the change and after it each read in seconds, and a function
-/// pooling rows of both is refused.
+/// before the change and after it each read in the exporter's unit, and a
+/// function pooling rows of both is refused.
 #[test]
 fn a_live_series_whose_scale_changes_is_refused_when_pooled() {
     let text = |t: u64| {
         if t < 6 {
-            fast_ms(t)
+            frac_fine(t)
         } else {
-            fast_tenths(t)
+            frac_coarse(t)
         }
     };
     let store = live_of(&text);
     let read = |lo: u64, hi: u64| {
         store.query_range(
-            "histogram_quantile(0.5, fast_seconds)",
+            "histogram_quantile(0.5, frac)",
             (BASE / S + lo) as f64,
             (BASE / S + hi) as f64,
             1.0,
@@ -611,7 +687,8 @@ fn a_live_series_whose_scale_changes_is_refused_when_pooled() {
 }
 
 /// A histogram's overflow series is `<exporter name>_overflow`, which its
-/// column names, and a quantile in the overflow is +Inf.
+/// column names, and a quantile in the overflow is +Inf, with the band
+/// from the highest finite bound, divided by the scale, to +Inf.
 #[test]
 fn the_overflow_series_is_named_after_the_exporter_name() {
     let dir = tempfile::tempdir().unwrap();
@@ -630,9 +707,17 @@ fn the_overflow_series_is_named_after_the_exporter_name() {
             Some("rpc_seconds_overflow"),
             1.0,
         );
-        let q = matrix(source, "histogram_quantile(0.99, rpc_seconds)");
-        assert_eq!(q.len(), 1, "{q:?}");
-        assert!(q[0].1.iter().all(|v| *v == f64::INFINITY), "{:?}", q[0].1);
+        for (query, bound) in [
+            ("histogram_quantile(0.99, rpc_seconds)", 10.0),
+            ("histogram_quantile(0.99, fast_seconds)", 0.01),
+        ] {
+            let q = matrix(source, query);
+            assert_eq!(q.len(), 1, "{q:?}");
+            assert!(q[0].1.iter().all(|v| *v == f64::INFINITY), "{:?}", q[0].1);
+            for band in bands(source, query) {
+                assert_eq!(band, (bound, f64::INFINITY), "{query}");
+            }
+        }
     }
 }
 
@@ -661,6 +746,16 @@ fn a_description_is_kept_under_the_exporters_name() {
 fn metric_unit_is_the_stored_unit() {
     let dir = tempfile::tempdir().unwrap();
     let reader = recorded(&dir.path().join("a.dendro"));
+    // Answered from a segment footer: no table's reader is built.
+    assert_eq!(
+        reader.metric_unit("lag_seconds").as_deref(),
+        Some("seconds")
+    );
+    assert!(
+        reader.opened_tables().is_empty(),
+        "{:?}",
+        reader.opened_tables()
+    );
     let store = live();
     for source in [&reader as &dyn MetricsSource, &store] {
         for (name, want) in [

@@ -50,14 +50,21 @@ pub const STORAGE_KEYS: &[&str] = &[
 /// The histogram column key holding the factor its values were stored
 /// multiplied by, as an `f64`: a stored bucket bound, and the
 /// [`OVERFLOW_BOUND_KEY`], is the exporter's bound, in the column's `unit`
-/// when it has one, times it. Written by metriken-recorder's Prometheus
-/// converter when the factor is not 1, which is when the bounds would
-/// otherwise have been truncated to integers (a smallest bound below 1).
-/// Every reader in this crate hands it to metriken-query as each histogram
-/// row's [`scale`](crate::histogram_stream::HistogramRow::scale), and
-/// metriken-query divides each value it takes from a bucket by it
-/// (quantiles and their bands, means, sums, heatmap bounds), so a query
-/// reads the histogram in its `unit`.
+/// when it has one, times it, rounded to an integer.
+///
+/// metriken-recorder's Prometheus converter writes it when it is not 1. A
+/// time unit has a fixed scale, its nanoseconds per unit (`seconds` 1e9,
+/// `milliseconds` 1e6, `microseconds` 1e3); any other histogram takes the
+/// smallest power of 10, at most 1e9, that makes every finite bound an
+/// integer.
+///
+/// The parquet, segmented and memory readers hand it to metriken-query as
+/// each counting histogram row's
+/// [`scale`](crate::histogram_stream::HistogramRow::scale), 1 for a column
+/// without it. metriken-query's counting-histogram functions divide each
+/// value they take from a bucket by it (quantiles and their bands, means,
+/// sums, heatmap bounds), so a query reads the histogram in its `unit`.
+/// The gauge-histogram functions do not.
 pub const SCALE_KEY: &str = "scale";
 
 /// The histogram column key naming its overflow series: the metric name of

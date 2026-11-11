@@ -90,9 +90,10 @@ from the two histogram heatmap fixes below.
   the line's when it is in `UNITS`, else the name's token, and `None` for
   a `_count` or `_bucket` sample. Removed: `PROMETHEUS_NAME_LABEL` (and
   its re-export at the crate root), `normalize`, `Normalized`,
-  `fallback_candidates`, `TOKENS`, `Unit`, and `SamplerReader::holds_labeled`.
-  `unit_of` returns the `unit` value (`Option<&'static str>`) where it
-  returned a `Unit`. `SUFFIXES` and `split_suffix` are unchanged.
+  `fallback_candidates`, `TOKENS`, `Unit`, and
+  `SamplerReader::holds_labeled`. `unit_of` returns the `unit` value
+  (`Option<&'static str>`) where it returned a `Unit`. `SUFFIXES` and
+  `split_suffix` are unchanged.
 - **Breaking:** `HistogramRow` gains `scale: f64`, the factor the row's
   bucket bounds and overflow bound are its values times: its column's
   `SCALE_KEY`, 1 for a column without one (or whose value is not a finite
@@ -104,13 +105,17 @@ from the two histogram heatmap fixes below.
   `unit` storage key on metric `name`'s columns, sorted, `None` for a
   column without one; empty by default and for a name the source does not
   hold. The parquet, segmented, lazy, labeled, recordings and union
-  sources and `Memory` answer it, `ArchiveReader::metric_units` merges it
-  over every table holding the name, and `source::merge_units` merges
-  several sources' answers. `Memory::set_unit(name, labels, unit)` records
-  a series' unit, the latest call holding.
-- **Docs:** `SCALE_KEY` says the factor applies to the exporter's bounds
-  in the column's `unit` and to `OVERFLOW_BOUND_KEY`, and that
-  metriken-query divides by it.
+  sources and `Memory` answer it, and `source::merge_units` merges several
+  sources' answers. A source wrapping others must forward it, or its
+  metrics have no unit. `ArchiveReader::metric_units` answers it from the
+  footer of each table's first sealed segment holding the name, without
+  building the table's reader (from the reader when the name's rows are
+  all in the WAL). `Memory::set_unit(name, labels, unit)` records a
+  series' unit, the latest call holding.
+- **Docs:** `SCALE_KEY` describes what metriken-recorder's converter
+  writes (a fixed scale for a time unit, else the power of 10 that makes
+  every bound an integer), that it applies to `OVERFLOW_BOUND_KEY` too,
+  and which readers divide by it.
 
 ### metriken-query (unreleased)
 
@@ -121,35 +126,44 @@ from the two histogram heatmap fixes below.
   overflow band, `histogram_mean`, `histogram_sum` and
   `histogram_heatmap`'s bucket bounds, over an archive, a parquet file or
   a live `MemoryStore` (whose ingest takes `scale` from each snapshot's
-  histogram metadata). A Prometheus `_seconds` histogram whose smallest
-  bound is 0.005 reads in seconds, where it read ×1000. `histogram_count`
-  and `histogram_irate` count observations and are unchanged. A function
-  whose rows have two scales (two recordings, or a series whose buckets
-  changed scale within the range) is refused with an `EvaluationError`
-  naming the two scales, since their buckets cannot be added; a label
-  matcher selecting series of one scale reads them.
-- **Added:** `MetricsSource::metric_unit(name)`, the `unit` storage key of
-  metric `name` (for a Prometheus series, a value of
-  `metriken_storage::prometheus_units::UNITS`), for a catalog to format a
-  metric by. `Some` only when every column of `name`, in every recording
-  and table, carries one and the same unit; `None` when the source does
-  not hold `name`, a column has none, or two differ. Answered by
-  `ArchiveReader`, `ParquetReader`, `SegmentedParquetReader`,
-  `UnionMetricsSource` and `MemoryStore`, whose ingest records each
-  series' unit from its snapshot metadata; `None` by default.
+  histogram metadata). A histogram stored with `scale` reads in its
+  exporter's unit, divided by `scale`. A `_seconds` histogram, which
+  metriken-recorder 0.12.0 to 0.14.0 stored ×1e9 as `<name>_nanoseconds`,
+  is stored ×1e9 under its own name with `scale` 1e9 and now reads in
+  seconds. `histogram_count` and `histogram_irate` count observations and
+  are unchanged. `histogram_mean` and `histogram_sum` divide each output
+  group by its own rows' scale. A function whose output pools rows of two
+  scales (two recordings or endpoints with different bucket layouts of a
+  histogram without a time unit, or a series whose layout changed within
+  the range; the row before the range's start counts) is refused with an
+  `EvaluationError` naming the two scales, since their buckets cannot be
+  added. A label matcher that selects series of one scale, a grouping
+  that keeps them apart, or a time range within one bucket layout reads
+  them. The gauge-histogram functions do not divide.
 - **Breaking:** `HistogramHeatmapResult::bucket_bounds` is `Vec<f64>`, in
   the histogram's unit, where it was `Vec<u64>` in its stored units. In
   JSON it is an array of finite numbers (`[0.001, 0.002, …]`; a whole
   number may be written `1000.0`); no bound is infinite.
-
 - **Breaking:** a selector reads only the name it gives. A query naming a
   Prometheus series by its exporter name no longer reads a series stored
   under a converted name with `__prometheus_name__` (metriken-recorder
   0.12.0 to 0.14.0), and answers as a query naming a metric the source
   does not hold when nothing else holds that name; the stored name still
   reads such a series as stored, in its converted unit. The error for one
-  exporter name stored under two names is gone. Recordings of metriken-recorder 0.15.0 store every series under
-  the exporter's name, so the exporter's name reads them.
+  exporter name stored under two names is gone. Recordings of the next
+  metriken-recorder release store every series under the exporter's name,
+  so the exporter's name reads them.
+- **Added:** `MetricsSource::metric_unit(name)`, the `unit` storage key of
+  metric `name` (for a Prometheus series, a value of
+  `metriken_storage::prometheus_units::UNITS`), for a catalog to format a
+  metric by. `Some` only when every column of `name`, in every recording
+  and table, carries one and the same unit; `None` when the source does
+  not hold `name`, a column has none, or two differ. Answered by
+  `ArchiveReader` (one segment footer per table holding the name),
+  `ParquetReader`, `SegmentedParquetReader`, `UnionMetricsSource` and
+  `MemoryStore`, whose ingest records each series' unit from its snapshot
+  metadata. The default is `None`, so a `MetricsSource` that wraps another
+  must forward `metric_unit`.
 
 ### metriken-recorder (unreleased)
 
@@ -170,18 +184,24 @@ Requires metriken-storage's unreleased `prometheus_units` above.
   matching `__prometheus_name__`, finds nothing in a new recording; one
   that took a time series' values as nanoseconds reads seconds,
   milliseconds or microseconds, as the `unit` key says.
-- **Breaking:** a histogram's bounds are the exporter's `le` values,
-  multiplied, when the smallest is below 1, by the power of 10 that brings
-  it to 1, written as `scale`; the overflow bound is multiplied by the same
-  factor. A `_seconds` histogram is no longer stored ×1e9: one whose
-  smallest bound is 0.005 is stored ×1000 with `scale="1000"` and
-  `unit="seconds"`; metriken-query divides by `scale`, so its quantiles
-  read in seconds. Its `_sum` is in seconds, unscaled. The overflow
-  series is `<exporter name>_overflow` (`rpc_seconds_overflow`).
+- **Breaking:** a histogram's bounds are stored as integers: each `le` is
+  multiplied by a scale, written as `scale` when it is not 1, and rounded
+  (it was truncated, so bounds 0.1, 0.25 and 0.5 stored 0.25 as 2 and read
+  a p50 of 0.2). A time unit has a fixed scale, its nanoseconds per unit:
+  `seconds` 1e9, `milliseconds` 1e6, `microseconds` 1e3, `nanoseconds` 1,
+  so a `_seconds` histogram is stored in nanoseconds whatever its smallest
+  bucket, and two endpoints' histograms of one name pool. Any other
+  histogram takes the smallest power of 10, at most 1e9, that makes every
+  finite bound an integer (0.1, 0.25, 0.5 take 100; 0.0003 takes 10_000).
+  The overflow bound takes the same scale. Two bounds that land in one
+  bucket of the `histogram` crate add their observations there.
+  metriken-query divides by `scale`, so the histogram reads in its unit.
+  Its `_sum` is in the exporter's unit, unscaled. The overflow series is
+  `<exporter name>_overflow` (`rpc_seconds_overflow`).
 - **Breaking:** the collision path is removed: two exporter names that
   would have been stored under one name are stored under their own names,
-  as every series is, and a collided `_seconds` histogram is scaled like
-  any other. A `# HELP` text is kept under the exporter's name only.
+  as every series is. A `# HELP` text is kept under the exporter's name
+  only.
 
 ### metriken-storage 0.12.0
 

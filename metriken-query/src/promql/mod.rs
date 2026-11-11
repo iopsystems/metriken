@@ -1765,11 +1765,12 @@ impl QueryEngine {
             "histogram_sum" => stream.sum(group, start_ns, end_ns, stride, &metric_name),
             _ => stream.count(group, start_ns, end_ns, stride, &metric_name),
         };
-        // A count does not depend on the buckets' scale.
+        // A count does not depend on the buckets' scale; a mean or a sum is
+        // divided by each output group's own.
         let mut result = result;
         if func != "histogram_count" {
-            let scale = scales.scale(func, &metric_name)?;
-            scale::unscale_samples(&mut result, scale);
+            let scales = scales.group_scales(func, &metric_name, group)?;
+            scale::unscale_groups(&mut result, &scales);
         }
         if result.is_empty() {
             return Ok(QueryResult::Matrix {

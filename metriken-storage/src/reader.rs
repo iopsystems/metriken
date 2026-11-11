@@ -1094,6 +1094,44 @@ impl SamplerReader {
         out
     }
 
+    /// The distinct `unit` values of metric `name`'s columns in the first
+    /// sealed segment, in store order, whose footer holds a column of
+    /// `name`: one footer read per segment tried, and the segmented reader
+    /// not built. `None` when no sealed segment holds `name` (its rows are
+    /// all in the WAL) or the segments cannot be read.
+    fn footer_units(&self, name: &str) -> Option<Vec<Option<String>>> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let store = match self.segments.store() {
+            Ok(Some(store)) => store,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!("fetching segments for {}: {e}", self.sampler);
+                return None;
+            }
+        };
+        for idx in 0..store.len() {
+            let Ok(Some(bytes)) = store.bytes(idx) else {
+                continue;
+            };
+            let Ok(builder) = ParquetRecordBatchReaderBuilder::try_new(bytes) else {
+                continue;
+            };
+            let units: Vec<Option<String>> = builder
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.metadata())
+                .filter(|meta| meta.get("metric").map(String::as_str) == Some(name))
+                .map(|meta| meta.get("unit").cloned())
+                .collect();
+            if !units.is_empty() {
+                return Some(crate::source::merge_units([units]));
+            }
+        }
+        None
+    }
+
     /// The label sets of `name`, a metric of `kind`, as the table's
     /// reader lists them. A table of a recording complete at open, whose
     /// segments' columns are all known (see `table_probes`), lists from them
@@ -2399,15 +2437,20 @@ impl ArchiveReader {
 
     /// The distinct `unit` storage key values of metric `name`'s columns,
     /// of any kind, in every table of every recording holding it, sorted
-    /// ([`DataSource::metric_units`]). Opens those tables.
+    /// ([`DataSource::metric_units`]).
+    ///
+    /// Each table holding `name` answers from the footer of its first
+    /// sealed segment holding a column of `name`, without building its
+    /// reader: one footer read per segment tried, usually one per table.
+    /// A unit that changed in a later segment of the same table is not
+    /// seen. A table whose rows of `name` are all in the WAL builds its
+    /// reader and answers from it.
     pub fn metric_units(&self, name: &str) -> Vec<Option<String>> {
-        crate::source::merge_units(
-            self.tables
-                .iter()
-                .filter(|t| t.holds(name))
-                .filter_map(|t| t.reader())
-                .map(|r| r.source().metric_units(name)),
-        )
+        crate::source::merge_units(self.tables.iter().filter(|t| t.holds(name)).map(|t| {
+            t.footer_units(name)
+                .or_else(|| t.reader().map(|r| r.source().metric_units(name)))
+                .unwrap_or_default()
+        }))
     }
 
     /// The label sets of gauge `name`, as [`counter_labels`](Self::counter_labels).

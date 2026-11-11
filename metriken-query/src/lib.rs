@@ -463,7 +463,14 @@ pub trait MetricsSource: Send + Sync {
     /// every column of `name`, of every series in every recording and
     /// table the source holds, carries the same unit; `None` when the
     /// source does not hold `name`, when a column has no unit, or when two
-    /// columns' units differ. `None` by default.
+    /// columns' units differ.
+    ///
+    /// An `ArchiveReader` reads one segment footer per table holding
+    /// `name` (more when the name first appears in a later segment) and
+    /// builds no table reader, except for a table whose rows of `name` are
+    /// all in the WAL; a unit that changed in a later segment of one table
+    /// is not seen. `None` by default, so a source wrapping another must
+    /// forward it.
     fn metric_unit(&self, name: &str) -> Option<String> {
         let _ = name;
         None
