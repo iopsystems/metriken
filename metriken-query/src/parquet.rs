@@ -292,6 +292,10 @@ impl ParquetReader {
 }
 
 impl MetricsSource for ParquetReader {
+    fn metric_unit(&self, name: &str) -> Option<String> {
+        crate::one_unit(self.engine.metric_units(name))
+    }
+
     fn query_range_opts(
         &self,
         expr: &str,

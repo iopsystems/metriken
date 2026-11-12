@@ -34,6 +34,11 @@ pub struct HistogramRow {
     /// value in the same row. `None` for a histogram without one, as every
     /// histogram recorded before the key existed is.
     pub overflow: Option<Overflow>,
+    /// The factor this row's bucket bounds and overflow bound are its
+    /// observed values multiplied by: its column's
+    /// [`SCALE_KEY`](crate::SCALE_KEY), 1 for a column without one. A
+    /// reader divides a value it takes from a bucket bound by it.
+    pub scale: f64,
 }
 
 /// The observations of a histogram series above its highest finite bound,
@@ -43,8 +48,9 @@ pub struct Overflow {
     /// The count since the series started, cumulative as the buckets are:
     /// a reader differences it between rows, and a decrease is a reset.
     pub count: f64,
-    /// The highest finite bound, in the histogram's value units
-    /// ([`OVERFLOW_BOUND_KEY`](crate::OVERFLOW_BOUND_KEY)).
+    /// The highest finite bound, in the histogram's stored bucket units
+    /// ([`OVERFLOW_BOUND_KEY`](crate::OVERFLOW_BOUND_KEY)): the row's
+    /// [`scale`](HistogramRow::scale) times the value.
     pub bound: f64,
 }
 
@@ -480,6 +486,7 @@ mod tests {
                     count: vec![c],
                 },
                 overflow: None,
+                scale: 1.0,
             })),
         }
     }
@@ -501,6 +508,7 @@ mod tests {
                     count: vec![t],
                 },
                 overflow: None,
+                scale: 1.0,
             })
             .collect();
         s.rows = Box::new(rows.into_iter());
@@ -609,6 +617,7 @@ mod tests {
                         count: vec![c],
                     },
                     overflow: None,
+                    scale: 1.0,
                 })
             })
             .collect();

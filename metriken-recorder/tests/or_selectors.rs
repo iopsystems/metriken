@@ -23,8 +23,8 @@ const TICKS: u64 = 12;
 
 /// What the exporter serves at tick `t`: a counter of three series (one
 /// with `job`), a gauge of the same three, a histogram of two jobs whose
-/// observations fall in different buckets, and a counter in bits, which is
-/// stored in bytes under another name with `__prometheus_name__`.
+/// observations fall in different buckets, and a counter in bits, stored
+/// under its own name in bits with `unit="bits"`.
 fn text(t: u64) -> String {
     format!(
         "\
@@ -275,10 +275,10 @@ fn a_histogram_function_with_or_reads_the_selected_series() {
     }
 }
 
-/// A selector naming a series by the exporter's name, held by no series,
-/// reads the stored series renamed from it, with its branches applied.
+/// A selector with `or` on a series with a unit token reads the series its
+/// branches select, in the exporter's unit.
 #[test]
-fn an_exporter_name_with_or_reads_the_stored_series_its_branches_select() {
+fn a_unit_series_with_or_reads_the_series_its_branches_select() {
     let dir = tempfile::tempdir().unwrap();
     let (reader, store) = sources(dir.path());
     for source in [&reader as &dyn MetricsSource, &store] {
@@ -287,9 +287,9 @@ fn an_exporter_name_with_or_reads_the_stored_series_its_branches_select() {
             let m = matrix(source, query, per_series);
             let jobs: Vec<&str> = m.iter().map(|m| m.metric["job"].as_str()).collect();
             assert_eq!(jobs, ["k"], "per_series={per_series} {query}: {m:?}");
-            // 1600 bits a second, stored as 200 bytes.
+            // 1600 bits a second, as served.
             assert!(
-                m[0].values.iter().all(|(_, v)| (v - 200.0).abs() < 1e-9),
+                m[0].values.iter().all(|(_, v)| (v - 1600.0).abs() < 1e-9),
                 "per_series={per_series} {query}: {m:?}"
             );
             let none = r#"rate(rx_bits_total{job="zzz" or job="yyy"}[3s])"#;

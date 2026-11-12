@@ -1,6 +1,7 @@
 import {
     createAxisLabelFormatter,
     plainValue,
+    resolveUnit,
 } from './util/units.js';
 import {
     insertGapNulls,
@@ -90,7 +91,7 @@ function oobSeparator(rangeMax, oobMax) {
 function renderPercentileBands(chart) {
     const { opts } = chart.spec;
     const format = opts.format || {};
-    const unitSystem = format.unit_system;
+    const { unitSystem, factor: unitFactor } = resolveUnit(format);
     const logScale = format.log_scale;
     const range = format.range;
     const cols = chart.spec.boxplot;
@@ -160,12 +161,12 @@ function renderPercentileBands(chart) {
         ...baseOption,
         dataZoom: getDataZoomConfig(calculateMinZoomSpan(widest, chart.interval)),
         yAxis: oob
-            ? oobYAxis(getBaseYAxisOption(logScale, unitSystem, format), oob.oobMax, range.max)
-            : getBaseYAxisOption(logScale, unitSystem, format),
+            ? oobYAxis(getBaseYAxisOption(logScale, unitSystem, format, unitFactor), oob.oobMax, range.max)
+            : getBaseYAxisOption(logScale, unitSystem, format, unitFactor),
         tooltip: {
             ...baseOption.tooltip,
             formatter: getTooltipFormatter(
-                unitSystem ? createAxisLabelFormatter(unitSystem) : plainValue,
+                unitSystem ? createAxisLabelFormatter(unitSystem, 2, unitFactor) : plainValue,
                 null,
                 chart,
             ),
@@ -273,7 +274,7 @@ export function configureScatterChart(chart) {
 
     // Access format properties using snake_case naming to match Rust serialization
     const format = opts.format || {};
-    const unitSystem = format.unit_system;
+    const { unitSystem, factor: unitFactor } = resolveUnit(format);
     const logScale = format.log_scale;
     const range = format.range;
 
@@ -398,7 +399,7 @@ export function configureScatterChart(chart) {
     const uniqueNamesForLayout = [...new Set(series.map(s => s.name))];
 
     // Build yAxis config — when OOB is active, cap at the band top + relabel range.max "OOB"
-    const baseYAxis = getBaseYAxisOption(logScale, unitSystem, format);
+    const baseYAxis = getBaseYAxisOption(logScale, unitSystem, format, unitFactor);
     const yAxisConfig = chart._oobAxisMax
         ? oobYAxis(baseYAxis, chart._oobAxisMax, range.max)
         : baseYAxis;
@@ -431,7 +432,7 @@ export function configureScatterChart(chart) {
         tooltip: {
             ...baseOption.tooltip,
             formatter: getTooltipFormatter(unitSystem ?
-                createAxisLabelFormatter(unitSystem) :
+                createAxisLabelFormatter(unitSystem, 2, unitFactor) :
                 plainValue, chart.pinnedSet, chart, 'scatter'),
         },
         // Bands appended (not prepended) so the pin logic's index-based series

@@ -138,6 +138,40 @@ struct that holds the `Plot` under `#[serde(flatten)]` beside them.
 `charts/source_metric.js` sets `width: 'full'` in the spec it builds, for a
 page whose layout reads it.
 
+## Stored units
+
+Each unit system formats values in one base: `time` in nanoseconds, `bytes`
+and `datarate` in bytes, `percentage` as a fraction from 0 to 1. A series
+stored in another unit names it in `opts.format.unit`, as the storage key
+`unit` spells it (`seconds`, `kibibytes`, `percent`; `STORED_UNITS` in
+`charts/util/units.js` lists them). The chart multiplies each value into the
+base before formatting it. Line, multi-series and percentile (dots and
+decimated bands) axes and tooltips, and heatmap and quantile heatmap
+tooltips and colour legends, apply it:
+
+| `format` | value | shown |
+| --- | --- | --- |
+| `{ unit_system: 'time' }` | `250000000` | `250 ms` |
+| `{ unit: 'seconds' }` | `0.25` | `250 ms` |
+| `{ unit: 'kibibytes' }` | `4` | `4 KB` |
+| `{ unit: 'percent' }` | `45` | `45 %` |
+| `{ unit: 'kibibytes', unit_system: 'datarate' }` | `4` | `4.1 KB/s` |
+| `{ unit: 'nanoseconds', unit_system: 'percentage' }` | `0.45` | `45 %` |
+
+`unit` is the unit of the values the query returns; set it only when the
+query has not rescaled them. A `unit_system` of another dimension ignores
+it, as in the last row, where the query has divided a nanosecond counter's
+rate by 1e9. With no `unit_system`, the unit's own system is used.
+`range` and `min_y_span` stay in the unit. In Rust,
+`PlotBuilder::with_stored_unit` sets it.
+
+`specForSourceMetric` draws a counter in a bytes unit as `datarate` and one
+in `bits` as `bitrate`, with the unit. A counter in a time unit is time per
+second, so its query divides the rate by `1e9 / factor` (nothing for
+`seconds`) and it is drawn as `percentage`, without the unit. A `bits`
+gauge is drawn as a count of bits, without the unit, since `bitrate` is a
+rate.
+
 ## Display mode
 
 `charts/display.js` decodes the binary bodies that rezolus's `display_wire`

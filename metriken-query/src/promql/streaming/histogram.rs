@@ -1305,7 +1305,7 @@ fn heatmap_impl(
 
     Some(HistogramHeatmapResult {
         timestamps,
-        bucket_bounds,
+        bucket_bounds: bucket_bounds.into_iter().map(|b| b as f64).collect(),
         data,
         min_value,
         max_value,

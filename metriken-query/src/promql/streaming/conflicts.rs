@@ -604,6 +604,9 @@ impl DataSource for Recorded {
     fn duplicated_series(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.inner.duplicated_series(name)
     }
+    fn metric_units(&self, name: &str) -> Vec<Option<String>> {
+        self.inner.metric_units(name)
+    }
     fn file_metadata(&self) -> HashMap<String, String> {
         self.inner.file_metadata()
     }

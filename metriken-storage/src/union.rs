@@ -380,6 +380,10 @@ impl DataSource for UnionSource {
             .collect()
     }
 
+    fn metric_units(&self, name: &str) -> Vec<Option<String>> {
+        crate::source::merge_units(self.owners.iter().map(|o| o.metric_units(name)))
+    }
+
     fn file_metadata(&self) -> HashMap<String, String> {
         let mut out = HashMap::new();
         for c in &self.children {

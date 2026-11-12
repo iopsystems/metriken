@@ -1337,7 +1337,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-charts"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "include_dir",
  "serde",
@@ -1403,7 +1403,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-query"
-version = "0.48.2"
+version = "0.50.0"
 dependencies = [
  "arrow",
  "bytes",
@@ -1426,7 +1426,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-recorder"
-version = "0.13.1"
+version = "0.15.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1444,6 +1444,7 @@ dependencies = [
  "metriken-types",
  "parquet",
  "reqwest",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1455,7 +1456,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-storage"
-version = "0.11.2"
+version = "0.13.0"
 dependencies = [
  "arrow",
  "bytes",
