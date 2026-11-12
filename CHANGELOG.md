@@ -53,7 +53,7 @@ from the two histogram heatmap fixes below.
 
 ### metriken-recorder 0.15.0
 
-Requires metriken-storage's unreleased `prometheus_units` (below).
+Requires metriken-storage 0.13.0 (`prometheus_units`, below).
 
 - **Breaking:** a recording no longer fails when its last source fails or
   is refused. When a source fails (`Event::SourceFailed`) or is refused and
