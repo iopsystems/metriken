@@ -301,14 +301,18 @@ impl BufferPool {
         key: CacheKey,
         data: Arc<Vec<Option<HistogramSnapshot>>>,
     ) {
-        let size: usize = data
+        // What the block allocates: a slot per row, and each snapshot's
+        // vectors by capacity.
+        let slots = data.capacity() * std::mem::size_of::<Option<HistogramSnapshot>>();
+        let vectors: usize = data
             .iter()
             .flatten()
             .map(|s| {
-                s.index.len() * std::mem::size_of::<u32>()
-                    + s.count.len() * std::mem::size_of::<u64>()
+                s.index.capacity() * std::mem::size_of::<u32>()
+                    + s.count.capacity() * std::mem::size_of::<u64>()
             })
             .sum();
+        let size = slots + vectors;
         self.put(key, Block::HistogramSnapshots(data), size);
     }
 
@@ -474,5 +478,30 @@ mod tests {
 
         let gv = pool.get_gauge_values(gk).unwrap();
         assert_eq!(*gv, vec![Some(-1i64), Some(0), None]);
+    }
+
+    /// A histogram block is charged what its snapshots allocate: each row's
+    /// slot, and each snapshot's vectors by capacity.
+    #[test]
+    fn a_histogram_block_is_charged_what_it_allocates() {
+        let pool = BufferPool::new(1 << 20);
+        let key = CacheKey {
+            source_id: 1,
+            column_idx: 0,
+            row_group_idx: 0,
+        };
+        let snapshot = || {
+            let mut index = Vec::with_capacity(16);
+            let mut count = Vec::with_capacity(16);
+            index.push(3u32);
+            count.push(7u64);
+            HistogramSnapshot { index, count }
+        };
+        let rows: Vec<Option<HistogramSnapshot>> =
+            (0..10).map(|i| (i % 2 == 0).then(snapshot)).collect();
+        let slots = rows.capacity() * std::mem::size_of::<Option<HistogramSnapshot>>();
+        let vectors = 5 * (16 * std::mem::size_of::<u32>() + 16 * std::mem::size_of::<u64>());
+        pool.put_histogram_snapshots(key, Arc::new(rows));
+        assert_eq!(pool.current_bytes(), slots + vectors);
     }
 }

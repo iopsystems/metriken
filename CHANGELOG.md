@@ -116,6 +116,15 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
 
 ### metriken-storage (unreleased)
 
+- **Fixed:** `BufferPool::put_histogram_snapshots` charges a block what it
+  allocates: a slot for each row, and each snapshot's bucket vectors by
+  capacity. It charged the vectors' lengths, so a snapshot with one
+  non-zero bucket was charged 12 of the 96 bytes it takes, and a pool of
+  sparse histogram blocks held several times its budget. Browsing a 2 h
+  recording with a 64 MiB pool, jemalloc's allocated bytes at the peak fell
+  from 231 to 184 MiB, and peak RSS from 346–355 to 320–323 MiB. A 12 h
+  v3 `.rez` with a 2 GiB pool peaked at 4809–4816 MiB RSS, from 5061–5079
+  MiB. A block now charged more than the whole budget is not cached (#400).
 - **Changed:** A segmented table keeps the segments its queries open in its
   `BufferPool`, charged against the pool's budget with the blocks decoded
   from them. Each table kept its own cache of opened segments, each with a
