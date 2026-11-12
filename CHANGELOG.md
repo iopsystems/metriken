@@ -124,7 +124,8 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   recording with a 64 MiB pool, jemalloc's allocated bytes at the peak fell
   from 231 to 184 MiB, and peak RSS from 346–355 to 320–323 MiB. A 12 h
   v3 `.rez` with a 2 GiB pool peaked at 4809–4816 MiB RSS, from 5061–5079
-  MiB. A block now charged more than the whole budget is not cached (#400).
+  MiB. A block whose charge now exceeds the whole budget is not cached, as
+  for any block (#400).
 - **Changed:** A segmented table keeps the segments its queries open in its
   `BufferPool`, charged against the pool's budget with the blocks decoded
   from them. Each table kept its own cache of opened segments, each with a
@@ -143,7 +144,9 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   keyed segments that earlier readers in its chain of handovers opened,
   including when a reader in the chain was never queried. A dashboard
   browse of a 12 h v3 `.rez` with a 2 GiB pool, with jemalloc as the
-  allocator, peaked at 3546–3547 MiB RSS, from 5061–5079 MiB (#400).
+  allocator, peaked at 3546–3547 MiB RSS, from 5061–5079 MiB, without the
+  histogram charge above, and at 3319–3356 MiB with it (two runs each)
+  (#400).
 
 ### metriken-storage 0.13.0
 
