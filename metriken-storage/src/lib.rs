@@ -134,7 +134,6 @@ pub use labels::{
 };
 pub use lazy::CompositionCatalog;
 pub use parquet::CompositionSource;
-pub use prometheus_units::PROMETHEUS_NAME_LABEL;
 pub use segmented::{ColumnRelabel, Handover, InMemorySegments, Run, SegmentBytes, SegmentStore};
 pub use source::{label_walk_series_count, ColumnPosition, CounterColumnRef, DataSource};
 pub use types::{

@@ -441,6 +441,13 @@ fn check_series(
 }
 
 impl MetricsSource for MemoryStore {
+    fn metric_unit(&self, name: &str) -> Option<String> {
+        crate::one_unit(metriken_storage::DataSource::metric_units(
+            &*self.state.memory.read().unwrap(),
+            name,
+        ))
+    }
+
     fn query_range_opts(
         &self,
         expr: &str,
@@ -581,40 +588,45 @@ impl MemoryStore {
         // so a query refuses the series (`DataSource::duplicated_series`).
         // A float value counts with an integer one of its kind.
         let mut taken: [std::collections::HashSet<(String, Labels)>; 4] = Default::default();
-        let mut take =
-            |memory: &mut crate::memory::Memory, kind: usize, name: &str, labels: &Labels| {
-                if !taken[kind].insert((name.to_string(), labels.clone())) {
-                    memory.mark_duplicated(name, labels);
-                }
-            };
+        // Each series' `unit` storage key is recorded for `metric_unit`.
+        let mut take = |memory: &mut crate::memory::Memory,
+                        kind: usize,
+                        name: &str,
+                        labels: &Labels,
+                        metadata: &HashMap<String, String>| {
+            if !taken[kind].insert((name.to_string(), labels.clone())) {
+                memory.mark_duplicated(name, labels);
+            }
+            memory.set_unit(name, labels, metadata.get("unit").map(String::as_str));
+        };
 
         for counter in snapshot.counters() {
             let (name, labels) = extract_name_labels(&counter.metadata, &counter.name);
-            take(&mut memory, 0, &name, &labels);
+            take(&mut memory, 0, &name, &labels, &counter.metadata);
             memory.upsert_counter_sample(&name, labels, ts, counter.value);
         }
 
         for gauge in snapshot.gauges() {
             let (name, labels) = extract_name_labels(&gauge.metadata, &gauge.name);
-            take(&mut memory, 1, &name, &labels);
+            take(&mut memory, 1, &name, &labels, &gauge.metadata);
             memory.upsert_gauge_sample(&name, labels, ts, gauge.value);
         }
 
         for counter in snapshot.float_counters() {
             let (name, labels) = extract_name_labels(&counter.metadata, &counter.name);
-            take(&mut memory, 0, &name, &labels);
+            take(&mut memory, 0, &name, &labels, &counter.metadata);
             memory.upsert_float_counter_sample(&name, labels, ts, counter.value);
         }
 
         for gauge in snapshot.float_gauges() {
             let (name, labels) = extract_name_labels(&gauge.metadata, &gauge.name);
-            take(&mut memory, 1, &name, &labels);
+            take(&mut memory, 1, &name, &labels, &gauge.metadata);
             memory.upsert_float_gauge_sample(&name, labels, ts, gauge.value);
         }
 
         for histogram in snapshot.histograms() {
             let (name, labels) = extract_name_labels(&histogram.metadata, &histogram.name);
-            take(&mut memory, 2, &name, &labels);
+            take(&mut memory, 2, &name, &labels, &histogram.metadata);
             let config = histogram.value.config();
             let snap = histogram_to_snapshot(&histogram.value);
             let overflow = histogram.metadata.get(metriken_storage::OVERFLOW_KEY).zip(
@@ -623,12 +635,19 @@ impl MemoryStore {
                     .get(metriken_storage::OVERFLOW_BOUND_KEY)
                     .and_then(|b| b.parse::<f64>().ok()),
             );
+            let scale = histogram
+                .metadata
+                .get(metriken_storage::SCALE_KEY)
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|s| s.is_finite() && *s > 0.0)
+                .unwrap_or(1.0);
             memory.upsert_histogram_sample(&name, labels.clone(), config, ts, snap);
             // A row the store dropped (its time before the series' last)
             // gets no link, which would otherwise name an overflow for a
             // row the series does not have.
-            if let Some((counter, bound)) = overflow {
-                if memory.histogram_last_timestamp(&name, &labels) == Some(ts) {
+            if memory.histogram_last_timestamp(&name, &labels) == Some(ts) {
+                memory.set_histogram_scale(&name, labels.clone(), ts, scale);
+                if let Some((counter, bound)) = overflow {
                     memory.set_histogram_overflow(&name, labels, ts, counter, bound);
                 }
             }
@@ -636,7 +655,7 @@ impl MemoryStore {
 
         for histogram in snapshot.gauge_histograms() {
             let (name, labels) = extract_name_labels(&histogram.metadata, &histogram.name);
-            take(&mut memory, 3, &name, &labels);
+            take(&mut memory, 3, &name, &labels, &histogram.metadata);
             let config = histogram.value.config();
             let snap = histogram_to_snapshot(&histogram.value);
             memory.upsert_gauge_histogram_sample(&name, labels, config, ts, snap);

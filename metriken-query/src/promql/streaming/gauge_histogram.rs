@@ -325,7 +325,7 @@ pub(crate) fn heatmap(parts: Vec<Part>, times: &[u64]) -> Option<HistogramHeatma
     };
     Some(HistogramHeatmapResult {
         timestamps,
-        bucket_bounds,
+        bucket_bounds: bucket_bounds.into_iter().map(|b| b as f64).collect(),
         data,
         min_value: if min_value == f64::MAX {
             0.0
@@ -380,6 +380,7 @@ mod tests {
                     snapshot,
                     resumes: false,
                     overflow: None,
+                    scale: 1.0,
                 }
             })),
         }
@@ -497,7 +498,7 @@ mod tests {
         ];
         let h = heatmap(vec![(stream(rows, 1), S)], &times(10 * S, 11 * S, S, None)).unwrap();
         assert_eq!(h.timestamps, [10.0, 11.0]);
-        assert_eq!(h.bucket_bounds, [1, 3, 7]);
+        assert_eq!(h.bucket_bounds, [1.0, 3.0, 7.0]);
         assert_eq!(h.data, [(0, 0, 3.0), (0, 2, 1.0), (1, 0, 2.0), (1, 2, 2.0)]);
     }
 

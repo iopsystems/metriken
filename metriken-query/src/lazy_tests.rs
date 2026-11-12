@@ -281,3 +281,45 @@ fn only_the_named_child_loads() {
     assert_eq!(cpu_loads.load(Ordering::SeqCst), 1);
     assert_eq!(mem_loads.load(Ordering::SeqCst), 0);
 }
+
+/// A lazy child answers a metric's unit (`MetricsSource::metric_unit`)
+/// from its loaded source, and loads only for a name its catalog holds.
+#[cfg(feature = "ingest")]
+#[test]
+fn a_lazy_child_answers_a_metrics_unit() {
+    use std::collections::HashMap;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let loads = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&loads);
+    let store = MemoryStore::builder().sampling_interval_ms(1000).build();
+    for t in 1..=4u64 {
+        let metadata = HashMap::from([
+            ("metric".to_string(), "cpu_usage".to_string()),
+            ("unit".to_string(), "seconds".to_string()),
+        ]);
+        store.ingest_snapshot(metriken_model::Snapshot::V2(metriken_model::SnapshotV2 {
+            systemtime: UNIX_EPOCH + Duration::from_secs(t),
+            duration: Duration::from_secs(0),
+            metadata: HashMap::new(),
+            counters: vec![metriken_model::Counter::new(
+                "cpu_usage".into(),
+                10 * t,
+                metadata,
+            )],
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
+        }));
+    }
+    let source = CompositionSource::lazy(catalog(), move || {
+        seen.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(CompositionSource::from(&store)))
+    });
+    let reader = compose(source);
+
+    assert_eq!(reader.metric_unit("memory_used"), None);
+    assert_eq!(loads.load(Ordering::SeqCst), 0, "a name it does not hold");
+    assert_eq!(reader.metric_unit("cpu_usage").as_deref(), Some("seconds"));
+    assert_eq!(loads.load(Ordering::SeqCst), 1);
+}

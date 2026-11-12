@@ -20,9 +20,7 @@ export const STORAGE_KEYS = [
 export const isStorageKey = (key) => STORAGE_KEYS.includes(key);
 
 // An internal label is part of a series' identity and matchable in a
-// selector, and never shown: `__name__`, `__run__`, `__incarnation__`,
-// `__prometheus_name__` (the name a Prometheus exporter served a renamed
-// series under). The
+// selector, and never shown: `__name__`, `__run__`, `__incarnation__`. The
 // prefix is the whole rule. The server's label order is not fixed, so a
 // legend that took "the first label that is not __name__" could print one.
 export const isInternalLabel = (key) => key.startsWith('__');

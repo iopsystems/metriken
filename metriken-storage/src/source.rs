@@ -260,6 +260,14 @@ pub trait DataSource: Send + Sync {
         let _ = name;
         Vec::new()
     }
+    /// The distinct values of the `unit` [storage key](crate::STORAGE_KEYS)
+    /// on metric `name`'s columns, of any kind, sorted: `None` for a column
+    /// without one. Empty when the source holds no column of `name`, and by
+    /// default. A source wrapping others forwards this, merging theirs.
+    fn metric_units(&self, name: &str) -> Vec<Option<String>> {
+        let _ = name;
+        Vec::new()
+    }
     /// Key-value metadata from the file footer. Default returns empty.
     fn file_metadata(&self) -> std::collections::HashMap<String, String> {
         std::collections::HashMap::new()
@@ -356,4 +364,13 @@ pub fn label_walk_series_count<S: DataSource + ?Sized>(source: &S) -> usize {
         count += source.gauge_histogram_labels(&name).len();
     }
     count
+}
+
+/// The distinct units of several sources' [`DataSource::metric_units`]
+/// for one name, sorted.
+pub fn merge_units(units: impl IntoIterator<Item = Vec<Option<String>>>) -> Vec<Option<String>> {
+    let mut out: Vec<Option<String>> = units.into_iter().flatten().collect();
+    out.sort();
+    out.dedup();
+    out
 }

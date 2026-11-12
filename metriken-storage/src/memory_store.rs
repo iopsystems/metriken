@@ -106,6 +106,10 @@ impl DataSource for MemoryStoreInner {
         self.memory.read().unwrap().duplicated_series(name)
     }
 
+    fn metric_units(&self, name: &str) -> Vec<Option<String>> {
+        self.memory.read().unwrap().metric_units(name)
+    }
+
     fn file_metadata(&self) -> HashMap<String, String> {
         self.metadata.read().unwrap().clone()
     }

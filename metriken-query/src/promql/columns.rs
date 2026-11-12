@@ -31,7 +31,7 @@ impl QueryEngine {
         let mut expr = parse_selector_expr(query)?;
         // `{__name__="x"}` resolves as `x` does.
         super::name_selectors(&mut expr);
-        self.resolve_names(&mut expr)?;
+        self.check_selectors(&expr)?;
         let col_map = self.source.column_map();
         let mut out = HashSet::new();
         walk(&col_map, &expr, &mut out);

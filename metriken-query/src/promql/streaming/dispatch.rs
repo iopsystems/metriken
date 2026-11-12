@@ -1470,7 +1470,10 @@ where
             name: metric_name.to_string(),
         });
     };
-    let result = stream.quantiles(&[quantile], ctx.start_ns, ctx.end_ns, None, metric_name);
+    let (stream, scales) = crate::promql::scale::Scales::watch(stream);
+    let mut result = stream.quantiles(&[quantile], ctx.start_ns, ctx.end_ns, None, metric_name);
+    let scale = scales.scale("histogram_quantile", metric_name)?;
+    crate::promql::scale::unscale_samples(&mut result, scale);
     Ok(Built::Materialized {
         result,
         name: metric_name.to_string(),

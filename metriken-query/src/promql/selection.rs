@@ -12,11 +12,10 @@
 
 use std::collections::BTreeMap;
 
-use metriken_storage::PROMETHEUS_NAME_LABEL;
 use promql_parser::label::{Matcher, Matchers};
 
 use crate::histogram_stream::{HistogramStream, HistogramStreamMeta};
-use crate::labels::{Labels, MatchOp};
+use crate::labels::Labels;
 use crate::promql::extract_filter_labels;
 
 /// A selector's label matchers, as a read applies them.
@@ -105,6 +104,7 @@ impl Selection {
     /// A filter for each branch, of its matchers: a series a branch
     /// selects passes that branch's filter. For a selector without `or`,
     /// `filter` alone. Empty when no branch can select the selector's name.
+    #[cfg_attr(not(feature = "archive"), allow(dead_code))]
     pub(crate) fn branch_filters(&self) -> Vec<Labels> {
         match &self.branches {
             None => vec![self.filter.clone()],
@@ -178,21 +178,5 @@ impl Selection {
                 Some(row)
             })),
         }
-    }
-
-    /// This selection reading the series an exporter served as `original`
-    /// under a stored name: `__prometheus_name__="<original>"` in the
-    /// filter, in place of any `__prometheus_name__` matcher a branch has.
-    pub(crate) fn renamed(mut self, original: &str) -> Self {
-        self.filter.inner.insert(
-            PROMETHEUS_NAME_LABEL.to_string(),
-            MatchOp::Equal.encode(original),
-        );
-        if let Some(branches) = &mut self.branches {
-            for branch in branches {
-                branch.retain(|m| m.name != PROMETHEUS_NAME_LABEL);
-            }
-        }
-        self
     }
 }
