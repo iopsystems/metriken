@@ -69,7 +69,7 @@ metriken-recorder    -> metriken, metriken-exposition, metriken-model, metriken-
 ## Pull Requests
 
 - Feature PRs do not bump crate versions; versions are bumped per crate in release PRs.
-- A user-facing change adds a bullet to `CHANGELOG.md` under `## Unreleased`, inside the affected crate's `### <crate> <next-version>` sub-section (created if absent).
+- A user-facing change adds a bullet to the root `CHANGELOG.md` under `## Unreleased`, inside the affected crate's `### <crate> (unreleased)` sub-section (created if absent, above that crate's released blocks).
 - Commit subjects are conventional, `type(scope): description`, with the crate area as the scope (`feat(query): …`, `fix(storage): …`), except release PRs (see Releases).
 - Open PRs as drafts.
 
@@ -78,6 +78,6 @@ metriken-recorder    -> metriken, metriken-exposition, metriken-model, metriken-
 Cut releases with `/cs:release`. What it cannot read from the repository:
 
 - Each crate is versioned and tagged on its own. Tags are `<crate>-v<version>` (`metriken-query-v0.41.0`).
-- A release PR covers one crate, or a crate and the dependents whose requirement on it changed, titled `release: <crate> v<version>[, <crate> v<version>…]` in the order of the list under Workspace Crates, from a branch named `release-<crate>-<version>[-<crate>-<version>…]`. It bumps each crate's version and the workspace requirements on it, and updates `Cargo.lock`.
-- The root `CHANGELOG.md` keeps released `### <crate> <version>` blocks under `## Unreleased`; a release does not move them. A crate with its own `CHANGELOG.md` has its pending entries put under the new version: metriken-query and metriken-storage rename `## [Unreleased]` to `## [<version>] - <date>`; metriken-core keeps `## Unreleased` and adds `## <version>` beneath it.
+- A release PR covers one or more crates (a crate and the dependents whose requirement on it changed, or several crates released together), titled `release: <crate> v<version>[, <crate> v<version>…]` in the order of the list under Workspace Crates, from a branch whose name starts with `release-`; nothing checks the rest of the name. It bumps each crate's version and the workspace requirements on it, and updates `Cargo.lock`.
+- The release PR renames each released crate's `### <crate> (unreleased)` block in the root `CHANGELOG.md` to `### <crate> <version>`, where it stays under `## Unreleased`. The per-crate `CHANGELOG.md` files in metriken-core, metriken-query and metriken-storage stop at metriken-core 0.3.3, metriken-query 0.41.0 and metriken-storage 0.4.0; a release does not touch them. metriken-core's file keeps an empty `## Unreleased` heading; add nothing under it.
 - Nothing is automated: CI (`cargo.yml`) builds and tests only. After the PR merges, tag the merge commit `<crate>-v<version>` for each crate by hand and push the tags to `origin`. Then stop and ask before `cargo publish -p <crate>`, in the order of the list; a crates.io publish cannot be undone, only yanked.

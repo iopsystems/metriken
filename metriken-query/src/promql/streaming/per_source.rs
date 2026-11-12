@@ -935,6 +935,7 @@ impl Combined {
                     snapshot: cumulative(&self.counts[s]),
                     resumes,
                     overflow: self.overflows[s],
+                    scale: row.scale,
                 })
             }
             Some(Emit::End { .. }) => {
@@ -955,6 +956,7 @@ impl Combined {
                     snapshot: cumulative(counts),
                     resumes: false,
                     overflow: self.overflows[s],
+                    scale: row.scale,
                 })
             }
             None => None,
@@ -1522,6 +1524,9 @@ impl DataSource for Tap {
     fn duplicated_series(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.inner.duplicated_series(name)
     }
+    fn metric_units(&self, name: &str) -> Vec<Option<String>> {
+        self.inner.metric_units(name)
+    }
     fn file_metadata(&self) -> HashMap<String, String> {
         self.inner.file_metadata()
     }
@@ -1814,6 +1819,9 @@ impl DataSource for GroupSource {
     fn duplicated_series(&self, name: &str) -> Vec<BTreeMap<String, String>> {
         self.listing(|s| s.duplicated_series(name))
     }
+    fn metric_units(&self, name: &str) -> Vec<Option<String>> {
+        metriken_storage::source::merge_units(self.sources.iter().map(|s| s.metric_units(name)))
+    }
     fn file_metadata(&self) -> HashMap<String, String> {
         self.sources[0].file_metadata()
     }
@@ -1866,6 +1874,9 @@ mod tests {
                 .saturating_mul(3),
         );
         let mut config = None;
+        // The members' rows' scale, NaN when two differ, which a histogram
+        // function refuses.
+        let mut scale: Option<f64> = None;
         let mut series: Vec<Labels> = Vec::new();
         let mut index: HashMap<Labels, usize> = HashMap::new();
         let mut rows: Vec<Vec<Vec<(u64, crate::types::HistogramSnapshot)>>> = Vec::new();
@@ -1894,6 +1905,11 @@ mod tests {
                         if row.timestamp < m.lo || row.timestamp > m.hi {
                             continue;
                         }
+                        scale = match scale {
+                            Some(have) if have != row.scale => Some(f64::NAN),
+                            Some(have) => Some(have),
+                            None => Some(row.scale),
+                        };
                         let s = local[row.series_idx];
                         if by_series.len() <= s {
                             by_series.resize_with(s + 1, Vec::new);
@@ -1996,6 +2012,7 @@ mod tests {
                         // source's rows.
                         resumes: last.is_some(),
                         overflow: None,
+                        scale: scale.unwrap_or(1.0),
                     });
                 }
                 let rs = of(r);
@@ -2012,6 +2029,7 @@ mod tests {
                     snapshot: snapshot(&counts),
                     resumes: false,
                     overflow: None,
+                    scale: scale.unwrap_or(1.0),
                 });
                 last = Some(t);
             }
@@ -2326,6 +2344,134 @@ mod tests {
         ));
         assert!(matches!(rows, Some(Some(ref r)) if !r.is_empty()));
         assert!(conflicts.notices().is_empty());
+    }
+
+    /// [`histogram_source`] with every series' rows at `scale`, as a
+    /// recorded column's `scale` key gives them.
+    fn scaled_source(
+        interval_s: u64,
+        series: &[TestSeries<'_>],
+        scale: f64,
+    ) -> Arc<dyn DataSource> {
+        let source = histogram_source(interval_s, series);
+        let mut memory = crate::memory::Memory::new(interval_s * 1000);
+        for (labels, rows) in series {
+            let labels = Labels::from(*labels);
+            let Some(stream) = source.histogram_stream("h", &labels, 0, u64::MAX) else {
+                continue;
+            };
+            let snapshots: Vec<crate::types::HistogramSnapshot> =
+                stream.rows.map(|r| r.snapshot).collect();
+            memory.push_histogram_series(
+                "h",
+                crate::types::Histogram {
+                    labels: labels.clone(),
+                    config: stream.meta.config,
+                    timestamps: rows.clone(),
+                    snapshots,
+                },
+            );
+            memory.set_histogram_scale("h", labels, 0, scale);
+        }
+        Arc::new(memory)
+    }
+
+    /// Two members of one process group, a fine one to 10 s and a coarse
+    /// one to 20 s, each at `scales[i]`.
+    fn scaled_group(scales: [f64; 2]) -> Vec<Member> {
+        let cpu0: &[(&str, &str)] = &[("cpu", "0")];
+        // The fine member stops at 10 s, so the coarse one's rows answer
+        // after it.
+        let rows: Vec<u64> = (0..=10).map(|s| s * S).collect();
+        let coarse: Vec<u64> = (0..=4).map(|s| s * 5 * S).collect();
+        [
+            scaled_source(1, &[(cpu0, rows)], scales[0]),
+            scaled_source(5, &[(cpu0, coarse)], scales[1]),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(m, source)| Member {
+            raw: Arc::clone(&source),
+            source,
+            lo: 0,
+            hi: u64::MAX,
+            uuid: Some(format!("u{m}")),
+            catalog_index: m,
+            position: m,
+            first_ns: u64::MAX,
+        })
+        .collect()
+    }
+
+    /// The p90 points of a combined stream, divided by its rows' scale as
+    /// `histogram_quantiles` divides them, or the refusal.
+    fn p90(stream: Option<Option<HistogramStream>>) -> Result<Vec<f64>, crate::QueryError> {
+        use crate::promql::scale::{unscale_samples, Scales};
+        use crate::promql::streaming::histogram::HistogramOps;
+        let stream = stream.flatten().expect("a combined stream");
+        let (stream, scales) = Scales::watch(stream);
+        let mut samples = stream.quantiles(&[0.9], 0, 20 * S, None, "h");
+        let scale = scales.scale("histogram_quantiles", "h")?;
+        unscale_samples(&mut samples, scale);
+        Ok(samples
+            .into_iter()
+            .flat_map(|m| m.values)
+            .map(|(_, v)| v)
+            .collect())
+    }
+
+    /// A process group's combined rows keep their members' scale, in the
+    /// streaming combine and the materialized one: members stored ×1000
+    /// read a thousandth of what the same members at scale 1 read.
+    #[test]
+    fn a_combined_histogram_reads_in_its_members_unit() {
+        let read = |scales: [f64; 2], streaming: bool| {
+            let members = scaled_group(scales);
+            let stream = if streaming {
+                combine_histograms(
+                    &members,
+                    "h",
+                    &Labels::default(),
+                    0,
+                    20 * S,
+                    &Default::default(),
+                )
+            } else {
+                combine_histograms_materialized(&members, "h", &Labels::default(), 0, 20 * S)
+            };
+            p90(stream).unwrap()
+        };
+        for streaming in [true, false] {
+            let unit = read([1.0, 1.0], streaming);
+            let scaled = read([1000.0, 1000.0], streaming);
+            assert!(
+                !unit.is_empty() && unit.iter().all(|v| *v > 0.0),
+                "{unit:?}"
+            );
+            let want: Vec<f64> = unit.iter().map(|v| v / 1000.0).collect();
+            assert_eq!(scaled, want, "streaming {streaming}");
+        }
+    }
+
+    /// A process group whose members are stored at two scales is refused
+    /// when a function pools their rows, in either combine.
+    #[test]
+    fn a_combined_histogram_of_two_scales_is_refused() {
+        let members = scaled_group([1000.0, 10.0]);
+        for stream in [
+            combine_histograms(
+                &members,
+                "h",
+                &Labels::default(),
+                0,
+                20 * S,
+                &Default::default(),
+            ),
+            combine_histograms_materialized(&members, "h", &Labels::default(), 0, 20 * S),
+        ] {
+            let err = p90(stream).expect_err("two scales").to_string();
+            assert!(err.contains("different scales"), "{err}");
+        }
     }
 
     /// A source whose second histogram read is another source's: rows the

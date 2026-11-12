@@ -16,6 +16,16 @@ applies retention, and reports `Event`s and a `Summary`. It never exits the
 process, never waits for the caller to read its events, and installs no
 signal handler.
 
+A source whose rows cannot be recorded, or whose local pass panics, fails
+alone (`Event::SourceFailed`). When every source has failed or been refused,
+or none was given, the recorder reports `Event::NoneRecording`, keeps the
+archive open, and `finish` returns `Ok`: it finalizes the archive, or removes
+it when no source delivered a frame, a scrape or a pass (`Summary::discarded`).
+An archive error fails the recording: a commit, seal, retention, metadata
+write or added recording that fails, or the writer task stopping, emits
+`Event::Failed`, and `finish` then returns `Error::Archive`, as it does for a
+finalize or join error.
+
 Features:
 
 - `http` (default): `detect`, `Subscription`, `pump`, scraping and

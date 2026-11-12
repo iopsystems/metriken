@@ -205,7 +205,7 @@ fn quantiles_sum_mean_and_heatmap_read_the_state() {
         panic!("a heatmap")
     };
     assert_eq!(result.timestamps, [1000.0, 1001.0]);
-    assert_eq!(result.bucket_bounds, [1, 3, 7]);
+    assert_eq!(result.bucket_bounds, [1.0, 3.0, 7.0]);
     assert_eq!(
         result.data,
         [(0, 0, 150.0), (0, 2, 30.0), (1, 0, 149.0), (1, 2, 31.0)]

@@ -1046,6 +1046,70 @@ fn growing(t: u64) -> Snapshot {
     })
 }
 
+/// `ArchiveReader::metric_units` reads each table's parts once, on the
+/// first call, and answers every later call, for any name, from what it
+/// kept: a second round of calls fetches no segment. It finds a metric
+/// that first appears in a later segment, or only in the live tail, and
+/// builds no table reader.
+#[test]
+fn metric_units_reads_a_tables_footers_once() {
+    for finalize in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("units.dendro");
+        let config = WriterConfig {
+            seal: SealPolicy {
+                max_rows: 5,
+                ..SealPolicy::default()
+            },
+            ..WriterConfig::default()
+        };
+        let mut writer = ArchiveWriter::create(&path, config).unwrap();
+        let labels = [("source".to_string(), "test".to_string())]
+            .into_iter()
+            .collect();
+        let mut source = writer.add_source(labels, BTreeMap::new(), BASE).unwrap();
+        for t in 0..TICKS {
+            let staged = source.stage(&growing(t), BASE + t * S, 0).unwrap();
+            writer.commit(vec![staged]).unwrap();
+            source.maybe_seal().unwrap();
+        }
+        if finalize {
+            source.finalize((BASE + (TICKS - 1) * S, 0)).unwrap();
+        } else {
+            source.sync().unwrap();
+            std::mem::forget(source);
+        }
+        writer.join().unwrap();
+
+        let pool = BufferPool::new(1 << 20);
+        let (reader, fetched) = open_counting(&path, &pool);
+        let names = ["mem_free", "swap_free", "dirty", "cpu_time"];
+        let first: Vec<_> = names.iter().map(|n| reader.metric_units(n)).collect();
+        for (name, units) in names.iter().zip(&first) {
+            assert_eq!(units, &vec![None], "finalize={finalize}: {name}");
+        }
+        let after_first = fetched.get();
+        assert!(
+            after_first.0 > 0,
+            "finalize={finalize}: the first call reads"
+        );
+        for _ in 0..3 {
+            let again: Vec<_> = names.iter().map(|n| reader.metric_units(n)).collect();
+            assert_eq!(again, first, "finalize={finalize}");
+        }
+        assert_eq!(
+            fetched.get(),
+            after_first,
+            "finalize={finalize}: a later call fetches nothing"
+        );
+        assert!(
+            reader.opened_tables().is_empty(),
+            "finalize={finalize}: {:?}",
+            reader.opened_tables()
+        );
+    }
+}
+
 /// A metric that first appears in a later segment of a table, or only in its
 /// live tail, is found: the reader routes a query by every segment's names,
 /// not the first segment's. The names come from the segments' names

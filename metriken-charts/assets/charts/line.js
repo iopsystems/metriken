@@ -1,6 +1,7 @@
 import {
     createAxisLabelFormatter,
     plainValue,
+    resolveUnit,
 } from './util/units.js';
 import {
     insertGapNulls,
@@ -82,7 +83,7 @@ export function configureLineChart(chart) {
 
     // Access format properties using snake_case naming to match Rust serialization
     const format = opts.format || {};
-    const unitSystem = format.unit_system;
+    const { unitSystem, factor: unitFactor } = resolveUnit(format);
     const logScale = format.log_scale;
     const range = format.range;
 
@@ -267,11 +268,11 @@ export function configureLineChart(chart) {
         ...baseOption,
         ...(xAxisOverride ? { xAxis: xAxisOverride } : {}),
         dataZoom: getDataZoomConfig(calculateMinZoomSpan(widestTimeData, chart.interval)),
-        yAxis: getBaseYAxisOption(logScale, unitSystem, format),
+        yAxis: getBaseYAxisOption(logScale, unitSystem, format, unitFactor),
         tooltip: {
             ...baseOption.tooltip,
             formatter: getTooltipFormatter(unitSystem ?
-                createAxisLabelFormatter(unitSystem) :
+                createAxisLabelFormatter(unitSystem, 2, unitFactor) :
                 plainValue, null, chart),
         },
         // Compare mode: shade the gap between the two overlaid medians (the

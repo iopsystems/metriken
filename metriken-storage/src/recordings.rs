@@ -312,6 +312,10 @@ impl DataSource for RecordingsSource {
         self.listing(|c| c.duplicated_series(name))
     }
 
+    fn metric_units(&self, name: &str) -> Vec<Option<String>> {
+        crate::source::merge_units(self.children.iter().map(|c| c.metric_units(name)))
+    }
+
     fn recording_label_keys(&self) -> Vec<String> {
         self.names(|c| c.recording_label_keys())
     }

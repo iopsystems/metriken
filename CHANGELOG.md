@@ -7,7 +7,206 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-### metriken-storage (unreleased)
+### metriken-charts 0.1.5
+
+Additive (0.1.5): a spec without `format.unit` formats as before, apart
+from the two histogram heatmap fixes below.
+
+- **Added:** `format.unit`, the unit a series is stored in (`seconds`,
+  `milliseconds`, `microseconds`, `nanoseconds`, `bytes`, `kilobytes`,
+  `kibibytes`, `megabytes`, `mebibytes`, `gigabytes`, `gibibytes`, `bits`,
+  `percent`, `ratio`, `celsius`, `hertz`, `cores`). `unit` is the unit of
+  the values the query returns; set it only when the query has not
+  rescaled them. A `unit_system` of another dimension ignores it. Within
+  the unit's dimension a chart multiplies each value into its unit
+  system's base before scaling and suffixing it: a `seconds` value by 1e9
+  for `time`, a `kibibytes` value by 1024 for `bytes` or `datarate`, a
+  `percent` value by 0.01 for `percentage`. With no `unit_system` the
+  unit's own system is used. `percentage` is read as `percent` (0 to 100):
+  rezolus samplers and metriken-recorder 0.12–0.14 write that name. Line,
+  multi-series and percentile (dots and decimated bands) axes and
+  tooltips, and heatmap and quantile heatmap tooltips and colour legends,
+  apply it. A histogram heatmap labels its bucket bounds in the unit, and
+  in nanoseconds without one, as before.
+- **Added:** `resolveUnit(format)` and `STORED_UNITS` in `util/units.js`;
+  `formatWithUnit`, `createAxisLabelFormatter` and `getBaseYAxisOption`
+  take an optional factor.
+- **Added:** the unit systems `temperature` (°C) and `cores`, and
+  `Unit::Temperature` and `Unit::Cores`.
+- **Added:** `PlotBuilder::with_stored_unit`, which sets `format.unit`.
+- **Added:** `specForSourceMetric` uses a catalog entry's `unit`. A counter
+  in a bytes unit is drawn as `datarate` and one in `bits` as `bitrate`,
+  with the unit. A counter in a time unit has its rate divided by
+  `1e9 / factor` in the query (nothing for `seconds`) and is drawn as
+  `percentage`. A `bits` gauge is drawn as a count of bits. Other metrics
+  carry the unit. A catalog entry without `unit` gives the spec it gave
+  before.
+- **Fixed:** a histogram heatmap raised every bucket bound below 1 to 1,
+  so a histogram in seconds or a ratio (bounds 0.005, 0.01, ...) drew its
+  buckets below 1 with no height and its axis from 1. It now draws them on
+  its log axis, with the first bucket starting a decade below the
+  smallest positive bound. A histogram whose positive bounds are all at
+  least 1 draws as before.
+- **Fixed:** a histogram heatmap whose counts were all 0, or all in
+  buckets above `range.max`, threw `RangeError: Invalid typed array
+  length`. It now draws no data.
+
+### metriken-recorder 0.15.0
+
+Requires metriken-storage 0.13.0 (`prometheus_units`, below).
+
+- **Breaking:** a recording no longer fails when its last source fails or
+  is refused. When a source fails (`Event::SourceFailed`) or is refused and
+  no source is left `Pending`, `Activating` or `Active`, the recorder emits
+  the new `Event::NoneRecording` once, keeps the archive open and keeps
+  ticking. `Recorder::finish` then finalizes the archive, including the rows
+  committed before the failures, and returns `Ok(Summary)` with each
+  source's state. Before, the recorder emitted `Event::Failed` with "no
+  source is left recording", stopped ticking, and `finish` returned
+  `Error::Archive`. `NoneRecording` also fires when the recorder starts with
+  no source `Pending` or `Active` (every endpoint refused at detection, or
+  none given). It is not emitted once `finish` has begun. A recording in
+  which no source delivered a frame, a scrape or a pass is still removed
+  (`Summary::discarded`). `Event::Failed` and `Error::Archive` now mean
+  only an archive error: a commit, seal, retention, metadata write or added
+  recording that fails, or the writer task stopping, emits `Event::Failed`,
+  and `finish` then returns `Error::Archive`, as it does for a finalize or
+  join error.
+- **Breaking:** a local source whose `pass` panics fails alone
+  (`Event::SourceFailed`, "its pass panicked: …"); the other sources keep
+  recording. Before, the panic failed the recording (`Event::Failed`) and
+  left the archive unfinalized.
+- **Breaking:** the Prometheus converter stores every series under the
+  name the exporter serves it as, with the value it serves: a
+  `_seconds` series in seconds, a `_ms` series in milliseconds, a `_bits`
+  series in bits, a `_percent` series in 0 to 100. The `unit` key is the
+  unit the name's token or the metric's `# UNIT` line gives, by its name
+  in `metriken_storage::prometheus_units::UNITS` (`seconds`,
+  `milliseconds`, `bytes`, `percent`, …); a `_count` sample and a
+  histogram's overflow series have none. Before, such a series was stored
+  in nanoseconds or bytes under a converted name (`rpc_seconds_sum` as
+  `rpc_nanoseconds_sum`, `rx_bits_total` as `rx_bytes_total`) with the
+  exporter's name in `__prometheus_name__`, and a `_percent` series had
+  `unit="percentage"`. A reader querying the converted names, or
+  matching `__prometheus_name__`, finds nothing in a new recording; one
+  that took a time series' values as nanoseconds reads seconds,
+  milliseconds or microseconds, as the `unit` key says.
+- **Breaking:** a histogram's bounds are stored as integers: each `le` is
+  multiplied by a scale, written as `scale` when it is not 1, and rounded
+  (it was truncated, so bounds 0.1, 0.25 and 0.5 stored 0.25 as 2 and read
+  a p50 of 0.2). A time unit has a fixed scale, its nanoseconds per unit:
+  `seconds` 1e9, `milliseconds` 1e6, `microseconds` 1e3, `nanoseconds` 1,
+  so a `_seconds` histogram is stored in nanoseconds whatever its smallest
+  bucket, and two endpoints' histograms of one name pool. Any other
+  histogram takes the smallest power of 10, at most 1e9, that makes every
+  finite bound an integer (0.1, 0.25, 0.5 take 100; 0.0003 takes 10_000).
+  The overflow bound takes the same scale. Two bounds that land in one
+  bucket of the `histogram` crate add their observations there. A time
+  histogram's resolution is 1 ns: a bound below half a nanosecond (a
+  `_ns` bound of 0.4, a `_us` bound below 0.0005, a `_ms` bound below
+  5e-7) rounds to 0, its observations are counted at 0, and the converter
+  logs it at `debug`; so does any bound below 5e-10 at the cap.
+  metriken-query divides by `scale`, so the histogram reads in its unit.
+  Its `_sum` is in the exporter's unit, unscaled. The overflow series is
+  `<exporter name>_overflow` (`rpc_seconds_overflow`).
+- **Breaking:** the collision path is removed: two exporter names that
+  would have been stored under one name are stored under their own names,
+  as every series is. A `# HELP` text is kept under the exporter's name
+  only.
+
+### metriken-storage 0.13.0
+
+- **Breaking:** `prometheus_units` gives a Prometheus series' unit and no
+  longer renames or converts. `UNITS` lists each unit token with the
+  `unit` value written for it: `seconds`; `milliseconds` (from
+  `milliseconds`, `ms`, `msec`); `microseconds` (`microseconds`, `us`);
+  `nanoseconds` (`nanoseconds`, `ns`); `bytes`; `kilobytes` (`kilobytes`,
+  `kb`); `kibibytes` (`kibibytes`, `kib`); `megabytes` (`megabytes`,
+  `mb`); `mebibytes` (`mebibytes`, `mib`); `gigabytes` (`gigabytes`,
+  `gb`); `gibibytes` (`gibibytes`, `gib`); `bits`; `percent`; `ratio`;
+  `celsius`; `hertz`; `cores`. `unit(name, unit_line)` returns the unit of
+  a series served as `name` whose metric's `# UNIT` line is `unit_line`:
+  the line's when it is in `UNITS`, else the name's token, and `None` for
+  a `_count` or `_bucket` sample. Removed: `PROMETHEUS_NAME_LABEL` (and
+  its re-export at the crate root), `normalize`, `Normalized`,
+  `fallback_candidates`, `TOKENS`, `Unit`, and
+  `SamplerReader::holds_labeled`. `unit_of` returns the `unit` value
+  (`Option<&'static str>`) where it returned a `Unit`. `SUFFIXES` and
+  `split_suffix` are unchanged.
+- **Breaking:** `HistogramRow` gains `scale: f64`, the factor the row's
+  bucket bounds and overflow bound are its values times: its column's
+  `SCALE_KEY`, 1 for a column without one (or whose value is not a finite
+  positive number). The parquet, segmented and memory readers fill it, so
+  a struct literal of `HistogramRow` must add the field. `Memory` gains
+  `set_histogram_scale(name, labels, ts, scale)`, which sets a series'
+  scale from its row at `ts` on.
+- **Added:** `DataSource::metric_units(name)`, the distinct values of the
+  `unit` storage key on metric `name`'s columns, sorted, `None` for a
+  column without one; empty by default and for a name the source does not
+  hold. The parquet, segmented, lazy, labeled, recordings and union
+  sources and `Memory` answer it, and `source::merge_units` merges several
+  sources' answers. A source wrapping others must forward it, or its
+  metrics have no unit. `ArchiveReader::metric_units` answers it from a
+  map of each table's names' units, built on the first call from its
+  parts' footers in order (sealed segments, then the live tail) and kept
+  for the reader's life, without building the table's reader; a unit that
+  changed in a later part of one table is not seen.
+  `Memory::set_unit(name, labels, unit)` records a
+  series' unit, the latest call holding.
+- **Docs:** `SCALE_KEY` describes what metriken-recorder's converter
+  writes (a fixed scale for a time unit, else the power of 10 that makes
+  every bound an integer), that it applies to `OVERFLOW_BOUND_KEY` too,
+  and which readers divide by it.
+
+### metriken-query 0.50.0
+
+- **Breaking:** a histogram function divides each value it takes from a
+  bucket by the rows' `scale` (`HistogramRow::scale`, a column's
+  `SCALE_KEY`), so it reads in the histogram's unit: `histogram_quantile`,
+  `histogram_quantiles` and their bands and intervals, a quantile's
+  overflow band, `histogram_mean`, `histogram_sum` and
+  `histogram_heatmap`'s bucket bounds, over an archive, a parquet file or
+  a live `MemoryStore` (whose ingest takes `scale` from each snapshot's
+  histogram metadata). A histogram stored with `scale` reads in its
+  exporter's unit, divided by `scale`. A `_seconds` histogram, which
+  metriken-recorder 0.12.0 to 0.14.0 stored ×1e9 as `<name>_nanoseconds`,
+  is stored ×1e9 under its own name with `scale` 1e9 and now reads in
+  seconds. `histogram_count` and `histogram_irate` count observations and
+  are unchanged. `histogram_mean` and `histogram_sum` divide each output
+  group by its own rows' scale. A function whose output pools rows of two
+  scales (two recordings or endpoints with different bucket layouts of a
+  histogram without a time unit, or a series whose layout changed within
+  the range; the row before the range's start counts) is refused with an
+  `EvaluationError` naming the two scales, since their buckets cannot be
+  added. A label matcher that selects series of one scale, a grouping
+  that keeps them apart, or a time range within one bucket layout reads
+  them. The gauge-histogram functions do not divide.
+- **Breaking:** `HistogramHeatmapResult::bucket_bounds` is `Vec<f64>`, in
+  the histogram's unit, where it was `Vec<u64>` in its stored units. In
+  JSON it is an array of finite numbers (`[0.001, 0.002, …]`; a whole
+  number may be written `1000.0`); no bound is infinite.
+- **Breaking:** a selector reads only the name it gives. A query naming a
+  Prometheus series by its exporter name no longer reads a series stored
+  under a converted name with `__prometheus_name__` (metriken-recorder
+  0.12.0 to 0.14.0), and answers as a query naming a metric the source
+  does not hold when nothing else holds that name; the stored name still
+  reads such a series as stored, in its converted unit. The error for one
+  exporter name stored under two names is gone. Recordings of the next
+  metriken-recorder release store every series under the exporter's name,
+  so the exporter's name reads them.
+- **Added:** `MetricsSource::metric_unit(name)`, the `unit` storage key of
+  metric `name` (for a Prometheus series, a value of
+  `metriken_storage::prometheus_units::UNITS`), for a catalog to format a
+  metric by. `Some` only when every column of `name`, in every recording
+  and table, carries one and the same unit; `None` when the source does
+  not hold `name`, a column has none, or two differ. Answered by
+  `ArchiveReader` (a per-table map of units, built once),
+  `ParquetReader`, `SegmentedParquetReader`, `UnionMetricsSource` and
+  `MemoryStore`, whose ingest records each series' unit from its snapshot
+  metadata. The default is `None`, so a `MetricsSource` that wraps another
+  must forward `metric_unit`.
+
+### metriken-storage 0.12.0
 
 - **Breaking:** `Labels::matches` takes a label the series does not carry
   as `""`, as Prometheus does: `l=""` matches a series without `l`, as do
@@ -58,7 +257,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   browse of a 12 h v3 `.rez` with a 2 GiB pool, with jemalloc as the
   allocator, peaked at 3546–3547 MiB RSS, from 5061–5079 MiB (#400).
 
-### metriken-query (unreleased)
+### metriken-query 0.49.0
 
 - **Breaking:** a matcher that matches the empty string selects the series
   that lack the label, through every source: `x{l=""}` selects the series
@@ -78,16 +277,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metriken-storage's entry. `cached_segments` counts the segments the
   reader would find in the pool. Requires metriken-storage 0.12.0 (#400).
 
-### metriken-recorder (unreleased)
+### metriken-recorder 0.14.0
 
+- **Breaking:** requires metriken-storage 0.12.0, whose `WriterConfig`
+  `RecorderConfig::writer` holds.
 - **Changed:** a source whose rows cannot be staged, or whose streamed frame
   cannot be read or decoded, fails alone (`Event::SourceFailed`) at the next
   commit, as a source whose rows cannot be encoded does; before, the whole
   recording failed. The rows it staged before are committed. An error from
   the archive itself still fails the recording.
 - **Changed:** a failed source keeps the segments its failed tables sealed
-  before the failure (metriken-storage's change above). Requires the
-  metriken-storage release with that change.
+  before the failure (metriken-storage 0.12.0's change above).
 
 ### metriken-storage 0.11.2
 

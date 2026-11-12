@@ -5,8 +5,8 @@ use metriken_model::{
     FloatCounter, FloatGauge, GroupSchema, GroupSnapshot, Histogram as SnapshotHistogram,
     MetricDesc, Snapshot, SnapshotV3,
 };
-use metriken_storage::prometheus_units::{normalize, split_suffix, Normalized};
-use metriken_storage::{OVERFLOW_BOUND_KEY, OVERFLOW_KEY, PROMETHEUS_NAME_LABEL, SCALE_KEY};
+use metriken_storage::prometheus_units::{split_suffix, unit};
+use metriken_storage::{OVERFLOW_BOUND_KEY, OVERFLOW_KEY, SCALE_KEY};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -27,22 +27,15 @@ use tracing::{debug, warn};
 /// column names ([`OVERFLOW_KEY`], with its highest finite bound as
 /// [`OVERFLOW_BOUND_KEY`]); see `convert_histogram`.
 ///
-/// A series whose name ends in a unit token (after `_bucket`, `_sum`,
-/// `_count` or `_total`), or whose metric has an OpenMetrics `# UNIT` line,
-/// is stored in the normalized unit with the `unit` key set: times in
-/// nanoseconds, sizes in bytes (bits divided by 8), and `percent`, `ratio`,
-/// `celsius`, `hertz` and `cores` unscaled
-/// ([`metriken_storage::prometheus_units`]). A histogram's buckets, its
-/// `_sum`, a summary's quantiles and its `_sum`, and plain scalars are
-/// multiplied by one factor; a `_count` is not. A series whose stored name
-/// differs from the exporter's (`rpc_ms` is stored as `rpc_nanoseconds`)
-/// carries the exporter's name in the internal label
-/// [`PROMETHEUS_NAME_LABEL`]. When two exporter names would be stored
-/// under one name (`rpc_seconds` and `rpc_ms`, or `rpc_seconds` beside an
-/// `rpc_nanoseconds` the exporter serves), each one's whole family (the
-/// name with its `_bucket`, `_sum`, `_count` and `_total` series) is
-/// stored under its own names, unscaled, from that scrape on for the life
-/// of the converter, so a histogram's buckets and `_sum` stay in one unit.
+/// Every series is stored under the name the exporter serves it as, in the
+/// exporter's units. A series whose name ends in a unit token (after
+/// `_sum` or `_total`), or whose metric has an OpenMetrics `# UNIT` line,
+/// has the `unit` key set to that unit's name in
+/// [`metriken_storage::prometheus_units::UNITS`]: `rpc_seconds` is in
+/// `seconds`, `rpc_ms` in `milliseconds`, `cpu_percent` in `percent` (0 to
+/// 100). A `_count` sample has none. A histogram's bounds are the
+/// exporter's `le` values multiplied by a scale and rounded, the scale
+/// written as [`SCALE_KEY`]; see `convert_histogram`.
 ///
 /// An exporter label whose key is a storage key
 /// ([`metriken_storage::STORAGE_KEYS`]: `unit`, `scale`, `metric`, …) is
@@ -71,16 +64,9 @@ pub struct PrometheusConverter {
     /// converter, later at `debug`.
     overflow_collision_warned: bool,
     /// A sample was dropped because the scrape already had one of the same
-    /// stored name and labels. Logged at `warn` once per converter, later at
+    /// name and stored labels. Logged at `warn` once per converter, later at
     /// `debug`.
     repeat_warned: bool,
-    /// Families (exporter names without a `_bucket`, `_sum`, `_count` or
-    /// `_total` suffix) stored under their own names, unscaled, because a
-    /// member's normalized name collided with another's in some scrape.
-    /// Never emptied, so a series is renamed back at most once.
-    keep_original: HashSet<String>,
-    /// A unit collision has been logged at `warn`; later ones at `debug`.
-    unit_collision_warned: bool,
 }
 
 impl Default for PrometheusConverter {
@@ -108,8 +94,6 @@ impl PrometheusConverter {
             skips_warned: false,
             overflow_collision_warned: false,
             repeat_warned: false,
-            keep_original: HashSet::new(),
-            unit_collision_warned: false,
         }
     }
 
@@ -186,79 +170,6 @@ impl PrometheusConverter {
         }
     }
 
-    fn log_unit_collision(&mut self, stored: &str, names: &[&str]) {
-        if self.unit_collision_warned {
-            debug!("{names:?} would all be stored as {stored}: each keeps its own name and unit");
-        } else {
-            self.unit_collision_warned = true;
-            warn!(
-                "{names:?} would all be stored as {stored}: each keeps its own name and unit, \
-                 unscaled, for the rest of this recording (later collisions log at debug)"
-            );
-        }
-    }
-
-    /// Whether exporter name `name`'s family is kept as served.
-    fn kept(&self, name: &str) -> bool {
-        self.keep_original.contains(split_suffix(name).0)
-    }
-
-    /// Each exporter name of `scrape` and how it is stored: `None` for a
-    /// name kept as served (no unit, or its family in `keep_original`). The
-    /// families of names that collide in this scrape join `keep_original`
-    /// first.
-    fn plan(&mut self, scrape: &Scrape) -> HashMap<String, Option<Normalized>> {
-        let mut plan: HashMap<String, Option<Normalized>> = HashMap::new();
-        for sample in &scrape.samples {
-            if !plan.contains_key(&sample.metric) {
-                let normalized =
-                    normalize(&sample.metric, unit_line(&scrape.units, &sample.metric));
-                plan.insert(sample.metric.clone(), normalized);
-            }
-        }
-        // Stored name -> the exporter names renamed to it.
-        let mut renamed: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        let mut as_served: HashSet<&str> = HashSet::new();
-        for (name, normalized) in &plan {
-            match normalized {
-                Some(n) if n.name != *name && !self.kept(name) => {
-                    renamed
-                        .entry(n.name.as_str())
-                        .or_default()
-                        .push(name.as_str());
-                }
-                _ => {
-                    as_served.insert(name.as_str());
-                }
-            }
-        }
-        let mut collisions: Vec<(String, Vec<String>)> = Vec::new();
-        for (stored, mut names) in renamed {
-            if names.len() > 1 || as_served.contains(stored) {
-                names.sort_unstable();
-                if as_served.contains(stored) {
-                    names.push(stored);
-                }
-                collisions.push((
-                    stored.to_string(),
-                    names.into_iter().map(str::to_string).collect(),
-                ));
-            }
-        }
-        for (stored, names) in collisions {
-            let shown: Vec<&str> = names.iter().map(String::as_str).collect();
-            self.log_unit_collision(&stored, &shown);
-            self.keep_original
-                .extend(names.iter().map(|n| split_suffix(n).0.to_string()));
-        }
-        for (name, normalized) in plan.iter_mut() {
-            if self.kept(name) {
-                *normalized = None;
-            }
-        }
-        plan
-    }
-
     fn log_skipped(&mut self, count: usize, first: &str) {
         let (cut, more) = shown_line(first);
         let more = if more { " (cut)" } else { "" };
@@ -286,21 +197,12 @@ impl PrometheusConverter {
             self.log_skipped(scrape.skipped, first);
         }
 
-        let plan = self.plan(&scrape);
-
         for (name, doc) in &scrape.docs {
-            // Under the exporter's name and, when renamed, the stored one.
-            let stored = match plan.get(name) {
-                Some(normalized) => normalized.as_ref().map(|n| n.name.clone()),
-                None if self.kept(name) => None,
-                None => normalize(name, unit_line(&scrape.units, name)).map(|n| n.name),
-            };
-            for name in std::iter::once(name.clone()).chain(stored) {
-                if let std::collections::btree_map::Entry::Vacant(e) = self.descriptions.entry(name)
-                {
-                    e.insert(doc.clone());
-                    self.descriptions_changed = true;
-                }
+            if let std::collections::btree_map::Entry::Vacant(e) =
+                self.descriptions.entry(name.clone())
+            {
+                e.insert(doc.clone());
+                self.descriptions_changed = true;
             }
         }
 
@@ -319,23 +221,12 @@ impl PrometheusConverter {
         let window = sample_window(request_ns, response_ns);
 
         for sample in scrape.samples {
-            // The stored name, the labels (sorted by name, which `MetricKey`
-            // relies on) with the exporter's name when it differs, the unit
-            // and the factor every value is multiplied by.
-            let normalized = plan.get(&sample.metric).and_then(Option::as_ref);
+            // The labels, storage keys moved to `exported_<key>` and sorted
+            // by name (which `MetricKey` relies on), and the unit.
             let mut labels = sample.labels;
             rename_storage_keys(&mut labels);
-            let (name, unit, factor) = match normalized {
-                Some(n) => {
-                    if n.name != sample.metric {
-                        labels.retain(|(k, _)| k != PROMETHEUS_NAME_LABEL);
-                        labels.push((PROMETHEUS_NAME_LABEL.to_string(), sample.metric.clone()));
-                        labels.sort();
-                    }
-                    (n.name.clone(), n.unit, n.factor)
-                }
-                None => (sample.metric.clone(), None, 1.0),
-            };
+            let unit = unit(&sample.metric, unit_line(&scrape.units, &sample.metric));
+            let name = sample.metric;
             // One series is one column: a second sample of it in this scrape
             // (a line served twice, or `exported_<key>` beside a `<key>` the
             // rename moved there) would give the column two values in one
@@ -365,8 +256,7 @@ impl PrometheusConverter {
                     }
                     let id = self.get_or_assign_id(&name, &labels);
                     counters.push(
-                        FloatCounter::new(id, v * factor, metadata(self, &labels))
-                            .with_window(window),
+                        FloatCounter::new(id, v, metadata(self, &labels)).with_window(window),
                     );
                     taken.insert(key);
                 }
@@ -375,10 +265,8 @@ impl PrometheusConverter {
                         continue;
                     }
                     let id = self.get_or_assign_id(&name, &labels);
-                    gauges.push(
-                        FloatGauge::new(id, v * factor, metadata(self, &labels))
-                            .with_window(window),
-                    );
+                    gauges
+                        .push(FloatGauge::new(id, v, metadata(self, &labels)).with_window(window));
                     taken.insert(key);
                 }
                 Value::Untyped(v) => {
@@ -389,23 +277,22 @@ impl PrometheusConverter {
                     // by Prometheus convention, so store them as counters.
                     // _sum is particularly useful: rate(_sum) / rate(_count)
                     // gives the true mean for comparison against approximated
-                    // histogram percentiles. A rename keeps the suffix.
+                    // histogram percentiles.
                     let id = self.get_or_assign_id(&name, &labels);
                     let metadata = metadata(self, &labels);
                     if name.ends_with("_total")
                         || name.ends_with("_sum")
                         || name.ends_with("_count")
                     {
-                        counters
-                            .push(FloatCounter::new(id, v * factor, metadata).with_window(window));
+                        counters.push(FloatCounter::new(id, v, metadata).with_window(window));
                     } else {
-                        gauges.push(FloatGauge::new(id, v * factor, metadata).with_window(window));
+                        gauges.push(FloatGauge::new(id, v, metadata).with_window(window));
                     }
                     taken.insert(key);
                 }
                 Value::Histogram(ref buckets) => {
                     if let Some((h, mut metadata, overflow)) =
-                        convert_histogram(buckets, &name, &labels, factor)
+                        convert_histogram(buckets, &name, &labels, unit)
                     {
                         if let Some(unit) = unit {
                             metadata.insert(UNIT_KEY.to_string(), unit.to_string());
@@ -430,7 +317,7 @@ impl PrometheusConverter {
                         q_labels.sort();
                         let id = self.get_or_assign_id(&name, &q_labels);
                         gauges.push(
-                            FloatGauge::new(id, quantile.count * factor, metadata(self, &q_labels))
+                            FloatGauge::new(id, quantile.count, metadata(self, &q_labels))
                                 .with_window(window),
                         );
                         taken.insert(key.clone());
@@ -587,11 +474,18 @@ has_name_and_metadata!(FloatCounter, FloatGauge, SnapshotHistogram);
 /// Uses the upper bound (le) of each bucket as the representative value and
 /// computes per-bucket delta counts from the cumulative Prometheus counts.
 ///
-/// Each `le` is multiplied by `factor`, the unit's (1e9 for a `_seconds`
-/// histogram, so its bounds are in nanoseconds, the unit metriken's latency
-/// histograms use), and then by the power of 10 that makes the smallest
-/// positive bound at least 1, so no bound truncates to 0. That power, when
-/// it is not 1, is written as [`SCALE_KEY`].
+/// The histogram's buckets hold integers, so each `le`, in the exporter's
+/// unit, is multiplied by a scale and rounded to the nearest integer
+/// ([`histogram_scale`]): a fixed one for a time unit (×1e9 for `seconds`,
+/// so the bounds are in nanoseconds, whatever the exporter's smallest
+/// bucket), and otherwise the smallest power of 10 that makes every finite
+/// bound an integer. The scale, when it is not 1, is written as
+/// [`SCALE_KEY`], and metriken-query divides by it, so the histogram reads
+/// in its `unit`. A bound is counted in the `histogram` crate's bucket
+/// holding its rounded value. Two bounds that land in one bucket (the
+/// crate's buckets are exact below 128 and about 1% wide above it, and two
+/// bounds can round to one integer at the cap) have their observations
+/// added in that bucket, so no observation is lost or counted twice.
 ///
 /// With a `+Inf` bucket, also returns the overflow, the `+Inf` count less
 /// the highest finite bucket's (at least 0), and writes into the metadata
@@ -603,7 +497,7 @@ fn convert_histogram(
     buckets: &[HistogramCount],
     metric_name: &str,
     labels: &[(String, String)],
-    factor: f64,
+    unit: Option<&str>,
 ) -> Option<(histogram::Histogram, HashMap<String, String>, Option<f64>)> {
     // Filter to finite boundaries only (+Inf cannot be represented)
     let finite_buckets: Vec<_> = buckets
@@ -615,14 +509,23 @@ fn convert_histogram(
         return None;
     }
 
-    // The unit's factor, then a power of 10 that keeps every bound above 0.
-    let generic = compute_generic_scale(finite_buckets.iter().map(|b| b.less_than * factor));
-    let scale = factor * generic;
+    let scale = histogram_scale(unit, finite_buckets.iter().map(|b| b.less_than));
+    let scaled = |bound: f64| (bound * scale).round();
+    if let Some(b) = finite_buckets
+        .iter()
+        .find(|b| b.less_than != 0.0 && scaled(b.less_than) == 0.0)
+    {
+        debug!(
+            "{metric_name}: bound {} rounds to 0 at scale {scale}, below the histogram's \
+             resolution; its observations are counted at 0",
+            b.less_than
+        );
+    }
 
     // max_value_power must cover the largest scaled value
     let max_scaled = finite_buckets
         .iter()
-        .map(|b| (b.less_than * scale) as u64)
+        .map(|b| scaled(b.less_than) as u64)
         .max()
         .unwrap_or(1);
     let max_value_power = if max_scaled == 0 {
@@ -641,7 +544,7 @@ fn convert_histogram(
         let cum_count = bucket.count as u64;
         let delta = cum_count.saturating_sub(prev_count);
         if delta > 0 {
-            let value = (bucket.less_than * scale) as u64;
+            let value = scaled(bucket.less_than) as u64;
             let _ = h.add(value, delta);
         }
         prev_count = cum_count;
@@ -655,8 +558,8 @@ fn convert_histogram(
     // See `build_metadata` for why neither is written here.
     metadata.insert("grouping_power".to_string(), grouping_power.to_string());
     metadata.insert("max_value_power".to_string(), max_value_power.to_string());
-    if generic != 1.0 {
-        metadata.insert(SCALE_KEY.to_string(), generic.to_string());
+    if scale != 1.0 {
+        metadata.insert(SCALE_KEY.to_string(), scale.to_string());
     }
 
     // The highest finite bucket, by bound rather than by position.
@@ -671,7 +574,7 @@ fn convert_histogram(
         metadata.insert(OVERFLOW_KEY.to_string(), overflow_name(metric_name));
         metadata.insert(
             OVERFLOW_BOUND_KEY.to_string(),
-            (top.less_than * scale).to_string(),
+            scaled(top.less_than).to_string(),
         );
     }
 
@@ -684,17 +587,44 @@ fn overflow_name(metric: &str) -> String {
     format!("{metric}_overflow")
 }
 
-/// Compute a power-of-10 scale factor that makes the smallest positive
-/// bound >= 1, preserving precision when converting float boundaries to u64.
-fn compute_generic_scale(bounds: impl Iterator<Item = f64>) -> f64 {
-    let min_le = bounds.filter(|v| *v > 0.0).fold(f64::INFINITY, f64::min);
+/// The largest scale [`histogram_scale`] picks for a histogram without a
+/// time unit: 1e9, nanosecond resolution of a unit of 1.
+const MAX_SCALE: f64 = 1e9;
 
-    if min_le >= 1.0 || min_le == f64::INFINITY {
-        return 1.0;
+/// The factor a histogram's bounds are multiplied by before they are
+/// rounded into its integer buckets ([`SCALE_KEY`]).
+///
+/// A time unit has a fixed scale, its nanoseconds per unit: `seconds` 1e9,
+/// `milliseconds` 1e6, `microseconds` 1e3, `nanoseconds` 1. Every
+/// histogram of one name and unit is then stored at one scale, whichever
+/// buckets its exporter serves, so two endpoints' histograms pool. Any
+/// other histogram (no unit, `bytes`, `ratio`, `percent`, …) takes the
+/// smallest power of 10, at most [`MAX_SCALE`], that makes every finite
+/// bound an integer within a relative 1e-9: `0.1, 0.25, 0.5` take 100.
+/// The overflow bound is the highest finite bound, so it is one of them.
+///
+/// A time histogram's resolution is therefore 1 ns: a bound below it (a
+/// `_ns` bound of 0.4, a `_us` bound below 0.0005, a `_ms` bound below
+/// 5e-7, a `_seconds` bound below 5e-10) rounds to 0, its observations are
+/// counted at 0, and `convert_histogram` logs it at `debug`. Any other
+/// histogram's bound below 5e-10 rounds to 0 at [`MAX_SCALE`] likewise.
+fn histogram_scale(unit: Option<&str>, bounds: impl Iterator<Item = f64> + Clone) -> f64 {
+    match unit {
+        Some("seconds") => return 1e9,
+        Some("milliseconds") => return 1e6,
+        Some("microseconds") => return 1e3,
+        Some("nanoseconds") => return 1.0,
+        _ => {}
     }
-
+    let integral = |scale: f64| {
+        bounds.clone().all(|b| {
+            // A bound that is not 0 must not round to 0.
+            let v = b * scale;
+            (b == 0.0 || v.round() != 0.0) && (v - v.round()).abs() <= v.abs() * 1e-9
+        })
+    };
     let mut scale = 1.0;
-    while min_le * scale < 1.0 {
+    while scale < MAX_SCALE && !integral(scale) {
         scale *= 10.0;
     }
     scale
@@ -870,12 +800,12 @@ mod tests {
     }
 
     /// A histogram's overflow is the `+Inf` count less the highest finite
-    /// bucket's, found by bound whatever the line order, and its bound is
-    /// scaled as the buckets are: ×1e9 for a `_seconds` name, stored as
-    /// `_nanoseconds`, whose overflow series is named after the stored name.
-    /// A histogram without a `+Inf` bucket has neither.
+    /// bucket's, found by bound whatever the line order, its bound is the
+    /// highest finite `le` at the buckets' scale (a `_seconds` histogram's
+    /// in nanoseconds), and its overflow series is named after the
+    /// exporter's name. A histogram without a `+Inf` bucket has neither.
     #[test]
-    fn the_overflow_is_above_the_highest_finite_bound_scaled() {
+    fn the_overflow_is_above_the_highest_finite_bound() {
         let mut conv = PrometheusConverter::new();
         let text = "# TYPE lat_seconds histogram
                     lat_seconds_bucket{le=\"10\"} 9
@@ -890,10 +820,7 @@ mod tests {
             .into_iter()
             .map(|c| (c.metadata["metric"].clone(), c.value))
             .collect();
-        assert_eq!(
-            overflow,
-            vec![("lat_nanoseconds_overflow".to_string(), 3.0)]
-        );
+        assert_eq!(overflow, vec![("lat_seconds_overflow".to_string(), 3.0)]);
         let hists = snap.histograms();
         let meta = |name: &str| {
             hists
@@ -903,12 +830,62 @@ mod tests {
                 .metadata
                 .clone()
         };
-        let lat = meta("lat_nanoseconds");
-        assert_eq!(lat[OVERFLOW_KEY], "lat_nanoseconds_overflow");
+        let lat = meta("lat_seconds");
+        assert_eq!(lat[OVERFLOW_KEY], "lat_seconds_overflow");
         assert_eq!(lat[OVERFLOW_BOUND_KEY], "10000000000");
+        assert_eq!(lat[UNIT_KEY], "seconds");
+        assert_eq!(lat[SCALE_KEY], "1000000000");
         let short = meta("short");
         assert!(!short.contains_key(OVERFLOW_KEY));
         assert!(!short.contains_key(OVERFLOW_BOUND_KEY));
+    }
+
+    /// A time unit takes its fixed scale whatever the bounds; any other
+    /// histogram the smallest power of 10 that makes every bound an integer,
+    /// at most `MAX_SCALE`.
+    #[test]
+    fn a_histogram_scale_makes_every_bound_an_integer() {
+        let scale = |unit, bounds: &[f64]| histogram_scale(unit, bounds.iter().copied());
+        assert_eq!(scale(Some("seconds"), &[0.005, 0.1]), 1e9);
+        assert_eq!(scale(Some("seconds"), &[1.0, 10.0]), 1e9);
+        assert_eq!(scale(Some("milliseconds"), &[0.5]), 1e6);
+        assert_eq!(scale(Some("microseconds"), &[0.5]), 1e3);
+        assert_eq!(scale(Some("nanoseconds"), &[100.0]), 1.0);
+        // Below a time unit's 1 ns resolution: the scale stays fixed, and
+        // the bound rounds to 0.
+        assert_eq!(scale(Some("nanoseconds"), &[0.4, 0.8]), 1.0);
+        assert_eq!(scale(None, &[1.0, 5.0, 10.0]), 1.0);
+        assert_eq!(scale(None, &[0.1, 0.25, 0.5]), 100.0);
+        assert_eq!(scale(None, &[0.0003, 0.0006]), 10_000.0);
+        assert_eq!(scale(Some("bytes"), &[0.5, 1024.0]), 10.0);
+        assert_eq!(scale(None, &[0.0, 0.5]), 10.0);
+        assert_eq!(scale(None, &[1e-12]), MAX_SCALE);
+        assert_eq!(scale(None, &[1.0 / 3.0]), MAX_SCALE);
+    }
+
+    /// Each bound is rounded, not truncated, into the buckets: `0.0003` ×
+    /// 10_000 is 3, and `0.1, 0.15` stay two buckets.
+    #[test]
+    fn a_bound_is_rounded_into_its_bucket() {
+        let bucket = |le: f64, count: f64| HistogramCount {
+            less_than: le,
+            count,
+        };
+        let values = |buckets: &[HistogramCount]| -> Vec<(u64, u64)> {
+            let (h, _, _) = convert_histogram(buckets, "x", &[], None).unwrap();
+            h.into_iter()
+                .filter(|b| b.count() > 0)
+                .map(|b| (b.end(), b.count()))
+                .collect()
+        };
+        assert_eq!(
+            values(&[bucket(0.0003, 1.0), bucket(0.0006, 3.0)]),
+            [(3, 1), (6, 2)]
+        );
+        assert_eq!(
+            values(&[bucket(0.1, 1.0), bucket(0.15, 3.0), bucket(0.25, 4.0)]),
+            [(10, 1), (15, 2), (25, 1)]
+        );
     }
 
     /// An exporter's trailing timestamp does not become the acquisition
@@ -1229,8 +1206,8 @@ x_total{metric=\"m\",metric_type=\"t\",scale=\"s\"} 3
 
     /// The rule holds for a histogram, whose own storage keys are written
     /// beside the exporter's, for its overflow series, for a summary's
-    /// quantiles, and for a series renamed for its unit, whose `unit` is
-    /// the normalized one.
+    /// quantiles, and for a series with a unit token, whose `unit` is the
+    /// token's.
     #[test]
     fn every_series_of_a_family_takes_the_exported_label() {
         let text = "\
@@ -1246,12 +1223,12 @@ g_seconds{unit=\"u\"} 5
         let find = |name: &str| -> Vec<&HashMap<String, String>> {
             all.iter().filter(|m| m["metric"] == name).collect()
         };
-        let lat = find("lat_nanoseconds");
+        let lat = find("lat_seconds");
         assert_eq!(lat.len(), 1, "{all:?}");
         assert_eq!(lat[0]["exported_scale"], "x");
-        assert_eq!(lat[0][OVERFLOW_KEY], "lat_nanoseconds_overflow");
-        assert!(!lat[0].contains_key(SCALE_KEY), "{:?}", lat[0]);
-        let overflow = find("lat_nanoseconds_overflow");
+        assert_eq!(lat[0][OVERFLOW_KEY], "lat_seconds_overflow");
+        assert_eq!(lat[0][SCALE_KEY], "1000000000", "{:?}", lat[0]);
+        let overflow = find("lat_seconds_overflow");
         assert_eq!(overflow.len(), 1, "{all:?}");
         assert_eq!(overflow[0]["exported_scale"], "x");
         assert!(!overflow[0].contains_key("scale"), "{:?}", overflow[0]);
@@ -1260,11 +1237,10 @@ g_seconds{unit=\"u\"} 5
         assert_eq!(q[0]["exported_unit"], "u");
         assert_eq!(q[0]["quantile"], "0.5");
         assert!(!q[0].contains_key(UNIT_KEY), "{:?}", q[0]);
-        let g = find("g_nanoseconds");
+        let g = find("g_seconds");
         assert_eq!(g.len(), 1, "{all:?}");
         assert_eq!(g[0]["exported_unit"], "u");
-        assert_eq!(g[0][UNIT_KEY], "nanoseconds");
-        assert_eq!(g[0][PROMETHEUS_NAME_LABEL], "g_seconds");
+        assert_eq!(g[0][UNIT_KEY], "seconds");
     }
 
     /// A repeated series keeps its first value the converter accepts: a
