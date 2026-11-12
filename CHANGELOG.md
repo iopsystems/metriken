@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-### metriken-charts (unreleased)
+### metriken-charts 0.1.5
 
 Additive (0.1.5): a spec without `format.unit` formats as before, apart
 from the two histogram heatmap fixes below.
@@ -51,9 +51,9 @@ from the two histogram heatmap fixes below.
   buckets above `range.max`, threw `RangeError: Invalid typed array
   length`. It now draws no data.
 
-### metriken-recorder (unreleased)
+### metriken-recorder 0.15.0
 
-Requires metriken-storage's unreleased `prometheus_units` (below).
+Requires metriken-storage 0.13.0 (`prometheus_units`, below).
 
 - **Breaking:** a recording no longer fails when its last source fails or
   is refused. When a source fails (`Event::SourceFailed`) or is refused and
@@ -114,7 +114,7 @@ Requires metriken-storage's unreleased `prometheus_units` (below).
   as every series is. A `# HELP` text is kept under the exporter's name
   only.
 
-### metriken-storage (unreleased)
+### metriken-storage 0.13.0
 
 - **Breaking:** `prometheus_units` gives a Prometheus series' unit and no
   longer renames or converts. `UNITS` lists each unit token with the
@@ -158,7 +158,7 @@ Requires metriken-storage's unreleased `prometheus_units` (below).
   every bound an integer), that it applies to `OVERFLOW_BOUND_KEY` too,
   and which readers divide by it.
 
-### metriken-query (unreleased)
+### metriken-query 0.50.0
 
 - **Breaking:** a histogram function divides each value it takes from a
   bucket by the rows' `scale` (`HistogramRow::scale`, a column's
