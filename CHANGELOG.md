@@ -147,6 +147,13 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   allocator, peaked at 5061–5079 MiB RSS before this change and the
   histogram charge above, at 3546–3547 MiB with this change alone, and at
   3319–3356 MiB with both (two runs each; #400).
+- **Added:** `ChunkReader::unread_start`, a time no row of a reader's
+  unread segments is before, known without reading them (provided;
+  `None` by default), and `CounterScan::unread_start`. A segmented
+  table's scan gives it from its catalog.
+- **Changed:** `scan::interleave` reads a scan not read yet in time order
+  with the others when the scan gives `unread_start`. It read every such
+  scan before the others; a scan that gives no start still is.
 
 ### metriken-storage 0.13.0
 
@@ -215,6 +222,24 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   8270–8320 MiB (four runs a side), with every answer the same to 9
   significant digits. These figures are from builds without #406 and
   #407 (metriken-storage, above).
+- **Fixed:** the batched rate path holds fewer points while it combines
+  a process group's members, notably over a source that spans a producer
+  restart. It passes points on after each segment it reads rather than
+  after each chunk of up to eight; a member whose span starts later (a
+  later producer epoch) no longer holds back the points before its
+  start; and scans are interleaved in time order (see metriken-storage's
+  `scan::interleave` entry), so a later epoch is not read ahead of an
+  earlier one. On a 12 h recording of 655 cgroups with one agent
+  restart, a dashboard browse of 426 queries peaked at 1640–1695 MiB RSS
+  with a 512 MiB pool, from 3804–3869 MiB, and at 3204–3233 MiB with a 2
+  GiB pool, from 5373–5412 MiB. Read from a v3 `.rez` of the same
+  recording, which records no restart and so reads as one member with no
+  union stage, the peaks were unchanged (1810–1848 against 1837–1839 MiB
+  with a 512 MiB pool, 4049–4065 against 4060–4069 MiB with 2 GiB).
+  Three runs a side from four interleaved rounds; the first, run while
+  other builds loaded the machine, read up to 2807 MiB lower in five of
+  its eight cells and is left out; every answer the same to 9
+  significant digits.
 
 ### metriken-query 0.50.0
 

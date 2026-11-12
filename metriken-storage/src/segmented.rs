@@ -2264,6 +2264,15 @@ impl crate::scan::ChunkReader for SegmentedScan<'_> {
             None => LaterRows::Unknown,
         }
     }
+
+    /// From the catalog: the earliest start of the segments not read yet;
+    /// `None` when none remain.
+    fn unread_start(&self) -> Option<u64> {
+        if self.next >= self.segments.len() {
+            return None;
+        }
+        self.rest_from[self.next]
+    }
 }
 
 /// Read `segments`, in parallel where threads exist, in their order. A
