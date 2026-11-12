@@ -417,9 +417,9 @@ fn reference_within(
                 cache.insert(key.clone(), open(&p));
             }
             let r = &cache[&key];
-            // A member clipped to one epoch of its source is read on the
-            // per-series path by the engine (a scan cannot be clipped), so
-            // the oracle reads it there too.
+            // The oracle reads a member clipped to one epoch on the
+            // per-series path, which does not depend on the batched scan's
+            // row filter.
             let points = range(r, q.text, w, ps || n > 1).unwrap_or_default();
             let rows1 = m
                 .rows

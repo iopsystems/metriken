@@ -1096,6 +1096,133 @@ fn an_epoch_chain_resets_at_the_shared_epochs_start() {
     }
 }
 
+/// A source spanning a restart, and a second source holding only the later
+/// epoch, overlapping the first after the restart, are read by the batched
+/// rate path: one scan per member, a member clipped to its epoch's rows. So
+/// is a member clipped by a query scope's span. Each agrees with the
+/// per-series path over windows across the restart, before it and after it.
+/// The counter grows as the square of the seconds since its epoch started
+/// (about 72,000 a second before the restart, at most 1,200 after), so a
+/// point read from the wrong rows differs, and the restart's drop taken as
+/// an increase would read as tens of millions a second or more.
+#[test]
+fn rates_across_a_restart_take_the_batch_path() {
+    use metriken_query::{Scope, ScopedSource, SourceRef};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("restart-batched.dendro");
+    // Inside a segment (rows are sealed 50 to a segment), so the segment
+    // holding the restart has rows of both epochs.
+    let restart = at(10, 5, 20);
+    let read = move |ts: u64| {
+        let value = if ts < restart {
+            let s = (ts - BASE) / S;
+            10_000_000_000 + s * s
+        } else {
+            let s = (ts - restart) / S;
+            5_000_000_000 + s * s
+        };
+        Read {
+            counters: vec![("cpu_cycles", value)],
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+            window: MS,
+        }
+    };
+    write(
+        &path,
+        &[
+            spec(
+                &[("host", "a")],
+                &[("e1", at(10, 0, 0)), ("e2", restart)],
+                rows(at(10, 0, 0), at(10, 10, 0), S),
+                read,
+            ),
+            spec(
+                &[("host", "a")],
+                &[("e2", restart)],
+                rows(at(10, 6, 0), at(10, 9, 0), S),
+                read,
+            ),
+        ],
+    );
+    let reader = open(&path);
+    let queries = [
+        "rate(cpu_cycles[1m])",
+        "irate(cpu_cycles[5s])",
+        "sum(rate(cpu_cycles[30s]))",
+        "sum(irate(cpu_cycles[5s]))",
+    ];
+    // The union stage runs only when the group is scanned as a whole; the
+    // per-member path scans an unclipped member alone, which the batch
+    // counter would also count.
+    let batched = |query: &str, (s, e, step): (u64, u64, f64), opts: &QueryOptions| {
+        metriken_query::fixtures::take_union_held_peak();
+        let got = from_matrix(
+            reader
+                .query_range_opts(query, s as f64 / 1e9, e as f64 / 1e9, step, opts)
+                .unwrap(),
+        );
+        assert!(
+            metriken_query::fixtures::take_union_held_peak() > 0,
+            "{query} over {s}..{e}: the group's batched scan"
+        );
+        got
+    };
+    for window in [
+        (at(10, 2, 0), at(10, 9, 30), 1.0),
+        (at(10, 1, 0), at(10, 4, 0), 1.0),
+        (at(10, 6, 0), at(10, 9, 30), 2.0),
+    ] {
+        for query in queries {
+            batched(query, window, &QueryOptions::default());
+            let s = one_series(&reader, query, window);
+            assert!(!s.points.is_empty(), "{query} over {window:?}");
+            for &(t, v) in &s.points {
+                assert!(
+                    v.abs() < 1_000_000.0,
+                    "{query} at {}: {v}",
+                    t - BASE as f64 / 1e9
+                );
+            }
+        }
+    }
+    // The first source clipped by a scope to a span ending inside the later
+    // source's rows, and the later source to one starting before the
+    // first's span ends.
+    let scope = Scope::new(vec![
+        ScopedSource::new(SourceRef::Position(0), Some((at(10, 0, 0), at(10, 7, 10)))),
+        ScopedSource::new(SourceRef::Position(1), Some((at(10, 6, 30), at(10, 9, 0)))),
+    ])
+    .unwrap();
+    let scoped = QueryOptions::default().with_scope(Some(std::sync::Arc::new(scope)));
+    let window = (at(10, 2, 0), at(10, 9, 30), 1.0);
+    for query in queries {
+        let fast = batched(query, window, &scoped);
+        let slow = from_matrix(
+            reader
+                .query_range_opts(
+                    query,
+                    window.0 as f64 / 1e9,
+                    window.1 as f64 / 1e9,
+                    window.2,
+                    &scoped.clone().with_per_series_rates(true),
+                )
+                .unwrap(),
+        );
+        assert_eq!(fast.len(), slow.len(), "scoped {query}");
+        for (f, w) in fast.iter().zip(&slow) {
+            assert_eq!(f.labels, w.labels, "scoped {query}");
+            assert_eq!(f.points.len(), w.points.len(), "scoped {query}");
+            for (a, b) in f.points.iter().zip(&w.points) {
+                assert!(
+                    (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() <= 1e-9 * b.1.abs().max(1.0),
+                    "scoped {query}: {a:?} against {b:?}"
+                );
+            }
+        }
+    }
+}
+
 /// Recordings whose sources form no group of more than one answer as they
 /// did: two hosts, and one source.
 #[test]
@@ -2088,9 +2215,9 @@ fn a_conflict_outside_the_answer_gives_no_notice() {
     }
 }
 
-/// A source with two producer epochs is read per member (one per epoch),
-/// not by the batched scan, and a conflict with another source of its group
-/// is reported there too.
+/// A source with two producer epochs is one member per epoch, and a
+/// conflict with another source of its group is reported beside the
+/// restart.
 #[test]
 fn a_conflict_beside_a_restart_is_reported() {
     let dir = tempfile::tempdir().unwrap();

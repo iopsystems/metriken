@@ -123,6 +123,12 @@ pub(crate) struct UnionMember {
     /// Its member's first sample time read (the grid's start less its
     /// member's lookback).
     pub data_start: u64,
+    /// The rows its member holds, `[lo, hi]` inclusive: `(0, u64::MAX)` for
+    /// a whole source, else the member's span (one producer epoch of its
+    /// source, a query scope's span for the source, or both intersected).
+    /// A row of the scan outside it is not this series' row: it is neither
+    /// a sample nor a row for the coverage rule.
+    pub rows: (u64, u64),
     /// Its member's interval for the counter.
     pub interval_ns: u64,
     /// Its member's place in S3's rank, lowest first.
@@ -1502,6 +1508,12 @@ pub(crate) fn grid_rates(
         part_rates[p].push(rate);
     }
     let data_start = |s: usize| union.map_or(start, |u| u.series[s].data_start);
+    let holds_row = |s: usize, ts: u64| {
+        union.is_none_or(|u| {
+            let (lo, hi) = u.series[s].rows;
+            lo <= ts && ts <= hi
+        })
+    };
 
     let mut sinks: Vec<PartSink> = members
         .iter()
@@ -1664,6 +1676,9 @@ pub(crate) fn grid_rates(
                             else {
                                 return;
                             };
+                            if !holds_row(series, base) {
+                                return;
+                            }
                             if let Some(stage) = sink.stage() {
                                 let l = slocal[series] as usize;
                                 // A row of a series taken as ended (out of

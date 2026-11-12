@@ -1677,9 +1677,14 @@ source identity on every sample and a separate implementation on each of
 three paths; evaluating the leaf per member reuses the one-recording code,
 so "evaluated alone, as one recording is evaluated today" holds by
 construction. A member that is a whole source reads the batched counter
-scan, the wrapper recording each row the scan decodes; a member clipped to
-an epoch takes the per-series path, since a scan cannot be clipped. Every
-member is read over the whole query range. Reading a later member only over
+scan, the wrapper recording each row the scan decodes. A member clipped to
+an epoch took the per-series path, since a scan cannot be clipped; since
+2026-11-12 the group's batched scan reads it too, scanning the segments of
+its epoch and dropping the rows outside it (`UnionMember::rows`), and the
+per-series path is left for a clipped member only when the group's scan is
+not available. Every member's rows within the query range are read (a
+clipped member's scan stops at its span, which holds no other rows of it).
+Reading a later member only over
 the grid times the first does not cover was tried and changed answers: a
 grid rate interpolates between the rows on either side of its window's
 edges, which can be any distance away across a hole, and a gauge read starts
@@ -1743,8 +1748,9 @@ follow include that. Against the double read by 0.41.0, the
 `cgroup_cpu_usage` display query is 86 ms against 56 ms, 295 MB against
 191 MB; the 1 h `rate` 13.8 against 11.9 ms; `sum(rate(...[1m]))` over
 9.6 h 39 against 33 ms. Gauges, raw placement,
-explicit evaluation timestamps, the per-series rate path and members clipped
-to an epoch read each member alone as before. Two
+explicit evaluation timestamps and the per-series rate path read each
+member alone as before. Members clipped to an epoch take the batched scan
+since 2026-11-12 (see above). Two
 pre-existing behaviours were found on the way and are not changed here:
 `offset` in a selector is ignored (on upstream/main too), and a single
 source's last points can move with the range's end (a rate at the range's
