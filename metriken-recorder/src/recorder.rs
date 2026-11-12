@@ -1757,6 +1757,8 @@ impl Driver {
     }
 
     /// Whether slot `i`'s rows could not be staged since the last commit.
+    /// Only a streamed or scraped slot asks.
+    #[cfg(feature = "http")]
     fn is_unstageable(&self, i: usize) -> bool {
         self.archive
             .as_ref()
