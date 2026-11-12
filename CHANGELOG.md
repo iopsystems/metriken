@@ -144,9 +144,9 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   keyed segments that earlier readers in its chain of handovers opened,
   including when a reader in the chain was never queried. A dashboard
   browse of a 12 h v3 `.rez` with a 2 GiB pool, with jemalloc as the
-  allocator, peaked at 3546–3547 MiB RSS, from 5061–5079 MiB, without the
-  histogram charge above, and at 3319–3356 MiB with it (two runs each)
-  (#400).
+  allocator, peaked at 5061–5079 MiB RSS before this change and the
+  histogram charge above, at 3546–3547 MiB with this change alone, and at
+  3319–3356 MiB with both (two runs each; #400).
 
 ### metriken-storage 0.13.0
 
