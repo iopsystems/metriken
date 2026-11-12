@@ -124,7 +124,29 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   recording with a 64 MiB pool, jemalloc's allocated bytes at the peak fell
   from 231 to 184 MiB, and peak RSS from 346–355 to 320–323 MiB. A 12 h
   v3 `.rez` with a 2 GiB pool peaked at 4809–4816 MiB RSS, from 5061–5079
-  MiB. A block now charged more than the whole budget is not cached (#400).
+  MiB. A block whose charge now exceeds the whole budget is not cached, as
+  for any block (#400).
+- **Changed:** A segmented table keeps the segments its queries open in its
+  `BufferPool`, charged against the pool's budget with the blocks decoded
+  from them. Each table kept its own cache of opened segments, each with a
+  budget of the whole pool, so a reader of many tables held many times the
+  pool in opened segments, none of it counted by the pool. The budget now
+  covers both, so a pool sized for decoded blocks alone keeps fewer of
+  them, and `BufferPool::stats` (`entries`, `bytes_used`),
+  `current_bytes` and `clear` include the opened segments; hit and miss
+  counts do not. A segment that does not fit in the budget beside the
+  blocks one series decodes from it is evicted while a query reads it, so
+  it is opened again for each series; a table's cache kept at least one.
+  `SegmentedSource::cached_segments` counts the segments the reader would
+  find in the pool. `Handover::without_segments` returns the handover
+  unchanged: a handover holds no opened segments, and a reader reopened
+  with `ArchiveReader::reuse_from` finds, while the pool holds them, the
+  keyed segments that earlier readers in its chain of handovers opened,
+  including when a reader in the chain was never queried. A dashboard
+  browse of a 12 h v3 `.rez` with a 2 GiB pool, with jemalloc as the
+  allocator, peaked at 5061–5079 MiB RSS before this change and the
+  histogram charge above, at 3546–3547 MiB with this change alone, and at
+  3319–3356 MiB with both (two runs each; #400).
 
 ### metriken-storage 0.13.0
 
@@ -169,6 +191,15 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   writes (a fixed scale for a time unit, else the power of 10 that makes
   every bound an integer), that it applies to `OVERFLOW_BOUND_KEY` too,
   and which readers divide by it.
+
+### metriken-query (unreleased)
+
+- **Changed:** `SegmentedParquetReader` keeps the segments its queries
+  open in its `BufferPool`, within the pool's budget, and a reader opened
+  with `open_after` finds an earlier reader's keyed segments there; see
+  metriken-storage's entry. `cached_segments` counts the segments the
+  reader would find in the pool. Requires the next metriken-storage
+  release (#400).
 
 ### metriken-query 0.50.0
 

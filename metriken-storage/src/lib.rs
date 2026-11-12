@@ -29,7 +29,8 @@
 //!   relabel. [`union`]: sources with disjoint series as one.
 //!   [`lazy`]: a composition child opened on first use. [`memory_store`] and
 //!   [`memory`]: an in-memory source.
-//! - [`buffer_pool`]: the cache of decoded blocks readers share.
+//! - [`buffer_pool`]: the cache of decoded blocks and opened segments
+//!   readers share.
 //!
 //! Archives (feature `archive`):
 //! - `catalog`: what a reader needs from a container, and dendro's

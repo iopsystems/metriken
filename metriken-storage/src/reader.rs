@@ -1712,8 +1712,9 @@ impl ArchiveReader {
     /// table of `previous` saved state (see [`keep_handover`](Self::keep_handover)
     /// and [`SegmentedSource::handover`]), the new one reads only the
     /// segments sealed since, the live tail, and the occupant-stream
-    /// segments not yet decoded, and takes over the segments `previous` had
-    /// open when both readers use the same pool. A table whose relabel's
+    /// segments not yet decoded, and finds, while the pool still holds them,
+    /// the keyed segments that `previous` and the readers it was itself
+    /// reopened from opened, when all use the same pool. A table whose relabel's
     /// identities are not fixed reuses nothing. Once retention evicts a segment
     /// `previous` read, only the decoded occupant-stream segments are
     /// reused. Tables are matched by recording id and name. A table already
@@ -1726,11 +1727,10 @@ impl ArchiveReader {
     /// gives wrong answers without an error.
     ///
     /// Until its reader is built, a table of this reader holds the state
-    /// `previous` saved for it, the segments `previous` had open among
-    /// those it reuses, and the decoded occupant-stream segments. A table
-    /// of `previous` that was never queried passes on the state and the
-    /// occupant-stream segments it was given, without the open segments.
-    /// None of it holds a connection to the archive.
+    /// `previous` saved for it and the decoded occupant-stream segments. A
+    /// table of `previous` that was never queried passes on the state and
+    /// the occupant-stream segments it was given. None of it holds a
+    /// connection to the archive.
     pub fn reuse_from(&self, previous: &ArchiveReader) {
         self.keep_handover();
         for table in &self.tables {
@@ -1748,8 +1748,7 @@ impl ArchiveReader {
                 continue;
             }
             // A built table gives its saved state. A table that was not
-            // queried, or whose build failed, gives the state it was given,
-            // without the open segments, which nothing will read.
+            // queried, or whose build failed, gives the state it was given.
             let carried = match old.reader.get() {
                 Some(Some(TableReader::Segmented(r))) => Some(Carried {
                     handover: r.handover(),
@@ -1765,7 +1764,7 @@ impl ArchiveReader {
                     .unwrap_or_else(|e| e.into_inner())
                     .as_ref()
                     .map(|c| Carried {
-                        handover: c.handover.as_ref().map(|h| h.without_segments()),
+                        handover: c.handover.clone(),
                         occupant_segments: c.occupant_segments.clone(),
                     }),
             };

@@ -529,13 +529,14 @@ mod reader_tests {
             assert_eq!(canonical(&a), canonical(&b), "{q}");
         }
         // A pruned read decodes into its own arrays, not the pool's
-        // whole-column cache: nothing went through the pool.
+        // whole-column cache: the pool holds the opened segment and nothing
+        // decoded from it.
         let stats = pool.stats();
         assert_eq!(
             stats.misses, 0,
             "pruned reads must not decode whole columns"
         );
-        assert_eq!(stats.entries, 0);
+        assert_eq!(stats.entries, long.cached_segments().0);
     }
 
     #[test]

@@ -1744,15 +1744,14 @@ fn state_passes_through_a_reader_that_was_not_queried() {
     third.reuse_from(&second);
     drop(second);
     assert_eq!(answers(&third, 0), expected);
-    // The second reader read only what opening reads. The third read the
-    // segments its query decodes, since open segments are not passed on
-    // past a reader that was not queried, but no footer to build its state
-    // and no occupant segment.
+    // The second reader read only what opening reads. The third read
+    // nothing: its state came through the second, and the segments its
+    // queries read are still in the pool under the first reader's id.
     let (_unqueried, probe_count) = open_counting(&path, &pool);
     assert_eq!(second_count.get(), probe_count.get());
-    let (third, fresh, probe) = (third_count.get(), fresh_count.get(), probe_count.get());
+    let (third, fresh) = (third_count.get(), fresh_count.get());
     assert!(
-        third.0 > probe.0 && third.0 < fresh.0 && third.1 == 0 && fresh.1 > 0,
+        third == (0, 0) && fresh.0 > 0 && fresh.1 > 0,
         "{third:?} {fresh:?}"
     );
 
