@@ -1712,9 +1712,9 @@ impl ArchiveReader {
     /// table of `previous` saved state (see [`keep_handover`](Self::keep_handover)
     /// and [`SegmentedSource::handover`]), the new one reads only the
     /// segments sealed since, the live tail, and the occupant-stream
-    /// segments not yet decoded, and finds the keyed segments `previous`
-    /// opened, while the pool still holds them, when both readers use the
-    /// same one. A table whose relabel's
+    /// segments not yet decoded, and finds, while the pool still holds them,
+    /// the keyed segments that `previous` and the readers it was itself
+    /// reopened from opened, when all use the same pool. A table whose relabel's
     /// identities are not fixed reuses nothing. Once retention evicts a segment
     /// `previous` read, only the decoded occupant-stream segments are
     /// reused. Tables are matched by recording id and name. A table already
