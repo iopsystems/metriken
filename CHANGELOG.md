@@ -240,6 +240,20 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   other builds loaded the machine, read up to 2807 MiB lower in five of
   its eight cells and is left out; every answer the same to 9
   significant digits.
+- **Fixed:** the batched rate path's union stage passes a process
+  group's points on as each sample makes them answerable, rather than
+  after each segment, so a combined series' point waits only until every
+  member of its unit has read the nine rows after it that the coverage
+  rule needs (about nine points per series in the restart test). On the
+  12 h recording above, a display of `sum(irate(cgroup_syscall[5m]))`
+  with a 512 MiB pool peaked at 381–388 MiB RSS, from 858–871 MiB (two
+  runs a side), and the 426-query browse at 1440–1456 MiB, from
+  1625–1676 MiB with a 512 MiB pool, and at 2940–2957 MiB, from
+  3191–3235 MiB with 2 GiB (four runs a side). The same recording as v3
+  `.rez`, which has no union stage, peaked at 1831–1854 MiB against
+  1821–1846 MiB (and one run at 1621) with 512 MiB, and 4063–4079
+  against 4058–4081 MiB with 2 GiB; every answer the same to 9
+  significant digits.
 
 ### metriken-query 0.50.0
 
