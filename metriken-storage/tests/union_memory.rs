@@ -346,26 +346,25 @@ fn a_stale_member_series_does_not_hold_its_groups_points() {
 }
 
 /// The most points a read of a restarted source may hold at once, per
-/// series: a segment of 20 rows and the coverage rule's look-ahead of nine
-/// rows (measured: 29 per series). Without the changes this bound guards,
-/// the read holds 328 per series; with each of its causes alone: points
-/// passed on only after each chunk (up to eight segments), 169; scans not
-/// read yet read before the others, 188; a member counted from the range's
-/// start whatever its epoch, 2018.
-const RESTART_BOUND: usize = (40 * (N + 1)) as usize;
+/// series: about the coverage rule's look-ahead of nine rows (measured: 161
+/// points, 9.5 per series). With the stage settled only after each
+/// segment, the read held 29 per series. Measured on that version: settling
+/// only after each chunk held 169, reading scans not yet read before the
+/// others 188, and counting a member from the range's start whatever its
+/// epoch 2018.
+const RESTART_BOUND: usize = (15 * (N + 1)) as usize;
 
 /// A source that restarts: one member per producer epoch, read in time
 /// order, so the later epoch's member is not read while the earlier one is,
 /// and holds back no point before its epoch starts. A point waits only for
 /// its own member's later rows (the coverage rule's look-ahead), and the
-/// stage passes it on after each segment. Rows on the second and half a
-/// second past it, over the whole recording and over a range starting
+/// stage passes it on as soon as that arrives. Rows on the second and half
+/// a second past it, over the whole recording and over a range starting
 /// after the restart, where the earlier epoch has no rows in the read and,
 /// for `irate` with rows half a second past the second, no segment in its
-/// scan. Each answer agrees
-/// with the per-series path.
+/// scan. Each answer agrees with the per-series path.
 #[test]
-fn a_restarted_source_holds_its_points_a_segment_at_a_time() {
+fn a_restarted_source_holds_only_its_look_ahead() {
     let dir = tempfile::tempdir().unwrap();
     let per_series = QueryOptions::default().with_per_series_rates(true);
     let after = ((BASE / S + ROWS / 2 + 505) as f64, WHOLE.1);

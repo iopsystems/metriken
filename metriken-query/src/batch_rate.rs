@@ -434,49 +434,61 @@ impl UnionStage<'_> {
     /// Pass on every held point that can be answered.
     fn settle(&mut self, rates: &[SeriesRate], grid: &Grid) {
         for u in 0..self.units.len() {
-            if !self.units[u].combine {
-                continue;
+            self.settle_unit(u, rates, grid);
+        }
+    }
+
+    /// Pass on every point of the unit of member series `m` that can be
+    /// answered: after a sample of `m`, only its unit can have become
+    /// answerable.
+    fn settle_member(&mut self, m: usize, rates: &[SeriesRate], grid: &Grid) {
+        self.settle_unit(self.member_unit[m] as usize, rates, grid);
+    }
+
+    /// Pass on every held point of unit `u` that can be answered.
+    fn settle_unit(&mut self, u: usize, rates: &[SeriesRate], grid: &Grid) {
+        if !self.units[u].combine {
+            return;
+        }
+        while let Some(index) = self.units[u].first() {
+            let t = grid.start_ns + index as u64 * grid.step_ns;
+            let unit = &self.units[u];
+            // A member whose rows start after `t` (a later producer
+            // epoch) has no point and no row at `t`, read or not.
+            let ready = unit.members.iter().all(|&m| {
+                t < self.firsts[m]
+                    || (rates[m].pending_ns().is_none_or(|p| p > t)
+                        && self.tracks[m].as_ref().is_some_and(|tr| tr.ready(t)))
+            });
+            if !ready {
+                break;
             }
-            while let Some(index) = self.units[u].first() {
-                let t = grid.start_ns + index as u64 * grid.step_ns;
-                let unit = &self.units[u];
-                // A member whose rows start after `t` (a later producer
-                // epoch) has no point and no row at `t`, read or not.
-                let ready = unit.members.iter().all(|&m| {
-                    t < self.firsts[m]
-                        || (rates[m].pending_ns().is_none_or(|p| p > t)
-                            && self.tracks[m].as_ref().is_some_and(|tr| tr.ready(t)))
-                });
-                if !ready {
-                    break;
-                }
-                let n = unit.members.len();
-                let at = |k: usize| unit.at(k, index);
-                let covers = |k: usize| {
-                    let m = unit.members[k];
-                    let track = self.tracks[m].as_ref().expect("combined");
-                    track.covers(t, self.window.ns())
-                };
-                let holds = |k: usize| {
-                    let m = unit.members[k];
-                    self.tracks[m].as_ref().expect("combined").holds(t)
-                };
-                let pick = (0..n)
-                    .find(|&k| at(k).is_some() && covers(k))
-                    .or_else(|| (0..n).find(|&k| at(k).is_some() && holds(k)))
-                    .and_then(|k| at(k).copied());
-                let _dropped = self.units[u].drop_first(index);
-                #[cfg(any(test, feature = "fixtures"))]
-                {
-                    self.held.0 -= _dropped;
-                }
-                if let Some(p) = pick {
-                    self.inner.sink().emit(u, index, p);
-                }
-                for &m in &self.units[u].members {
-                    if let Some(tr) = &mut self.tracks[m] {
-                        tr.forget_before(t);
-                    }
+            let n = unit.members.len();
+            let at = |k: usize| unit.at(k, index);
+            let covers = |k: usize| {
+                let m = unit.members[k];
+                let track = self.tracks[m].as_ref().expect("combined");
+                track.covers(t, self.window.ns())
+            };
+            let holds = |k: usize| {
+                let m = unit.members[k];
+                self.tracks[m].as_ref().expect("combined").holds(t)
+            };
+            let pick = (0..n)
+                .find(|&k| at(k).is_some() && covers(k))
+                .or_else(|| (0..n).find(|&k| at(k).is_some() && holds(k)))
+                .and_then(|k| at(k).copied());
+            let _dropped = self.units[u].drop_first(index);
+            #[cfg(any(test, feature = "fixtures"))]
+            {
+                self.held.0 -= _dropped;
+            }
+            if let Some(p) = pick {
+                self.inner.sink().emit(u, index, p);
+            }
+            for &m in &self.units[u].members {
+                if let Some(tr) = &mut self.tracks[m] {
+                    tr.forget_before(t);
                 }
             }
         }
@@ -1732,6 +1744,13 @@ pub(crate) fn grid_rates(
                                 s,
                                 sink.sink(),
                             );
+                            // Pass on what this sample made answerable in
+                            // its unit; the settles after each segment and
+                            // chunk catch what rows without a sample make
+                            // answerable.
+                            if let Some(stage) = sink.stage() {
+                                stage.settle_member(s, rates, &grid);
+                            }
                         };
                         match series {
                             RowSeries::One(s) => {
