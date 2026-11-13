@@ -1322,8 +1322,10 @@ impl crate::scan::ChunkReader for RecordingChunks<'_> {
 
 impl DataSource for Tap {
     /// The source's scan, its rows recorded as they are read; `None` when
-    /// clipped (to an epoch or a scope's span; a scan cannot be clipped),
-    /// which then takes the per-series path.
+    /// clipped (to an epoch or a scope's span), since this wrapper does not
+    /// drop a scan's rows outside its span, so the per-series path answers.
+    /// The group's batched scan (`dispatch::scan_rates`) reads a clipped
+    /// member's source directly and drops those rows (`UnionMember::rows`).
     fn counter_scan(
         &self,
         name: &str,

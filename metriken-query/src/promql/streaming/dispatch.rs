@@ -457,6 +457,7 @@ fn scan_rates(
                     });
                     series.push(crate::batch_rate::UnionMember {
                         data_start: from,
+                        rows: (0, u64::MAX),
                         interval_ns: (interval * 1e9) as u64,
                         rank: 0,
                         before: Vec::new(),
@@ -467,10 +468,6 @@ fn scan_rates(
                 scans.push(scan);
             }
             per_source::Part::Group(members) => {
-                // A member clipped to one epoch cannot be scanned.
-                if members.iter().any(|m| m.lo != 0 || m.hi != u64::MAX) {
-                    return None;
-                }
                 let mut ranked: Vec<(u64, &per_source::Member)> = members
                     .iter()
                     .filter(|m| holds(m.source.as_ref()))
@@ -484,11 +481,20 @@ fn scan_rates(
                     std::collections::HashMap::new();
                 for (rank, (interval_ns, m)) in ranked.into_iter().enumerate() {
                     let from = data_start(m.source.as_ref());
-                    let mut scan = m.raw.counter_scan(name, filter, from, request.end_ns)?;
+                    // A member clipped to `[m.lo, m.hi]` (one producer
+                    // epoch, a scope's span, or both) scans only the segments
+                    // its rows can be in; the batch path drops the scan's
+                    // rows outside the span (`UnionMember::rows`). When all
+                    // its rows lie outside the read, `.max(scan_from)` keeps
+                    // the range from inverting: the member scans one instant
+                    // and contributes no rows.
+                    let scan_from = from.max(m.lo);
+                    let scan_to = request.end_ns.min(m.hi).max(scan_from);
+                    let mut scan = m.raw.counter_scan(name, filter, scan_from, scan_to)?;
                     let interval = m.source.counter_interval(name);
                     let labels: Vec<crate::labels::Labels> =
                         scan.series.iter().map(|s| s.labels.clone()).collect();
-                    let tap = Tap::new(m.raw.clone(), 0, u64::MAX);
+                    let tap = Tap::new(m.raw.clone(), m.lo, m.hi);
                     let (mut before, mut after) =
                         tap.context_rows(true, name, filter, (from, request.end_ns), &labels);
                     for s in &mut scan.series {
@@ -503,6 +509,7 @@ fn scan_rates(
                         unit.push(u);
                         series.push(crate::batch_rate::UnionMember {
                             data_start: from,
+                            rows: (m.lo, m.hi),
                             interval_ns,
                             rank,
                             before: before.remove(&s.labels).unwrap_or_default(),

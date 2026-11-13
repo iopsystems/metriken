@@ -200,6 +200,21 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   metriken-storage's entry. `cached_segments` counts the segments the
   reader would find in the pool. Requires the next metriken-storage
   release (#400).
+- **Fixed:** `rate` and `irate` over a source spanning a producer
+  restart (a source holding several producer epochs, each a member of
+  its process group), and over a source clipped by a query scope's span,
+  alone or in a process group, take the batched rate path, one scan per
+  member, each clipped to its span's rows. They took the per-series
+  path, which evaluates each member's series one at a time and holds
+  every series of every member at full resolution before the
+  aggregation. On a 12 h recording of 655 cgroups with one agent
+  restart, `sum(irate(cgroup_syscall[5m]))` for display, run alone with
+  a 512 MiB pool, peaks at 2995–2996 MiB RSS in 2.0 s, from 6817–6844
+  MiB in 17.5–17.8 s (two runs a side, on a loaded machine); a dashboard
+  browse of 426 queries with the same pool peaked at 4428–4499 MiB, from
+  8270–8320 MiB (four runs a side), with every answer the same to 9
+  significant digits. These figures are from builds without #406 and
+  #407 (metriken-storage, above).
 
 ### metriken-query 0.50.0
 
