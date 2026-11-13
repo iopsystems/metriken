@@ -435,6 +435,10 @@ impl crate::scan::ChunkReader for RecordedChunks<'_> {
     fn later_rows(&self, series: u32) -> crate::scan::LaterRows {
         self.inner.later_rows(series)
     }
+
+    fn unread_start(&self) -> Option<u64> {
+        self.inner.unread_start()
+    }
 }
 
 impl DataSource for Recorded {

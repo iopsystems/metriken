@@ -1318,6 +1318,10 @@ impl crate::scan::ChunkReader for RecordingChunks<'_> {
         }
         Ok(Some(chunk))
     }
+
+    fn unread_start(&self) -> Option<u64> {
+        self.inner.unread_start()
+    }
 }
 
 impl DataSource for Tap {

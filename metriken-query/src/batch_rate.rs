@@ -209,6 +209,9 @@ pub(crate) struct UnionStage<'d> {
     /// Per member series: the coverage of its rows; `None` for a member of
     /// a unit that is not combined.
     tracks: Vec<Option<crate::promql::streaming::per_source::RowTrack>>,
+    /// Per member series: the first time its member's rows can be at
+    /// (`UnionMember::rows`); it has no point and no row before it.
+    firsts: Vec<u64>,
     /// Per unit (local): its members (local) in rank order, and the grid
     /// indices with a member's point, each member's point there.
     units: Vec<StageUnit>,
@@ -437,9 +440,12 @@ impl UnionStage<'_> {
             while let Some(index) = self.units[u].first() {
                 let t = grid.start_ns + index as u64 * grid.step_ns;
                 let unit = &self.units[u];
+                // A member whose rows start after `t` (a later producer
+                // epoch) has no point and no row at `t`, read or not.
                 let ready = unit.members.iter().all(|&m| {
-                    rates[m].pending_ns().is_none_or(|p| p > t)
-                        && self.tracks[m].as_ref().is_some_and(|tr| tr.ready(t))
+                    t < self.firsts[m]
+                        || (rates[m].pending_ns().is_none_or(|p| p > t)
+                            && self.tracks[m].as_ref().is_some_and(|tr| tr.ready(t)))
                 });
                 if !ready {
                     break;
@@ -1561,12 +1567,14 @@ pub(crate) fn grid_rates(
                     .collect();
                 let mut member_unit = Vec::new();
                 let mut tracks = Vec::new();
+                let mut firsts = Vec::new();
                 let mut compared = Vec::new();
                 let mut ranked: Vec<(usize, usize, usize)> = Vec::new();
                 for &(s, u) in &stages[p] {
                     let ul = local[u] as usize;
                     let m = &plan.series[s];
                     member_unit.push(ul as u32);
+                    firsts.push(m.rows.0);
                     tracks.push(plan.units[u].combine.then(|| {
                         crate::promql::streaming::per_source::RowTrack::new(
                             m.interval_ns,
@@ -1594,6 +1602,7 @@ pub(crate) fn grid_rates(
                     member_unit,
                     member_slot,
                     tracks,
+                    firsts,
                     units,
                     window: plan.window,
                     compare: plan
@@ -1741,6 +1750,11 @@ pub(crate) fn grid_rates(
                             }
                         }
                     }
+                }
+                // Pass on what this segment made answerable rather than
+                // waiting for the chunk's other segments.
+                if let Some(stage) = sink.stage() {
+                    stage.settle(rates, &grid);
                 }
             }
             if let Some(stage) = sink.stage() {

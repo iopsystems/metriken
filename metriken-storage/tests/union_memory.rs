@@ -88,6 +88,64 @@ fn write(path: &Path, c_stops: &[u64]) {
     writer.join().unwrap();
 }
 
+/// An archive of one source that restarts halfway: producer epoch `e0` for
+/// the first `ROWS / 2` rows and `e1` after, so the source is one process
+/// group of two members, each clipped to its epoch. `N + 1` series of
+/// counter `c` (label `id`) growing `id + 1` a second, starting again from
+/// zero at the restart. Rows at `offset` past each second. Segments of 20
+/// rows.
+fn write_restart(path: &Path, offset: u64) {
+    let config = WriterConfig {
+        seal: SealPolicy {
+            max_rows: 20,
+            ..SealPolicy::default()
+        },
+        ..WriterConfig::default()
+    };
+    let mut writer = ArchiveWriter::create(path, config).unwrap();
+    let restart = BASE + ROWS / 2 * S + offset;
+    let labels: BTreeMap<String, String> = [("host".to_string(), "a".to_string())].into();
+    let metadata: BTreeMap<String, String> = [
+        (
+            "producer_epochs".to_string(),
+            format!(r#"[{{"epoch":"e0","from_ts":{BASE}}},{{"epoch":"e1","from_ts":{restart}}}]"#),
+        ),
+        ("producer_epoch".to_string(), "e1".to_string()),
+    ]
+    .into();
+    let mut source = writer.add_source(labels, metadata, BASE).unwrap();
+    for k in 0..ROWS {
+        let ts = BASE + k * S + offset;
+        let w = Some(metriken::Window::new(ts - MS, ts));
+        let since = if ts < restart { k } else { k - ROWS / 2 };
+        let counters = (0..=N)
+            .map(|i| {
+                let meta: HashMap<String, String> = [
+                    ("metric".to_string(), "c".to_string()),
+                    ("sampler".to_string(), "cpu".to_string()),
+                    ("id".to_string(), i.to_string()),
+                ]
+                .into();
+                Counter::new(format!("c{i}"), since * (i + 1), meta).with_window(w)
+            })
+            .collect();
+        let snapshot = Snapshot::V2(SnapshotV2 {
+            systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
+            duration: Duration::ZERO,
+            metadata: HashMap::new(),
+            counters,
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
+        });
+        let staged = source.stage(&snapshot, ts, 0).unwrap();
+        writer.commit(vec![staged]).unwrap();
+        source.maybe_seal().unwrap();
+    }
+    source.finalize((BASE + (ROWS - 1) * S, 0)).unwrap();
+    writer.join().unwrap();
+}
+
 /// An archive at `into` holding a copy of each of `from` (whole segments
 /// with a row in `range`, as a hindsight dump): one uuid, so one process
 /// group of two members.
@@ -124,13 +182,26 @@ fn sorted(mut v: Points) -> Points {
     v
 }
 
+/// The whole recording, in seconds.
+const WHOLE: (f64, f64) = ((BASE / S) as f64, (BASE / S + ROWS - 1) as f64);
+
 /// `query` over the whole recording at a 1 s step, batched, and the most
 /// points its union stages held at once.
 fn batched(reader: &ArchiveReader, query: &str) -> (Points, usize) {
-    let (start, end) = ((BASE / S) as f64, (BASE / S + ROWS - 1) as f64);
+    batched_over(reader, query, WHOLE, &QueryOptions::default())
+}
+
+/// `query` over `[start, end]` seconds at a 1 s step with `opts`, and the
+/// most points its union stages held at once.
+fn batched_over(
+    reader: &ArchiveReader,
+    query: &str,
+    (start, end): (f64, f64),
+    opts: &QueryOptions,
+) -> (Points, usize) {
     take_union_held_peak();
     let result = reader
-        .query_range_opts(query, start, end, 1.0, &QueryOptions::default())
+        .query_range_opts(query, start, end, 1.0, opts)
         .unwrap();
     let peak = take_union_held_peak();
     let QueryResult::Matrix { result, .. } = result else {
@@ -146,14 +217,25 @@ fn batched(reader: &ArchiveReader, query: &str) -> (Points, usize) {
 /// `query` for display at full resolution over the whole recording at a
 /// 1 s step (medians), and the most points its union stages held at once.
 fn display(reader: &ArchiveReader, query: &str) -> (Points, usize) {
-    let (start, end) = ((BASE / S) as f64, (BASE / S + ROWS - 1) as f64);
+    display_over(reader, query, WHOLE, &QueryOptions::default())
+}
+
+/// `query` for display at full resolution over `[start, end]` seconds at a
+/// 1 s step with `opts` (medians), and the most points its union stages
+/// held at once.
+fn display_over(
+    reader: &ArchiveReader,
+    query: &str,
+    (start, end): (f64, f64),
+    query_opts: &QueryOptions,
+) -> (Points, usize) {
     let opts = DisplayOptions {
         budget: 0,
         ..DisplayOptions::default()
     };
     take_union_held_peak();
     let result = reader
-        .query_range_display_opts(query, start, end, 1.0, &opts, &QueryOptions::default())
+        .query_range_display_opts(query, start, end, 1.0, &opts, query_opts)
         .unwrap();
     let peak = take_union_held_peak();
     let DisplayResult::Series { result, .. } = result else {
@@ -260,6 +342,62 @@ fn a_stale_member_series_does_not_hold_its_groups_points() {
             peak <= BOUND,
             "{query}: held {peak} points at once, bound {BOUND}"
         );
+    }
+}
+
+/// The most points a read of a restarted source may hold at once, per
+/// series: a segment of 20 rows and the coverage rule's look-ahead of nine
+/// rows (measured: 29 per series). Without the changes this bound guards,
+/// the read holds 328 per series; with each of its causes alone: points
+/// passed on only after each chunk (up to eight segments), 169; scans not
+/// read yet read before the others, 188; a member counted from the range's
+/// start whatever its epoch, 2018.
+const RESTART_BOUND: usize = (40 * (N + 1)) as usize;
+
+/// A source that restarts: one member per producer epoch, read in time
+/// order, so the later epoch's member is not read while the earlier one is,
+/// and holds back no point before its epoch starts. A point waits only for
+/// its own member's later rows (the coverage rule's look-ahead), and the
+/// stage passes it on after each segment. Rows on the second and half a
+/// second past it, over the whole recording and over a range starting
+/// after the restart, where the earlier epoch has no rows in the read and,
+/// for `irate` with rows half a second past the second, no segment in its
+/// scan. Each answer agrees
+/// with the per-series path.
+#[test]
+fn a_restarted_source_holds_its_points_a_segment_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let per_series = QueryOptions::default().with_per_series_rates(true);
+    let after = ((BASE / S + ROWS / 2 + 505) as f64, WHOLE.1);
+    for offset in [0, 500 * MS] {
+        let path = dir.path().join(format!("restart-{offset}.dendro"));
+        write_restart(&path, offset);
+        let reader = open(&path);
+        for range in [WHOLE, after] {
+            for query in ["sum(irate(c[5s]))", "rate(c[1m])"] {
+                let default = QueryOptions::default();
+                for (path, (got, peak), (want, _)) in [
+                    (
+                        "batched",
+                        batched_over(&reader, query, range, &default),
+                        batched_over(&reader, query, range, &per_series),
+                    ),
+                    (
+                        "display",
+                        display_over(&reader, query, range, &default),
+                        display_over(&reader, query, range, &per_series),
+                    ),
+                ] {
+                    let at = format!("{query} ({path}, offset {offset}, {range:?})");
+                    assert_close(&at, &got, &want);
+                    assert!(peak > 0, "{at}: no union stage held a point");
+                    assert!(
+                        peak <= RESTART_BOUND,
+                        "{at}: held {peak} points at once, bound {RESTART_BOUND}"
+                    );
+                }
+            }
+        }
     }
 }
 
