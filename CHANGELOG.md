@@ -213,8 +213,8 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   MiB in 17.5–17.8 s (two runs a side, on a loaded machine); a dashboard
   browse of 426 queries with the same pool peaked at 4428–4499 MiB, from
   8270–8320 MiB (four runs a side), with every answer the same to 9
-  significant digits. These figures are from builds without the
-  metriken-storage pool changes in this release.
+  significant digits. These figures are from builds without #406 and
+  #407 (metriken-storage, above).
 
 ### metriken-query 0.50.0
 
