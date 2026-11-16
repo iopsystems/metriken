@@ -114,7 +114,7 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   as every series is. A `# HELP` text is kept under the exporter's name
   only.
 
-### metriken-storage (unreleased)
+### metriken-storage 0.13.1
 
 - **Fixed:** `BufferPool::put_histogram_snapshots` charges a block what it
   allocates: a slot for each row, and each snapshot's bucket vectors by
@@ -199,14 +199,14 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   every bound an integer), that it applies to `OVERFLOW_BOUND_KEY` too,
   and which readers divide by it.
 
-### metriken-query (unreleased)
+### metriken-query 0.50.1
 
 - **Changed:** `SegmentedParquetReader` keeps the segments its queries
   open in its `BufferPool`, within the pool's budget, and a reader opened
   with `open_after` finds an earlier reader's keyed segments there; see
   metriken-storage's entry. `cached_segments` counts the segments the
-  reader would find in the pool. Requires the next metriken-storage
-  release (#400).
+  reader would find in the pool. Requires metriken-storage 0.13.1
+  (#400).
 - **Fixed:** `rate` and `irate` over a source spanning a producer
   restart (a source holding several producer epochs, each a member of
   its process group), and over a source clipped by a query scope's span,
