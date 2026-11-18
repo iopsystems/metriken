@@ -220,15 +220,25 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   sample after the end, however far after it is, on the batched and the
   per-series path and for each source of a scope or process group; the
   points still end at the range's end, and an instant query takes each
-  series' first sample after its time. A point past a series' last sample
-  is still held within the series' spacing of it. In a process group the
+  series' first sample after its time. When no sample follows the end (the
+  recording ends, or the series stops for good), a point past the series'
+  last sample is still held only when that sample is within the series'
+  typical spacing of the range's end, so there the last points can still
+  differ from a longer range's. In a process group the
   sample is compared with the other sources' rows (S4) but is not one of
   the rows past a read that decide a member's coverage (S3's nine within
   64 intervals). Raw mode, whose points are at samples, reads to the
-  range's end. The sample is read from each series' stream, so a query
-  over a segmented reader opens the next segment holding a row of each
-  series; with metriken-storage's unreleased change below it skips a
-  segment where the series' column is all null.
+  range's end. The sample is read in windows of 16 of the counter's
+  interval after the end, doubling until every series has one or the
+  source's last row is reached, pulling one sample per series from its
+  stream, so a query over a segmented reader opens the next segment
+  holding a row of each series. With metriken-storage's unreleased change
+  below it skips a segment whose footer statistics say the series' column
+  is null throughout; without statistics it reads each later segment until
+  one holds a row. A source using the default `counter_streams` reads
+  every row of the matched series in each window. When the batched path
+  gives up and the query is evaluated per series, the sample is read
+  again.
 
 ### metriken-query 0.50.1
 

@@ -175,10 +175,13 @@ pub use union::UnionMetricsSource;
 /// a grid read takes each series' first sample after the range's end,
 /// however far after it is: a point between a series' last sample in the
 /// range and the range's end has the value it has inside a longer range.
-/// Past a series' last sample (a recording that ends, or a series that
-/// stops, before the range does) a point within the series' typical
-/// spacing of it is held: the rate over the same span, ending at that
-/// sample.
+/// When no sample follows the range's end (the recording ends, or the
+/// series stops for good), a point past the series' last sample is held
+/// only when that sample is within the series' typical spacing of the
+/// range's end: the rate over the same span, ending at that sample. A
+/// series whose last sample is further from the end has no points past it,
+/// so there a point can differ between a range ending just after the last
+/// sample and a longer one.
 ///
 /// * [`Grid`](RateMode::Grid) (default): points at each grid tick
 ///   `t = floor(start/step)·step + k·step`. The grid phase is fixed to the

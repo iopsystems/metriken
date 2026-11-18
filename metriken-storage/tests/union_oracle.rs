@@ -835,8 +835,9 @@ fn deterministic_cases_match_the_oracle() {
 /// a gap to 203 s, then 5 s rows, beside a 2 s source, queried to 204 s. The
 /// union matches the oracle there; a gauge, `rate` and `irate` read the same
 /// to 204 s as to 260 s, on the batched and the per-series path (the rate at
-/// 204 s interpolates to the first source's row at 208 s, past two of its
-/// 1 s interval); and the gauge reads the same instantly at 204 s.
+/// 204 s interpolates to the first source's row at 208 s, 4 s after the
+/// end, which a read past the end by two of its 1 s interval would miss);
+/// and the gauge reads the same instantly at 204 s.
 #[test]
 fn the_last_points_read_the_rows_after_the_range() {
     let dir = tempfile::tempdir().unwrap();

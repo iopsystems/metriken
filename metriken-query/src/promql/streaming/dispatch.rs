@@ -226,45 +226,66 @@ fn rate_reach(ctx: &Ctx<'_>, name: &str) -> u64 {
     crate::batch_rate::interval_reach(ctx.source.counter_interval(name))
 }
 
-/// Each series of counter `name` matching `filter` in `source`, and its
-/// first sample after `after_ns`, by labels: what a grid `rate`/`irate`
-/// point between a series' last row at or before a range's end and that end
-/// interpolates to, so that the point has the value it has in a longer range.
-/// However far away the sample is, each series' stream is pulled once, so a
-/// source that reads lazily (a segmented archive) reads up to the first
-/// segment holding a row of it and no further. Up to `until_ns`, or the
-/// source's last row.
+/// The first sample after `after_ns` of each series of counter `name` in
+/// `want`, read from `source` within `span` (inclusive), by labels: what a
+/// grid `rate`/`irate` point between a series' last row at or before a
+/// range's end and that end interpolates to, so that the point has the
+/// value it has in a longer range.
+///
+/// The read is in windows of 16 of the counter's interval, doubling, each
+/// starting after the last, until every series in `want` has a sample or
+/// the window reaches the span's end or the source's last row; a series
+/// with no row before then has none. A window pulls one sample from the
+/// stream of each series still without one. `SegmentedSource` opens a
+/// series' segments in a window in order until one yields a row, skipping
+/// those whose footer statistics say its column is null throughout; a
+/// source using the default `counter_streams` reads every row of the
+/// matched series in the window.
 fn next_samples(
     source: &dyn DataSource,
     name: &str,
     filter: &crate::labels::Labels,
+    (lo, hi): (u64, u64),
     after_ns: u64,
-    until_ns: u64,
+    want: &std::collections::HashSet<&crate::labels::Labels>,
 ) -> std::collections::HashMap<crate::labels::Labels, crate::types::CounterSample> {
-    let until = source
-        .time_range()
-        .map_or(0, |(_, last)| last.min(until_ns));
-    if until <= after_ns {
-        return std::collections::HashMap::new();
+    let mut found = std::collections::HashMap::new();
+    let after = after_ns.max(lo.saturating_sub(1));
+    let until = source.time_range().map_or(0, |(_, last)| last.min(hi));
+    let mut from = after.saturating_add(1);
+    let mut width = ((source.counter_interval(name) * 1e9) as u64)
+        .max(1)
+        .saturating_mul(16);
+    while from <= until && found.len() < want.len() {
+        let to = after.saturating_add(width).min(until);
+        if let Some(streams) = source.counter_streams(name, filter, from, to) {
+            for mut stream in streams {
+                if !want.contains(&stream.labels) || found.contains_key(&stream.labels) {
+                    continue;
+                }
+                if let Some(first) = stream.samples.next() {
+                    found.insert(stream.labels, first);
+                }
+            }
+        }
+        from = to.saturating_add(1);
+        width = width.saturating_mul(2);
     }
-    let Some(streams) = source.counter_streams(name, filter, after_ns + 1, until) else {
-        return std::collections::HashMap::new();
-    };
-    streams
-        .into_iter()
-        .filter_map(|mut s| {
-            let first = s.samples.next()?;
-            Some((s.labels, first))
-        })
-        .collect()
+    found
 }
 
-/// [`next_samples`] in the order of a scan's series, as `grid_rates` takes
-/// them.
+/// [`next_samples`] for a scan's series, in its order, as `grid_rates`
+/// takes them.
 fn next_for_scan(
     scan: &crate::scan::CounterScan<'_>,
-    mut next: std::collections::HashMap<crate::labels::Labels, crate::types::CounterSample>,
+    source: &dyn DataSource,
+    name: &str,
+    filter: &crate::labels::Labels,
+    span: (u64, u64),
+    after_ns: u64,
 ) -> Vec<Option<crate::batch_rate::Sample>> {
+    let want = scan.series.iter().map(|s| &s.labels).collect();
+    let mut next = next_samples(source, name, filter, span, after_ns, &want);
     scan.series
         .iter()
         .map(|s| {
@@ -375,8 +396,9 @@ pub(crate) fn try_streaming_display(
 struct Ctx<'a> {
     source: &'a dyn DataSource,
     /// Where each series' first sample after the end is read
-    /// ([`next_samples`]); `None` for `source`.
-    next_source: Option<&'a dyn DataSource>,
+    /// ([`next_samples`]), and within what span; `None` for `source`, over
+    /// all its rows.
+    next_source: Option<(&'a dyn DataSource, (u64, u64))>,
     /// The process groups of more than one member among the sources, which
     /// each leaf reads per member and combines ([`per_source`]); `None` when
     /// there are none, and in the context a member is read in.
@@ -417,8 +439,8 @@ impl<'a> Ctx<'a> {
     }
 
     /// Where each series' first sample after the end is read.
-    fn next_from(&self) -> &'a dyn DataSource {
-        self.next_source.unwrap_or(self.source)
+    fn next_from(&self) -> (&'a dyn DataSource, (u64, u64)) {
+        self.next_source.unwrap_or((self.source, (0, u64::MAX)))
     }
 
     /// Apply the caller's explicit evaluation timestamps to a gauge producer,
@@ -476,8 +498,8 @@ fn scan_rates(
         let scan = ctx
             .source
             .counter_scan(name, filter, request.data_start, request.end_ns)?;
-        let next = next_samples(ctx.next_from(), name, filter, request.end_ns, u64::MAX);
-        let next = next_for_scan(&scan, next);
+        let (from, span) = ctx.next_from();
+        let next = next_for_scan(&scan, from, name, filter, span, request.end_ns);
         return crate::batch_rate::grid_rates(scan, &request, next);
     };
     let range = call.func.name == "rate";
@@ -514,7 +536,11 @@ fn scan_rates(
                 let mut scan = source.counter_scan(name, filter, from, request.end_ns)?;
                 next.extend(next_for_scan(
                     &scan,
-                    next_samples(source.as_ref(), name, filter, request.end_ns, u64::MAX),
+                    source.as_ref(),
+                    name,
+                    filter,
+                    (0, u64::MAX),
+                    request.end_ns,
                 ));
                 let interval = source.counter_interval(name);
                 for s in &mut scan.series {
@@ -561,10 +587,13 @@ fn scan_rates(
                     let scan_to = request.end_ns.min(m.hi).max(scan_from);
                     let mut scan = m.raw.counter_scan(name, filter, scan_from, scan_to)?;
                     // The member's first row after the end, within its span.
-                    let after = request.end_ns.max(m.lo.saturating_sub(1));
                     next.extend(next_for_scan(
                         &scan,
-                        next_samples(m.raw.as_ref(), name, filter, after, m.hi),
+                        m.raw.as_ref(),
+                        name,
+                        filter,
+                        (m.lo, m.hi),
+                        request.end_ns,
                     ));
                     let interval = m.source.counter_interval(name);
                     let labels: Vec<crate::labels::Labels> =
@@ -1283,8 +1312,9 @@ where
             // after the range (`next_samples`); raw points are at samples, so
             // a raw read ends at the range's end.
             if ctx.rate_mode == RateMode::Grid {
-                let mut next =
-                    next_samples(ctx.next_from(), metric_name, filter, ctx.end_ns, u64::MAX);
+                let (from, span) = ctx.next_from();
+                let want = streams.iter().map(|s| &s.labels).collect();
+                let mut next = next_samples(from, metric_name, filter, span, ctx.end_ns, &want);
                 for stream in &mut streams {
                     if let Some(after) = next.remove(&stream.labels) {
                         let samples =
@@ -1838,12 +1868,12 @@ where
         let mut evaluated = Vec::with_capacity(ranked.len());
         for (interval_ns, m) in ranked {
             let tap = Tap::new(m.source.clone(), m.lo, m.hi).with_context(m.raw.clone());
-            // Each series' first row after the end is read through a tap of
-            // its own, whose rows are not taken as the member's: S3 bounds
-            // the rows past a read that decide coverage.
-            let next = Tap::new(m.source.clone(), m.lo, m.hi).with_context(m.raw.clone());
+            // Each series' first row after the end is read from the member's
+            // source within its span, not through `tap`: S3 bounds the rows
+            // past a read that decide coverage, and the tap would take it as
+            // one of them.
             let member = Ctx {
-                next_source: Some(&next),
+                next_source: Some((m.source.as_ref(), (m.lo, m.hi))),
                 ..ctx.over(&tap)
             };
             let series = collect(leaf.build(&member)?);
