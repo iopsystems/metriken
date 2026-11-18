@@ -2244,6 +2244,63 @@ pub(crate) mod tests {
         ]
     }
 
+    /// Three segments of two series, `a` with values in each and `b` only
+    /// in the first: its column in the others is null throughout, as a wide
+    /// table keeps a series' column after it stops.
+    fn a_series_that_stops() -> Vec<Vec<u8>> {
+        (0..3u64)
+            .map(|k| {
+                let ts = [2 * k + 1, 2 * k + 2].map(|s| s * 1_000_000_000);
+                let a: Vec<Option<u64>> = ts.iter().map(|t| Some(t / 100_000_000)).collect();
+                let b: Vec<Option<u64>> = if k == 0 { a.clone() } else { vec![None; 2] };
+                let field = |id: &str, i: usize| {
+                    let meta: HashMap<String, String> =
+                        [("metric", "c"), ("metric_type", "counter"), ("id", id)]
+                            .into_iter()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect();
+                    Field::new(format!("c__{i}"), DataType::UInt64, true).with_metadata(meta)
+                };
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("timestamp", DataType::UInt64, false),
+                    field("a", 0),
+                    field("b", 1),
+                ]));
+                let columns: Vec<ArrayRef> = vec![
+                    Arc::new(UInt64Array::from(ts.to_vec())),
+                    Arc::new(UInt64Array::from(a)),
+                    Arc::new(UInt64Array::from(b)),
+                ];
+                let mut buf = Vec::new();
+                let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), None).unwrap();
+                writer
+                    .write(&RecordBatch::try_new(schema, columns).unwrap())
+                    .unwrap();
+                writer.close().unwrap();
+                buf
+            })
+            .collect()
+    }
+
+    /// A grid rate's read takes each series' first row after the range's
+    /// end, from the next segment holding one: the segment after the range
+    /// for a series that goes on, and none for one whose column is null in
+    /// every later segment.
+    #[test]
+    fn the_row_after_the_range_fetches_only_a_segment_holding_one() {
+        let store = CountingStore::new(a_series_that_stops());
+        let r = SegmentedParquetReader::open_with_pool(store.clone(), BufferPool::new(0)).unwrap();
+        store.fetched();
+        let opts = QueryOptions::default().with_per_series_rates(true);
+        for (query, fetched) in [
+            ("irate(c{id=\"b\"}[1s])", vec![0]),
+            ("irate(c{id=\"a\"}[1s])", vec![1, 0]),
+        ] {
+            let _ = r.query_range_opts(query, 1.0, 2.0, 1.0, &opts).unwrap();
+            assert_eq!(store.fetched(), fetched, "{query}");
+        }
+    }
+
     /// Open reads every segment exactly once and keeps none of them; a
     /// query fetches only the segments whose span it touches, and the
     /// listing surface answers from what open kept.
@@ -2265,20 +2322,22 @@ pub(crate) mod tests {
         );
 
         // A range in the middle segment, its lookback of one step
-        // included, touches the middle segment only. Per series, so the
-        // segments are opened as the series' stream reads them.
+        // included, touches the middle segment, and the last, which holds
+        // the series' first row after the range's end and is read first.
+        // Not the first. Per series, so the segments are opened as the
+        // series' stream reads them.
         let opts = QueryOptions::default().with_per_series_rates(true);
         let _ = r.query_range_opts("irate(c[1s])", 3.25, 3.75, 1.0, &opts);
-        assert_eq!(store.fetched(), vec![1]);
-        assert_eq!(r.cached_segments().0, 1);
+        assert_eq!(store.fetched(), vec![2, 1]);
+        assert_eq!(r.cached_segments().0, 2);
 
         // Again: served from the cache.
         let _ = r.query_range_opts("irate(c[1s])", 3.25, 3.75, 1.0, &opts);
         assert_eq!(store.fetched(), Vec::<usize>::new());
 
-        // The whole range: the two not yet cached.
+        // The whole range: the one not yet cached.
         let _ = r.query_range_opts("irate(c[1s])", 0.0, 6.0, 1.0, &opts);
-        assert_eq!(store.fetched(), vec![0, 2]);
+        assert_eq!(store.fetched(), vec![0]);
         assert_eq!(r.cached_segments().0, 3);
     }
 
@@ -2368,11 +2427,13 @@ pub(crate) mod tests {
         assert_eq!(r.cached_segments().0, 0, "a scan keeps no segment");
 
         let opts = QueryOptions::default().with_per_series_rates(true);
+        // The query reads the middle segment and, for the row after its
+        // end, the last, first.
         let _ = r.query_range_opts("irate(c[1s])", 3.25, 3.75, 1.0, &opts);
-        assert_eq!(store.fetched(), vec![1]);
+        assert_eq!(store.fetched(), vec![2, 1]);
         assert_eq!(MetricsSource::sample_timestamps(&r), want);
-        assert_eq!(store.fetched(), vec![0, 2], "the cached segment is reused");
-        assert_eq!(r.cached_segments().0, 1);
+        assert_eq!(store.fetched(), vec![0], "the cached segments are reused");
+        assert_eq!(r.cached_segments().0, 2);
     }
 
     /// A segment the store has lost since open — a rolling buffer's

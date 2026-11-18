@@ -2309,6 +2309,78 @@ mod tests {
         buf
     }
 
+    /// On an archive, through the batched rates and per series, a point
+    /// at the range's end has the value it has inside a wider range: the
+    /// read reaches each series' first row after it, however far away.
+    #[test]
+    fn a_rate_at_the_end_of_the_range_is_the_same_from_any_end() {
+        // Rows every second, half a second off the grid; 10/s until 20.5 s,
+        // then 30/s. Series `far` has no rows from 21.5 s to 49.5 s, so its
+        // first row after 21 s is 29 of its intervals away.
+        let rows: Vec<(u64, u64)> = (0..60u64)
+            .map(|k| {
+                let v = if k <= 20 { k * 10 } else { 200 + (k - 20) * 30 };
+                (k * S + S / 2, v)
+            })
+            .collect();
+        let far: Vec<(u64, u64)> = rows
+            .iter()
+            .copied()
+            .filter(|(t, _)| !(21 * S..50 * S).contains(t))
+            .collect();
+        let reader = archive(vec![recording(
+            &[("source", "a")],
+            vec![
+                ("t", explicit_table("c", "counter", &rows)),
+                ("f", explicit_table("far", "counter", &far)),
+            ],
+        )]);
+        let at = |query: &str, end: f64, opts: &QueryOptions, t: f64| -> Option<f64> {
+            let QueryResult::Matrix { result, .. } =
+                reader.query_range_opts(query, 5.0, end, 1.0, opts).unwrap()
+            else {
+                panic!("{query}: not a matrix");
+            };
+            result
+                .first()?
+                .values
+                .iter()
+                .find(|(x, _)| (x - t).abs() < 1e-9)
+                .map(|(_, v)| *v)
+        };
+        // A scope reads the source per part (`scan_rates`' groups): whole,
+        // and as a member clipped to a span that covers every row.
+        let scoped = |span: Option<(u64, u64)>| {
+            use crate::{Scope, ScopedSource, SourceRef};
+            QueryOptions::default().with_scope(Some(Arc::new(
+                Scope::new(vec![ScopedSource {
+                    source: SourceRef::Position(0),
+                    span,
+                }])
+                .unwrap(),
+            )))
+        };
+        for opts in [
+            QueryOptions::default(),
+            QueryOptions::default().with_per_series_rates(true),
+            scoped(None),
+            scoped(Some((0, 100 * S))),
+        ] {
+            for query in ["rate(c[3s])", "irate(c[3s])", "sum(rate(c[3s]))"] {
+                for t in [20.0, 21.0, 22.0] {
+                    let wide = at(query, t + 10.0, &opts, t);
+                    assert!(wide.is_some(), "{query} at {t}");
+                    assert_eq!(at(query, t, &opts, t), wide, "{query} at {t}");
+                }
+            }
+            for query in ["rate(far[3s])", "irate(far[3s])", "sum(rate(far[3s]))"] {
+                let wide = at(query, 59.0, &opts, 21.0);
+                assert!(wide.is_some(), "{query} at 21");
+                assert_eq!(at(query, 21.0, &opts, 21.0), wide, "{query} at 21");
+            }
+        }
+    }
+
     fn values(
         reader: &ArchiveReader,
         query: &str,

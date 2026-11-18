@@ -3027,6 +3027,44 @@ fn a_rate_across_a_hole_is_the_same_from_any_start() {
     }
 }
 
+/// A point's value does not depend on where the query ends: the read goes
+/// past the range's end to the row after its last point, so that point is
+/// interpolated as every other one is, not held from the row before it.
+#[test]
+fn a_rate_at_the_end_of_the_range_is_the_same_from_any_end() {
+    const S: u64 = 1_000_000_000;
+    // Rows every second, half a second off the grid; 10/s until 1020.5 s,
+    // then 30/s.
+    let ts: Vec<u64> = (1000..1040u64).map(|s| s * S + S / 2).collect();
+    let vals: Vec<u64> = ts
+        .iter()
+        .map(|t| {
+            let s = t / S;
+            if s <= 1020 {
+                (s - 1000) * 10
+            } else {
+                200 + (s - 1020) * 30
+            }
+        })
+        .collect();
+    let engine = counter_engine(1000, ts, vals);
+    let at_end = |query: &str, end: f64| -> Option<f64> {
+        let result = engine.query_range(query, 1005.0, end, 1.0).unwrap();
+        get_matrix_values(&result)
+            .first()?
+            .iter()
+            .find(|(ts, _)| (ts - end).abs() < 1e-9)
+            .map(|(_, v)| *v)
+    };
+    for query in ["rate(c[3s])", "irate(c[3s])", "sum(rate(c[3s]))"] {
+        for t in [1020.0, 1021.0, 1022.0] {
+            let wide = rate_at(&engine, query, 1005.0, t);
+            assert!(wide.is_some(), "{query} at {t}");
+            assert_eq!(at_end(query, t), wide, "{query} at {t}");
+        }
+    }
+}
+
 /// A counter read every 10 s from a source whose interval says 1 s: a
 /// `rate` at one time has one value from any start.
 #[test]

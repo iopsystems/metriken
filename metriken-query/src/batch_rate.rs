@@ -620,6 +620,9 @@ pub(crate) struct SeriesRate {
     last_edge: Option<(u64, Edge)>,
     /// Finished before its samples ran out; see [`end_early`](Self::end_early).
     ended_early: bool,
+    /// The series' first sample after the range's end, pushed once its scan
+    /// has no more rows ([`take_next`](Self::take_next)).
+    next: Option<Sample>,
 }
 
 /// An edge's interpolated cumulative and, when real reads describe it, its
@@ -648,7 +651,20 @@ impl SeriesRate {
             done: false,
             last_edge: None,
             ended_early: false,
+            next: None,
         }
+    }
+
+    /// With `next`, the series' first sample after the range's end.
+    pub fn with_next(mut self, next: Option<Sample>) -> Self {
+        self.next = next;
+        self
+    }
+
+    /// The series' first sample after the range's end, once: the caller
+    /// pushes it when the scan has no more rows of the series.
+    pub fn take_next(&mut self) -> Option<Sample> {
+        self.next.take()
     }
 
     /// The time of the last sample pushed, or `None` before the first.
@@ -1430,18 +1446,26 @@ impl<A: Accum> Sink for Grouped<A> {
 /// `rate`/`irate` of a scanned counter on `request`'s grid. `None` when a
 /// segment cannot be read or an ended series is pushed a sample; the
 /// dispatcher then evaluates the query per series.
+///
+/// `next` holds, per scanned series, its first sample after `end_ns`
+/// (`dispatch::next_samples`), which the scan does not read: it is pushed
+/// after the series' last scanned row, so a point between that row and the
+/// range's end interpolates to it as it would in a longer range.
 pub(crate) fn grid_rates(
     mut scan: crate::scan::CounterScan<'_>,
     request: &GridRateRequest<'_>,
+    mut next: Vec<Option<Sample>>,
 ) -> Option<GridRates> {
     use crate::scan::RowSeries;
     let (start, end) = (request.data_start, request.end_ns);
+    next.resize(scan.series.len(), None);
     let rates: Vec<SeriesRate> = scan
         .series
         .iter()
-        .map(|s| {
+        .zip(next)
+        .map(|(s, next)| {
             let reach = s.interval.map_or(request.reach_ns, interval_reach);
-            SeriesRate::new(s.windowed, request.start_ns, reach)
+            SeriesRate::new(s.windowed, request.start_ns, reach).with_next(next)
         })
         .collect();
     let scanned: Vec<Labels> = std::mem::take(&mut scan.series)
@@ -1657,6 +1681,27 @@ pub(crate) fn grid_rates(
         _ => None,
     };
     let resumed = std::sync::atomic::AtomicBool::new(false);
+    // Push the partition's rate `l` its first sample after the range's end,
+    // if it has one not pushed yet: after the scan's last row of it. A
+    // union's stage compares it with the other sources' rows (S4), but does
+    // not take it as a row of the member's coverage: S3 bounds the rows
+    // read past a read for that (`UnionMember::after`).
+    let push_next = |rates: &mut Vec<SeriesRate>, sink: &mut PartSink, l: usize| {
+        let Some(sample) = rates[l].take_next() else {
+            return;
+        };
+        if rates[l].ended_early() {
+            resumed.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        if let Some(stage) = sink.stage() {
+            stage.sample(l, sample.ts, sample.window, sample.value);
+        }
+        rates[l].push(sample, &grid, l, sink.sink());
+        if let Some(stage) = sink.stage() {
+            stage.settle_member(l, rates, &grid);
+        }
+    };
     while let Some(chunk) = scan.next_chunk(threads).ok()? {
         let run = |rates: &mut Vec<SeriesRate>, sink: &mut PartSink, part: usize| {
             // A joined scan's series whose scan has ended get no more rows:
@@ -1669,6 +1714,7 @@ pub(crate) fn grid_rates(
                         continue;
                     }
                     let l = slocal[s] as usize;
+                    push_next(rates, sink, l);
                     rates[l].finish(&grid, l, sink.sink());
                     if let Some(stage) = sink.stage() {
                         stage.end_member(l);
@@ -1808,18 +1854,21 @@ pub(crate) fn grid_rates(
             // The earliest grid point each group can still be given.
             let mut pending = vec![u64::MAX; group_of.iter().max().map_or(0, |g| g + 1)];
             for (p, (rates, sink)) in part_rates.iter_mut().zip(sinks.iter_mut()).enumerate() {
-                for (s, rate) in rates.iter_mut().enumerate() {
+                for s in 0..rates.len() {
                     let g = group_of[rate_unit[p][s]];
-                    if let Some(last) = rate.last_ts() {
-                        let lag = rate
+                    if let Some(last) = rates[s].last_ts() {
+                        let lag = rates[s]
                             .spacing_ns()
                             .or(median)
                             .map(|sp| sp.max(grid.step_ns).saturating_mul(10));
-                        if rate.pending_ns().is_some()
+                        if rates[s].pending_ns().is_some()
                             && lag.is_some_and(|lag| last.saturating_add(lag) < w)
                             && scan.later_rows(rate_series[p][s]) != LaterRows::Possible
                         {
-                            rate.end_early(&grid, s, sink.sink());
+                            // Its first sample after the end follows its
+                            // last row, as the scan's end would push it.
+                            push_next(rates, sink, s);
+                            rates[s].end_early(&grid, s, sink.sink());
                             // Its rows are taken as ended too; a row after
                             // this (only from a scan that cannot say whether
                             // one follows) ends the read (`resumed`), as a
@@ -1829,7 +1878,7 @@ pub(crate) fn grid_rates(
                             }
                         }
                     }
-                    if let Some(t) = earliest_point(rate, w, &grid) {
+                    if let Some(t) = earliest_point(&rates[s], w, &grid) {
                         pending[g] = pending[g].min(t);
                     }
                 }
@@ -1859,12 +1908,13 @@ pub(crate) fn grid_rates(
             }
         }
     }
-    if resumed.load(std::sync::atomic::Ordering::Relaxed) {
-        #[cfg(any(test, feature = "fixtures"))]
-        BATCH_ABANDONED.with(|n| n.set(n.get() + 1));
-        return None;
-    }
     let finish = |rates: &mut Vec<SeriesRate>, sink: &mut PartSink, _p: usize| {
+        for l in 0..rates.len() {
+            push_next(rates, sink, l);
+        }
+        if resumed.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         for (s, rate) in rates.iter_mut().enumerate() {
             rate.finish(&grid, s, sink.sink());
         }
@@ -1872,7 +1922,17 @@ pub(crate) fn grid_rates(
             stage.finish(rates, &grid);
         }
     };
+    if resumed.load(std::sync::atomic::Ordering::Relaxed) {
+        #[cfg(any(test, feature = "fixtures"))]
+        BATCH_ABANDONED.with(|n| n.set(n.get() + 1));
+        return None;
+    }
     run_partitions(&mut part_rates, &mut sinks, &finish);
+    if resumed.load(std::sync::atomic::Ordering::Relaxed) {
+        #[cfg(any(test, feature = "fixtures"))]
+        BATCH_ABANDONED.with(|n| n.set(n.get() + 1));
+        return None;
+    }
 
     // Each series' result, in the order of `labels`, from the partitions'
     // per-series results.

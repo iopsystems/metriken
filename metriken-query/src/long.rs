@@ -857,8 +857,11 @@ mod reader_tests {
                         Arc::clone(&pool),
                     )
                     .unwrap();
+                    let batched =
+                        || crate::promql::streaming::dispatch::BATCH_RATES.with(|n| n.get());
+                    let before = batched();
                     let batch = r.query_range(q, start, end, step).unwrap();
-                    assert_eq!(pool.stats().misses, 0, "{layout} {q}: the batch path ran");
+                    assert!(batched() > before, "{layout} {q}: the batch path ran");
                     let streams = r
                         .query_range_opts(q, start, end, step, &per_series)
                         .unwrap();

@@ -1920,9 +1920,15 @@ impl DataSource for SegmentedSource {
             let labels = labels.clone();
             let series_labels = labels.clone();
             let name = Arc::clone(&name);
+            // A column whose footer says every cell is null gives no
+            // sample, so its segment is not fetched: a read past a series'
+            // last row ends without reading the segments after it.
             let samples = locations
                 .iter()
-                .filter(move |l| self.state.catalog[l.segment as usize].touches(start_ns, end_ns))
+                .filter(move |l| {
+                    l.position.holds_values
+                        && self.state.catalog[l.segment as usize].touches(start_ns, end_ns)
+                })
                 .filter_map(move |l| {
                     let idx = l.segment as usize;
                     let seg = match self.segment(idx) {

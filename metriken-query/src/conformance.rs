@@ -55,8 +55,9 @@
 //! oracle states them as the engine does: how long a raw operand's point is
 //! held ([`held`]), the interpolated quantiles of a display bucket, which of
 //! two equally slow histograms sets the ticks, and an operator over two rates
-//! whose spans share no time (a rate held at a range's end beside a current
-//! one) giving a value with no band, marked interpolated.
+//! whose spans share no time (a rate held past its series' last row beside a
+//! current one) giving a value with no band, marked interpolated. On the
+//! grid a read reaches the first row after the query's end ([`Mode::end`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -929,7 +930,9 @@ struct Mode {
     raw: bool,
     back: u64,
     step: u64,
-    /// The query's end: rows after it are not read.
+    /// The query's end. On the grid the read reaches the first row after
+    /// it, so a rate at the end is interpolated from that row as every
+    /// other point is; in raw mode rows after it are not read.
     end: u64,
 }
 
@@ -1040,11 +1043,16 @@ impl World {
                         // Held for the gap before it in raw mode; on the
                         // grid a gauge for the step or its spacing, and a
                         // rate needs a row at or after `t`.
-                        // Rows after the query's end are not read: past the
-                        // last one read, a rate is held at it when the next
-                        // row would fall after the end, and ends otherwise
-                        // (a row at the end would have been read).
-                        let last_read = i.row_at(mode.end)?;
+                        // On the grid the read reaches the first row at or
+                        // after the query's end; past the last row read (a
+                        // series that stopped before the end), a rate is held
+                        // at it when the next row would fall after the end,
+                        // and ends otherwise. Raw reads end at the end.
+                        let last_read = if mode.raw {
+                            i.row_at(mode.end)?
+                        } else {
+                            i.row_from(mode.end).or_else(|| i.row_at(mode.end))?
+                        };
                         let held = if mode.raw {
                             i.every
                         } else if matches!(f, F::Rate(_) | F::Irate) {

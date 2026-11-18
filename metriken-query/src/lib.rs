@@ -171,6 +171,15 @@ pub use union::UnionMetricsSource;
 /// window is one step, and in raw mode it is the gap to the previous
 /// sample.
 ///
+/// The value at `t` is interpolated from the samples either side of it, so
+/// a grid read takes each series' first sample after the range's end,
+/// however far after it is: a point between a series' last sample in the
+/// range and the range's end has the value it has inside a longer range.
+/// Past a series' last sample (a recording that ends, or a series that
+/// stops, before the range does) a point within the series' typical
+/// spacing of it is held: the rate over the same span, ending at that
+/// sample.
+///
 /// * [`Grid`](RateMode::Grid) (default): points at each grid tick
 ///   `t = floor(start/step)·step + k·step`. The grid phase is fixed to the
 ///   step boundary, so two recordings on the same step share a grid and are

@@ -114,6 +114,14 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   as every series is. A `# HELP` text is kept under the exporter's name
   only.
 
+### metriken-storage (unreleased)
+
+- **Changed:** `SegmentedSource::counter_streams` does not fetch a
+  segment whose column of the series is null in every row by its footer
+  statistics; that segment gave the stream no sample. A read that starts
+  after a series' last row in a wide table, whose later segments keep the
+  column, now fetches none of them.
+
 ### metriken-storage 0.13.1
 
 - **Fixed:** `BufferPool::put_histogram_snapshots` charges a block what it
@@ -198,6 +206,29 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   writes (a fixed scale for a time unit, else the power of 10 that makes
   every bound an integer), that it applies to `OVERFLOW_BOUND_KEY` too,
   and which readers divide by it.
+
+### metriken-query (unreleased)
+
+- **Fixed:** a grid `rate` or `irate` point between a series' last
+  sample in a range and the range's end had a different value from the
+  same point inside a longer range. The value at a point is interpolated
+  from the samples either side of it, but the read stopped at the range's
+  end, so those points were held from the sample before: over rows 1 s
+  apart and half a second off the grid, with the rate going from 10/s to
+  30/s at 20.5 s, `rate(c[3s])` at 21 s read 10 in a range ending at 21 s
+  and 13.33 in one ending later. A grid read now takes each series' first
+  sample after the end, however far after it is, on the batched and the
+  per-series path and for each source of a scope or process group; the
+  points still end at the range's end, and an instant query takes each
+  series' first sample after its time. A point past a series' last sample
+  is still held within the series' spacing of it. In a process group the
+  sample is compared with the other sources' rows (S4) but is not one of
+  the rows past a read that decide a member's coverage (S3's nine within
+  64 intervals). Raw mode, whose points are at samples, reads to the
+  range's end. The sample is read from each series' stream, so a query
+  over a segmented reader opens the next segment holding a row of each
+  series; with metriken-storage's unreleased change below it skips a
+  segment where the series' column is all null.
 
 ### metriken-query 0.50.1
 
