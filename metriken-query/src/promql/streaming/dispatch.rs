@@ -233,15 +233,16 @@ fn rate_reach(ctx: &Ctx<'_>, name: &str) -> u64 {
 /// value it has in a longer range.
 ///
 /// The read is in windows ending 16, 32, 64, ... of the counter's interval
-/// after `after_ns`, each starting after the last, until every series in
-/// `want` has a sample or a window reaches the span's end or the source's
-/// last row; a series with no row before then has none. A series in `want`
-/// with no row after `after_ns` makes the read go to that bound. A window
-/// pulls one sample from the stream of each series still without one. `SegmentedSource` opens a
-/// series' segments in a window in order until one yields a row, skipping
-/// those whose footer statistics say its column is null throughout; a
-/// source using the default `counter_streams` reads every row of the
-/// matched series in the window.
+/// after `after_ns`, or after the start of `span` when that is later, each
+/// starting after the last, until every series in `want` has a sample or a
+/// window reaches the span's end or the source's last row; a series with no row
+/// before then has none. A series in `want` with no row in that part of the
+/// span makes the read go to that bound. A window pulls one sample from the
+/// stream of each series still without one. `SegmentedSource` opens a series'
+/// segments in a window in order until one yields a row, skipping those whose
+/// footer statistics say its column is null throughout; a source using the
+/// default `counter_streams` reads every row of the matched series in the
+/// window.
 fn next_samples(
     source: &dyn DataSource,
     name: &str,
