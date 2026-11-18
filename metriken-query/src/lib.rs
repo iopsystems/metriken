@@ -52,11 +52,19 @@
 //!   `histogram_heatmap(h, 15)`), gives one point per stride window that
 //!   holds observations, each row's delta shared among the windows its
 //!   interval overlaps. Windows end at multiples of the stride and a point
-//!   is stamped at its window's end (the last at its last row), so with the
-//!   stride at the step and a start that is not a multiple of the step, the
-//!   points are one per step but at multiples of the step rather than at
-//!   `start + k·step`. (`histogram_irate` and `histogram_quantile` take no
-//!   stride; `histogram_quantiles([q], h, s)` is the strided quantile.)
+//!   is stamped at its window's end, so with the stride at the step and a
+//!   start that is not a multiple of the step, the points are one per step
+//!   but at multiples of the step rather than at `start + k·step`. A window
+//!   the rows end inside is stamped at its last row. The windows at the
+//!   range's end get each series' share of the interval to its next row
+//!   after the end, unless the bucket configuration or scale changes after
+//!   the end; every series goes two of its row intervals without a row
+//!   across it; or, on a process group, a series' next row is more than 16
+//!   of the metric's row intervals after the end. While rows follow the
+//!   range's end, the window holding an end that is not a multiple of the
+//!   stride gives no point.
+//!   (`histogram_irate` and `histogram_quantile` take no stride;
+//!   `histogram_quantiles([q], h, s)` is the strided quantile.)
 //!
 //! A chart over rows whose spacing varies, or over several series with
 //! unaligned rows, should use the strided form with the stride at its step.

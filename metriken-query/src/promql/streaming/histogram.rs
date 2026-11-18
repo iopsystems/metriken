@@ -50,6 +50,10 @@ pub(crate) struct Stride {
     /// point falls before the range; 0 for an instant, whose one window
     /// always is.
     pub(crate) emit_from_ns: u64,
+    /// A window is emitted only when its stamp is at or before this: the
+    /// range's end. The rows after it are read until every window closing
+    /// at or before it is closed ([`Splitter::done`]).
+    pub(crate) emit_through_ns: u64,
 }
 
 impl Stride {
@@ -102,8 +106,8 @@ fn mul_div_floor(a: u128, b: u128, c: u128) -> u128 {
 /// A share for a window already closed, from a series that missed rows,
 /// counts in the oldest window still open. A closed window is stamped at
 /// its close, the last window at its last row; it is emitted when that
-/// stamp is at or after the stride's `emit_from_ns`. At most
-/// [`MAX_OPEN_WINDOWS`] are open at once.
+/// stamp is from the stride's `emit_from_ns` through its `emit_through_ns`.
+/// At most [`MAX_OPEN_WINDOWS`] are open at once.
 struct Splitter {
     stride: Stride,
     /// The window holding the range's start: the first that can be emitted.
@@ -207,7 +211,8 @@ impl Splitter {
         {
             let (j, mut accums) = self.open.pop_front().unwrap();
             let at = self.stride.closes_ns(j).min(cap);
-            emit((at >= self.stride.emit_from_ns).then_some(at), &mut accums);
+            let emitted = (self.stride.emit_from_ns..=self.stride.emit_through_ns).contains(&at);
+            emit(emitted.then_some(at), &mut accums);
             self.closed_to = j;
             self.spare.push(accums);
         }
@@ -327,6 +332,19 @@ impl Splitter {
             self.close_excess(t, emit);
         }
         self.deltas = deltas;
+    }
+
+    /// Whether every window closing at or before the stride's
+    /// `emit_through_ns` is closed: no later row changes what is emitted.
+    fn done(&self) -> bool {
+        let through = self.stride.emit_through_ns;
+        let k = self.stride.window(through);
+        let last = if self.stride.closes_ns(k) <= through {
+            k
+        } else {
+            k - 1
+        };
+        self.closed_to >= last
     }
 
     /// Closes every window.
@@ -737,7 +755,9 @@ fn quantiles_impl(
         ..
     } in rows
     {
-        if t > end_ns {
+        // A strided call reads each series' rows after the end until the
+        // windows at the end are closed; an unstrided one reads none.
+        if t > end_ns && splitter.is_none() {
             continue;
         }
         let overflow_since = overflow
@@ -757,6 +777,9 @@ fn quantiles_impl(
                 &mut |at, accums| emit_window(at, accums, &mut outputs),
             );
             prev_per_series[series_idx] = Some(snapshot);
+            if t > end_ns && sp.done() {
+                break;
+            }
             continue;
         }
 
@@ -926,7 +949,9 @@ fn reduce(
         ..
     } in rows
     {
-        if t > end_ns {
+        // A strided call reads each series' rows after the end until the
+        // windows at the end are closed; an unstrided one reads none.
+        if t > end_ns && splitter.is_none() {
             continue;
         }
 
@@ -943,6 +968,9 @@ fn reduce(
                 },
             );
             prev_per_series[series_idx] = Some(snapshot);
+            if t > end_ns && sp.done() {
+                break;
+            }
             continue;
         }
 
@@ -1184,7 +1212,9 @@ fn heatmap_impl(
         ..
     } in rows
     {
-        if t > end_ns {
+        // A strided call reads each series' rows after the end until the
+        // windows at the end are closed; an unstrided one reads none.
+        if t > end_ns && splitter.is_none() {
             continue;
         }
 
@@ -1209,6 +1239,9 @@ fn heatmap_impl(
                 }
             });
             prev_per_series[series_idx] = Some(snapshot);
+            if t > end_ns && sp.done() {
+                break;
+            }
             continue;
         }
 
@@ -1565,6 +1598,7 @@ mod accum_tests {
             ns: 1_000_000_000,
             anchor_ns: 0,
             emit_from_ns: 0,
+            emit_through_ns: u64::MAX,
         };
         let mut sp = Splitter::new(stride, 1_000_000_000_000, 1, 1, config);
         let (mut idx, mut cnt) = (Vec::new(), Vec::new());
@@ -1600,6 +1634,7 @@ mod accum_tests {
             ns: s,
             anchor_ns: 0,
             emit_from_ns: 0,
+            emit_through_ns: u64::MAX,
         };
         let mut sp = Splitter::new(stride, 1000 * s, 2, 1, config);
         let (mut idx, mut cnt) = (Vec::new(), Vec::new());

@@ -1,6 +1,6 @@
 use crate::promql::streaming::histogram::{HistogramOps, Stride};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use promql_parser::label::{MatchOp as PromMatchOp, Matcher};
 use promql_parser::parser::{self, Expr};
@@ -142,6 +142,164 @@ pub(crate) fn read_histogram(
     source
         .histogram_stream(name, &selection.filter, start_ns, end_ns)
         .map(|stream| selection.histogram(stream))
+}
+
+/// [`read_histogram`] for a call with `stride`: the rows to `end_ns`, then
+/// the rows after it until every window closing at or before `end_ns` is
+/// closed, so a window at the end gets each series' share of the interval
+/// to its next row. The first read runs to 16 of the metric's row intervals
+/// (1 s when it has none) after `end_ns`, and later reads to 32, 64, … of
+/// them, to the source's last row, each made when the call reaches it. No
+/// read is made past the time at which every series has gone two of its
+/// row intervals without a row, when none holds a strided window open.
+/// After `end_ns`, a series' rows are left out when it has no row at or
+/// before `end_ns`, and from its first row whose scale differs from its
+/// last row's at or before `end_ns`. Every row of a later read whose
+/// buckets do not map into the first read's is left out, and no read is
+/// made after it. Unstrided, the rows to `end_ns`.
+pub(crate) fn read_strided_histogram(
+    source: &Arc<dyn DataSource>,
+    name: &str,
+    selection: &Selection,
+    (from_ns, end_ns): (u64, u64),
+    stride: Option<Stride>,
+) -> Option<crate::histogram_stream::HistogramStream> {
+    if stride.is_none() {
+        return read_histogram(source.as_ref(), name, selection, from_ns, end_ns);
+    }
+    let until = source.time_range().map_or(0, |(_, last)| last).max(end_ns);
+    // A source with no positive interval for the metric is read as if its
+    // rows were a second apart.
+    let interval = Some(source.histogram_interval(name))
+        .filter(|i| i.is_finite() && *i > 0.0)
+        .unwrap_or(1.0);
+    let width = ((interval * 1e9) as u64).max(1).saturating_mul(16);
+    let first_end = end_ns.saturating_add(width).min(until);
+    let stream = read_histogram(source.as_ref(), name, selection, from_ns, first_end)?;
+    let seen = Arc::new(Mutex::new(vec![
+        SeriesSeen::default();
+        stream.meta.series.len()
+    ]));
+    let after = RowsAfter {
+        source: Arc::clone(source),
+        name: name.to_string(),
+        selection: selection.clone(),
+        index: (stream.meta.series.iter().cloned().enumerate())
+            .map(|(i, labels)| (labels, i))
+            .collect(),
+        config: stream.meta.config,
+        end_ns,
+        next: (first_end < until).then(|| (first_end + 1, width.saturating_mul(2))),
+        until,
+        seen: Arc::clone(&seen),
+        rows: None,
+    };
+    let crate::histogram_stream::HistogramStream { meta, rows } = stream;
+    let rows = rows.chain(after).filter(move |row| {
+        let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(s) = seen.get_mut(row.series_idx) else {
+            return false;
+        };
+        let t = row.timestamp;
+        if t > end_ns {
+            if s.left_out || s.scale_at_end.is_none_or(|scale| scale != row.scale) {
+                s.left_out = true;
+                return false;
+            }
+        } else {
+            s.scale_at_end = Some(row.scale);
+        }
+        s.interval = s.latest.map_or(0, |at| t.saturating_sub(at));
+        s.latest = Some(t);
+        true
+    });
+    Some(crate::histogram_stream::HistogramStream {
+        meta,
+        rows: Box::new(rows),
+    })
+}
+
+/// What [`read_strided_histogram`] has passed on of one series.
+#[derive(Clone, Copy, Default)]
+struct SeriesSeen {
+    /// Its latest row's time, and the interval before it (0 with one row).
+    latest: Option<u64>,
+    interval: u64,
+    /// The scale of its last row at or before the end.
+    scale_at_end: Option<f64>,
+    /// Whether its rows after the end are left out.
+    left_out: bool,
+}
+
+/// The rows of [`read_strided_histogram`] after its first read, read one
+/// window at a time as they are reached, with the first read's series
+/// indices.
+struct RowsAfter {
+    source: Arc<dyn DataSource>,
+    name: String,
+    selection: Selection,
+    /// The first read's series, by labels.
+    index: HashMap<Labels, usize>,
+    config: ::histogram::Config,
+    end_ns: u64,
+    /// The next read's first instant and width; `None` once a read reached
+    /// `until`.
+    next: Option<(u64, u64)>,
+    until: u64,
+    seen: Arc<Mutex<Vec<SeriesSeen>>>,
+    rows: Option<Box<dyn Iterator<Item = crate::histogram_stream::HistogramRow> + Send>>,
+}
+
+impl RowsAfter {
+    /// The time from which no series passed on holds a window open: its
+    /// latest row plus two of its row intervals, the latest among them.
+    fn quiet_from(&self) -> u64 {
+        let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        seen.iter()
+            .filter(|s| !s.left_out && s.interval > 0)
+            .filter_map(|s| Some(s.latest?.saturating_add(s.interval.saturating_mul(2))))
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+impl Iterator for RowsAfter {
+    type Item = crate::histogram_stream::HistogramRow;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(row) = self.rows.as_mut().and_then(|rows| rows.next()) {
+                return Some(row);
+            }
+            let (from, width) = self.next?;
+            if from >= self.quiet_from() {
+                self.next = None;
+                return None;
+            }
+            let to = self.end_ns.saturating_add(width).min(self.until);
+            self.next = (to < self.until).then(|| (to + 1, width.saturating_mul(2)));
+            let Some(stream) =
+                read_histogram(self.source.as_ref(), &self.name, &self.selection, from, to)
+            else {
+                self.rows = None;
+                continue;
+            };
+            let common = crate::histogram_stream::common_config([self.config, stream.meta.config]);
+            if common != Some(self.config) {
+                self.next = None;
+                self.rows = None;
+                continue;
+            }
+            let stream = stream.rebucketed(self.config);
+            let at: Vec<Option<usize>> = (stream.meta.series.iter())
+                .map(|labels| self.index.get(labels).copied())
+                .collect();
+            self.rows = Some(Box::new(stream.rows.filter_map(move |mut row| {
+                row.series_idx = at.get(row.series_idx).copied().flatten()?;
+                Some(row)
+            })));
+        }
+    }
 }
 
 /// A range's `(start_ns, end_ns, step_ns)` as the gauge grid lays it: the
@@ -489,6 +647,7 @@ fn stride_windows(
         ns,
         anchor_ns: if opts.instant { end_ns } else { 0 },
         emit_from_ns: if opts.instant { 0 } else { start_ns },
+        emit_through_ns: end_ns,
     };
     let windows = end_ns.saturating_sub(window_read_start(Some(stride), start_ns)) / ns + 1;
     // An interval that is not a positive number says nothing about the
@@ -1504,16 +1663,19 @@ impl QueryEngine {
                 stride_windows(ns, interval, start_ns, end_ns, opts)
             })
             .transpose()?;
-        let stream = read_histogram(
-            self.source.as_ref(),
+        let stream = read_strided_histogram(
+            &self.source,
             &metric_name,
             &selection,
-            histogram_read_start(
-                self.source.as_ref(),
-                &metric_name,
-                window_read_start(stride, start_ns),
+            (
+                histogram_read_start(
+                    self.source.as_ref(),
+                    &metric_name,
+                    window_read_start(stride, start_ns),
+                ),
+                end_ns,
             ),
-            end_ns,
+            stride,
         );
         let Some(stream) = stream else {
             nothing_read(self.source.as_ref(), &metric_name, MetricKind::Histogram)?;
@@ -1594,16 +1756,19 @@ impl QueryEngine {
                 stride_windows(ns, interval, start_ns, end_ns, opts)
             })
             .transpose()?;
-        let stream = read_histogram(
-            self.source.as_ref(),
+        let stream = read_strided_histogram(
+            &self.source,
             &metric_name,
             &selection,
-            histogram_read_start(
-                self.source.as_ref(),
-                &metric_name,
-                window_read_start(stride, start_ns),
+            (
+                histogram_read_start(
+                    self.source.as_ref(),
+                    &metric_name,
+                    window_read_start(stride, start_ns),
+                ),
+                end_ns,
             ),
-            end_ns,
+            stride,
         );
         let Some(stream) = stream else {
             nothing_read(self.source.as_ref(), &metric_name, MetricKind::Histogram)?;
@@ -1740,16 +1905,19 @@ impl QueryEngine {
                 stride_windows(ns, interval, start_ns, end_ns, opts)
             })
             .transpose()?;
-        let stream = read_histogram(
-            self.source.as_ref(),
+        let stream = read_strided_histogram(
+            &self.source,
             &metric_name,
             &selection,
-            histogram_read_start(
-                self.source.as_ref(),
-                &metric_name,
-                window_read_start(stride, start_ns),
+            (
+                histogram_read_start(
+                    self.source.as_ref(),
+                    &metric_name,
+                    window_read_start(stride, start_ns),
+                ),
+                end_ns,
             ),
-            end_ns,
+            stride,
         );
         let Some(stream) = stream else {
             nothing_read(self.source.as_ref(), &metric_name, MetricKind::Histogram)?;
