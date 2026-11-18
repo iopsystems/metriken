@@ -605,7 +605,9 @@ impl<'a> Iterator for CounterGridRate<'a> {
             // end, a point past that sample is the rate over the same span
             // ending at it, as a gauge is held past its last sample. Without
             // it, a series whose rows fall between the grid's points has none
-            // at the range's end, and `sum` across series out of phase with
+            // at the range's end when no sample follows the end (the
+            // dispatcher appends the first one that does), and `sum` across
+            // series out of phase with
             // one another (two recordings) drops the ones that read last
             // before the end. A series that stops earlier in the range is not
             // held: it ended. Otherwise nothing past the last sample: on the

@@ -115,6 +115,7 @@ fn make_ctx<'a>(
     };
     Ctx {
         source,
+        next_source: None,
         groups,
         start_ns,
         end_ns: crate::promql::range_end_ns(end),
@@ -225,6 +226,86 @@ fn rate_reach(ctx: &Ctx<'_>, name: &str) -> u64 {
     crate::batch_rate::interval_reach(ctx.source.counter_interval(name))
 }
 
+/// The first sample after `after_ns` of each series of counter `name` in
+/// `want`, read from `source` within `span` (inclusive), by labels: what a
+/// grid `rate`/`irate` point between a series' last row at or before a
+/// range's end and that end interpolates to, so that the point has the
+/// value it has in a longer range.
+///
+/// The read is in windows ending 16, 32, 64, ... of the counter's interval
+/// after `after_ns`, or after the start of `span` when that is later, each
+/// starting after the last, until every series in `want` has a sample or a
+/// window reaches the span's end or the source's last row; a series with no row
+/// before then has none. A series in `want` with no row in that part of the
+/// span makes the read go to that bound. A window pulls one sample from the
+/// stream of each series still without one. `SegmentedSource` opens a series'
+/// segments in a window in order until one yields a row, skipping those whose
+/// footer statistics say its column is null throughout; a source using the
+/// default `counter_streams` reads every row of the matched series in the
+/// window.
+fn next_samples(
+    source: &dyn DataSource,
+    name: &str,
+    filter: &crate::labels::Labels,
+    (lo, hi): (u64, u64),
+    after_ns: u64,
+    want: &std::collections::HashSet<&crate::labels::Labels>,
+) -> std::collections::HashMap<crate::labels::Labels, crate::types::CounterSample> {
+    let mut found = std::collections::HashMap::new();
+    let after = after_ns.max(lo.saturating_sub(1));
+    if after == u64::MAX {
+        return found;
+    }
+    let until = source.time_range().map_or(0, |(_, last)| last.min(hi));
+    let mut from = after + 1;
+    let mut width = ((source.counter_interval(name) * 1e9) as u64)
+        .max(1)
+        .saturating_mul(16);
+    while from <= until && found.len() < want.len() {
+        let to = after.saturating_add(width).min(until);
+        if let Some(streams) = source.counter_streams(name, filter, from, to) {
+            for mut stream in streams {
+                if !want.contains(&stream.labels) || found.contains_key(&stream.labels) {
+                    continue;
+                }
+                if let Some(first) = stream.samples.next() {
+                    found.insert(stream.labels, first);
+                }
+            }
+        }
+        if to >= until {
+            break;
+        }
+        from = to + 1;
+        width = width.saturating_mul(2);
+    }
+    found
+}
+
+/// [`next_samples`] for a scan's series, in its order, as `grid_rates`
+/// takes them.
+fn next_for_scan(
+    scan: &crate::scan::CounterScan<'_>,
+    source: &dyn DataSource,
+    name: &str,
+    filter: &crate::labels::Labels,
+    span: (u64, u64),
+    after_ns: u64,
+) -> Vec<Option<crate::batch_rate::Sample>> {
+    let want = scan.series.iter().map(|s| &s.labels).collect();
+    let mut next = next_samples(source, name, filter, span, after_ns, &want);
+    scan.series
+        .iter()
+        .map(|s| {
+            next.remove(&s.labels).map(|x| crate::batch_rate::Sample {
+                ts: x.ts,
+                value: x.value,
+                window: x.window,
+            })
+        })
+        .collect()
+}
+
 /// How far before a `rate(name[range])` point's time its read starts: the
 /// `[range]`, the reach before it ([`rate_reach`]), and one reach more for
 /// a point held past a series' last sample, whose window ends at that
@@ -322,6 +403,10 @@ pub(crate) fn try_streaming_display(
 
 struct Ctx<'a> {
     source: &'a dyn DataSource,
+    /// Where each series' first sample after the end is read
+    /// ([`next_samples`]), and within what span; `None` for `source`, over
+    /// all its rows.
+    next_source: Option<(&'a dyn DataSource, (u64, u64))>,
     /// The process groups of more than one member among the sources, which
     /// each leaf reads per member and combines ([`per_source`]); `None` when
     /// there are none, and in the context a member is read in.
@@ -347,6 +432,7 @@ impl<'a> Ctx<'a> {
     fn over<'s>(&self, source: &'s dyn DataSource) -> Ctx<'s> {
         Ctx {
             source,
+            next_source: None,
             groups: None,
             start_ns: self.start_ns,
             end_ns: self.end_ns,
@@ -358,6 +444,11 @@ impl<'a> Ctx<'a> {
             raw_hold_ns: self.raw_hold_ns,
             raw_depth: self.raw_depth,
         }
+    }
+
+    /// Where each series' first sample after the end is read.
+    fn next_from(&self) -> (&'a dyn DataSource, (u64, u64)) {
+        self.next_source.unwrap_or((self.source, (0, u64::MAX)))
     }
 
     /// Apply the caller's explicit evaluation timestamps to a gauge producer,
@@ -415,7 +506,9 @@ fn scan_rates(
         let scan = ctx
             .source
             .counter_scan(name, filter, request.data_start, request.end_ns)?;
-        return crate::batch_rate::grid_rates(scan, &request);
+        let (from, span) = ctx.next_from();
+        let next = next_for_scan(&scan, from, name, filter, span, request.end_ns);
+        return crate::batch_rate::grid_rates(scan, &request, next);
     };
     let range = call.func.name == "rate";
     let range_ns = match call.args.args.first().map(|a| &**a) {
@@ -436,6 +529,8 @@ fn scan_rates(
     };
     let holds = |source: &dyn DataSource| source.counter_names().iter().any(|n| n == name);
     let mut scans = Vec::new();
+    // Per scanned series, its first sample after the end (`next_samples`).
+    let mut next = Vec::new();
     let mut unit = Vec::new();
     let mut units: Vec<crate::batch_rate::UnionUnit> = Vec::new();
     let mut series = Vec::new();
@@ -447,6 +542,14 @@ fn scan_rates(
                 }
                 let from = data_start(source.as_ref());
                 let mut scan = source.counter_scan(name, filter, from, request.end_ns)?;
+                next.extend(next_for_scan(
+                    &scan,
+                    source.as_ref(),
+                    name,
+                    filter,
+                    (0, u64::MAX),
+                    request.end_ns,
+                ));
                 let interval = source.counter_interval(name);
                 for s in &mut scan.series {
                     s.interval.get_or_insert(interval);
@@ -491,6 +594,15 @@ fn scan_rates(
                     let scan_from = from.max(m.lo);
                     let scan_to = request.end_ns.min(m.hi).max(scan_from);
                     let mut scan = m.raw.counter_scan(name, filter, scan_from, scan_to)?;
+                    // The member's first row after the end, within its span.
+                    next.extend(next_for_scan(
+                        &scan,
+                        m.raw.as_ref(),
+                        name,
+                        filter,
+                        (m.lo, m.hi),
+                        request.end_ns,
+                    ));
                     let interval = m.source.counter_interval(name);
                     let labels: Vec<crate::labels::Labels> =
                         scan.series.iter().map(|s| s.labels.clone()).collect();
@@ -547,7 +659,7 @@ fn scan_rates(
         union: Some(&plan),
         ..request
     };
-    crate::batch_rate::grid_rates(metriken_storage::scan::interleave(scans), &request)
+    crate::batch_rate::grid_rates(metriken_storage::scan::interleave(scans), &request, next)
 }
 
 /// The metric, filter and request for a batch `rate`/`irate` of `call`, or
@@ -1204,6 +1316,21 @@ where
                 });
             };
             selection.retain(&mut streams, |s| &s.labels);
+            // On the grid each series' stream ends with its first sample
+            // after the range (`next_samples`); raw points are at samples, so
+            // a raw read ends at the range's end.
+            if ctx.rate_mode == RateMode::Grid {
+                let (from, span) = ctx.next_from();
+                let want = streams.iter().map(|s| &s.labels).collect();
+                let mut next = next_samples(from, metric_name, filter, span, ctx.end_ns, &want);
+                for stream in &mut streams {
+                    if let Some(after) = next.remove(&stream.labels) {
+                        let samples =
+                            std::mem::replace(&mut stream.samples, Box::new(std::iter::empty()));
+                        stream.samples = Box::new(samples.chain(std::iter::once(after)));
+                    }
+                }
+            }
             // Each series is its producer over its own sample stream, pulled
             // by whatever consumes it: an aggregate holds one buffered point
             // per series and each producer one interval's worth of samples,
@@ -1749,7 +1876,15 @@ where
         let mut evaluated = Vec::with_capacity(ranked.len());
         for (interval_ns, m) in ranked {
             let tap = Tap::new(m.source.clone(), m.lo, m.hi).with_context(m.raw.clone());
-            let series = collect(leaf.build(&ctx.over(&tap))?);
+            // Each series' first row after the end is read from the member's
+            // source within its span, not through `tap`: S3 bounds the rows
+            // past a read that decide coverage, and the tap would take it as
+            // one of them.
+            let member = Ctx {
+                next_source: Some((m.source.as_ref(), (m.lo, m.hi))),
+                ..ctx.over(&tap)
+            };
+            let series = collect(leaf.build(&member)?);
             evaluated.push(MemberSeries::new(series, tap.take_rows(), interval_ns));
         }
         out.extend(per_source::combine(

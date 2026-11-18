@@ -833,11 +833,11 @@ fn deterministic_cases_match_the_oracle() {
 
 /// The last points of a range read the rows after it: 1 s rows to 200 s,
 /// a gap to 203 s, then 5 s rows, beside a 2 s source, queried to 204 s. The
-/// union matches the oracle there, and a gauge (whose points each source
-/// alone gives whatever the range's end) reads the same to 204 s as to
-/// 260 s, in a range query and instantly at 204 s. (A rate's last point
-/// moves with the range's end for a source alone too, so only the oracle is
-/// asked about it.)
+/// union matches the oracle there; a gauge, `rate` and `irate` read the same
+/// to 204 s as to 260 s, on the batched and the per-series path (the rate at
+/// 204 s interpolates to the first source's row at 208 s, 4 s after the
+/// end, which a read past the end by two of its 1 s interval would miss);
+/// and the gauge reads the same instantly at 204 s.
 #[test]
 fn the_last_points_read_the_rows_after_the_range() {
     let dir = tempfile::tempdir().unwrap();
@@ -858,10 +858,18 @@ fn the_last_points_read_the_rows_after_the_range() {
             assert!(d.is_empty(), "{q} per-series {ps}: {d:?}");
         }
     }
-    let a = range(&u, "g", short, false).unwrap();
+    for q in ["g", "rate(c[5s])", "irate(c[5s])"] {
+        for ps in [false, true] {
+            let a = range(&u, q, short, ps).unwrap();
+            let b = range(&u, q, long, ps).unwrap();
+            let d = differences(&a, &b, Some((to_ns(short.0), to_ns(short.1))));
+            assert!(
+                d.is_empty(),
+                "{q} per-series {ps} to 204 s against to 260 s: {d:?}"
+            );
+        }
+    }
     let b = range(&u, "g", long, false).unwrap();
-    let d = differences(&a, &b, Some((to_ns(short.0), to_ns(short.1))));
-    assert!(d.is_empty(), "g to 204 s against to 260 s: {d:?}");
     let QueryResult::Vector { result, .. } = u.query("g", Some(short.1)).unwrap() else {
         panic!("not a vector");
     };
