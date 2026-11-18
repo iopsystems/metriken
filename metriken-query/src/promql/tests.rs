@@ -4530,8 +4530,9 @@ fn a_strided_instant_counts_the_stride_ending_at_the_instant() {
         result.first().map(|s| s.value.1)
     };
     assert_eq!(count("histogram_count(lat, 60)", 1400.0), Some(60.0));
-    // The window (1339.5, 1399.5] holds half of the row at 1340's interval.
-    assert_eq!(count("histogram_count(lat, 60)", 1399.5), Some(59.5));
+    // The window (1339.5, 1399.5] holds half of the interval to the row at
+    // 1340 and half of the one to the row at 1400, after the instant.
+    assert_eq!(count("histogram_count(lat, 60)", 1399.5), Some(60.0));
     assert_eq!(count("histogram_count(lat, 10)", 1400.0), Some(10.0));
     // 7 s does not divide 300 s; the window is still the 7 s before.
     assert_eq!(count("histogram_count(lat, 7)", 1400.0), Some(7.0));
@@ -4716,25 +4717,26 @@ fn a_strided_window_with_no_row_in_the_range_gives_no_point() {
 /// is in the range: with rows every 50 s of one observation and a 30 s
 /// stride over [1155, 1230], the window (1140, 1170] holds 10 s of the
 /// interval to 1150 and 20 s of the one to 1200, 0.6 of an observation, and
-/// is emitted at 1170; (1170, 1200] holds the other 30 s of the second.
+/// is emitted at 1170; (1170, 1200] holds the other 30 s of the second, and
+/// (1200, 1230] 30 s of the interval to the row at 1250, after the range.
 #[test]
 fn a_closed_strided_window_is_stamped_at_its_close() {
     let engine = QueryEngine::new(Arc::new(hist_rows(50_000, 1000, 1400, 50)));
     let points = strided_counts(&engine, "histogram_count(lat, 30)", 1155.0, 1230.0);
-    assert_close(&points, &[(1170.0, 0.6), (1200.0, 0.6)]);
+    assert_close(&points, &[(1170.0, 0.6), (1200.0, 0.6), (1230.0, 0.6)]);
     let QueryResult::HistogramHeatmap { result, .. } = engine
         .query_range("histogram_heatmap(lat, 30)", 1155.0, 1230.0, 1.0)
         .unwrap()
     else {
         panic!("not a heatmap");
     };
-    assert_eq!(result.timestamps, vec![1170.0, 1200.0]);
+    assert_eq!(result.timestamps, vec![1170.0, 1200.0, 1230.0]);
     let counts: Vec<(f64, f64)> = result
         .data
         .iter()
         .map(|(t, _, c)| (*t as f64, *c))
         .collect();
-    assert_close(&counts, &[(0.0, 0.6), (1.0, 0.6)]);
+    assert_close(&counts, &[(0.0, 0.6), (1.0, 0.6), (2.0, 0.6)]);
 }
 
 /// `have` matches `want` in its timestamps and, to the precision of a
@@ -4812,27 +4814,261 @@ fn strided_windows_share_series_read_at_different_phases() {
     let off: Vec<u64> = on.iter().map(|t| t + 7000).collect();
     let engine = QueryEngine::new(Arc::new(hist_series(10_000, &[("a", on), ("b", off)], 100)));
     let points = strided_counts(&engine, "histogram_count(lat, 15)", 1100.0, 1380.0);
-    // The last window, (1365, 1380], lacks the second series' share from
-    // 1377 on: its row at 1387 is after the range.
-    let mut expected: Vec<(f64, f64)> = (1110..1380)
+    // The last window, (1365, 1380], has the second series' share from
+    // 1377 on from its row at 1387, after the range.
+    let expected: Vec<(f64, f64)> = (1110..=1380)
         .step_by(15)
         .map(|t| (t as f64, 300.0))
         .collect();
-    expected.push((1380.0, 270.0));
     assert_eq!(points, expected);
 }
 
 /// A strided window closes at a multiple of the stride whatever the rows'
-/// phase: rows 300 ms after each 10 s give points at multiples of 60 s,
-/// and the last window, still open, at its last row.
+/// phase: rows 300 ms after each 10 s give points at multiples of 60 s.
+/// The window holding the range's end, (1380, 1440] for an end at 1395,
+/// closes after it and gives no point while rows follow the end; when the
+/// rows end inside it, it is stamped at the last row.
 #[test]
 fn strided_points_fall_at_window_closes() {
     let times: Vec<u64> = (1000..=1400).step_by(10).map(|s| s * 1000 + 300).collect();
     let engine = QueryEngine::new(Arc::new(hist_series(10_000, &[("a", times)], 100)));
     let points = strided_counts(&engine, "histogram_count(lat, 60)", 1130.0, 1395.0);
     let times: Vec<f64> = points.iter().map(|(t, _)| *t).collect();
-    assert_eq!(times, vec![1140.0, 1200.0, 1260.0, 1320.0, 1380.0, 1390.3]);
-    assert!(points[..5].iter().all(|(_, c)| *c == 600.0), "{points:?}");
+    assert_eq!(times, vec![1140.0, 1200.0, 1260.0, 1320.0, 1380.0]);
+    assert!(points.iter().all(|(_, c)| *c == 600.0), "{points:?}");
+    let points = strided_counts(&engine, "histogram_count(lat, 60)", 1130.0, 1410.0);
+    let times: Vec<f64> = points.iter().map(|(t, _)| *t).collect();
+    assert_eq!(times, vec![1140.0, 1200.0, 1260.0, 1320.0, 1380.0, 1400.3]);
+}
+
+/// A strided point at or before a range's end is the one a longer range
+/// gives, for an end on, between and off the windows' closes, with a
+/// series every second beside one every 30 s at another phase, whose row
+/// after the end is up to 30 s after it; and a strided instant on a close
+/// is that point.
+#[test]
+fn strided_points_at_the_end_are_those_of_a_longer_range() {
+    let fast: Vec<u64> = (1000..=2000).map(|s| s * 1000 + 300).collect();
+    let slow: Vec<u64> = (1000..=2000).step_by(30).map(|s| s * 1000 + 7000).collect();
+    let engine = QueryEngine::new(Arc::new(hist_series(
+        30_000,
+        &[("fast", fast), ("slow", slow)],
+        100,
+    )));
+    let matrix = |q: &str, end: f64| -> Vec<(f64, f64)> {
+        let QueryResult::Matrix { result, .. } = engine.query_range(q, 1200.0, end, 1.0).unwrap()
+        else {
+            panic!("not a matrix");
+        };
+        result.iter().flat_map(|s| s.values.clone()).collect()
+    };
+    // The heatmap's columns to `cut`, of a range to `end`.
+    let heatmap = |end: f64, cut: f64| {
+        let QueryResult::HistogramHeatmap { result, .. } = engine
+            .query_range("histogram_heatmap(lat, 60)", 1200.0, end, 1.0)
+            .unwrap()
+        else {
+            panic!("not a heatmap");
+        };
+        let n = result.timestamps.iter().filter(|t| **t <= cut).count();
+        let cells: Vec<_> = result.data.into_iter().filter(|c| c.0 < n).collect();
+        (result.timestamps[..n].to_vec(), cells)
+    };
+    for end in [1500.0, 1530.0, 1547.5] {
+        for q in [
+            "histogram_count(lat, 60)",
+            "histogram_sum(lat, 60)",
+            "histogram_quantiles([0.5, 0.99], lat, 60)",
+        ] {
+            let short = matrix(q, end);
+            let long: Vec<_> = matrix(q, end + 300.0)
+                .into_iter()
+                .filter(|(t, _)| *t <= end)
+                .collect();
+            assert!(!short.is_empty(), "{q} to {end}");
+            assert_eq!(short, long, "{q} to {end}");
+        }
+        assert_eq!(
+            heatmap(end, end),
+            heatmap(end + 300.0, end),
+            "heatmap to {end}"
+        );
+    }
+    let count = matrix("histogram_count(lat, 60)", 1800.0);
+    for end in [1500.0, 1560.0] {
+        let QueryResult::Vector { result, .. } =
+            engine.query("histogram_count(lat, 60)", Some(end)).unwrap()
+        else {
+            panic!("not a vector");
+        };
+        let at = count.iter().find(|(t, _)| *t == end).map(|(_, v)| *v);
+        assert_eq!(Some(result[0].value.1), at, "instant at {end}");
+    }
+}
+
+/// On recordings read together, whose rows a read puts on the slowest
+/// recording's row times, a strided point at or before the end is still
+/// the one a longer range gives: a second each at 300 ms past it beside
+/// one every 10 s at 7 s past it.
+#[test]
+fn strided_points_at_the_end_of_recordings_are_those_of_a_longer_range() {
+    use metriken_storage::labeled::LabeledSource;
+    use metriken_storage::recordings::RecordingsSource;
+
+    let fast: Vec<u64> = (1000..=2000).map(|s| s * 1000 + 300).collect();
+    let slow: Vec<u64> = (1000..=2000).step_by(10).map(|s| s * 1000 + 7000).collect();
+    let recording = |interval_ms, times, source| -> Arc<dyn DataSource> {
+        Arc::new(LabeledSource::new(
+            Arc::new(hist_series(interval_ms, &[("a", times)], 100)),
+            make_labels(&[("source", source)]),
+        ))
+    };
+    let engine = QueryEngine::new(Arc::new(RecordingsSource::new(vec![
+        recording(1_000, fast, "fast"),
+        recording(10_000, slow, "slow"),
+    ])));
+    for end in [1500.0, 1530.0, 1547.5] {
+        let short = strided_counts(&engine, "histogram_count(lat, 60)", 1200.0, end);
+        let long: Vec<_> = strided_counts(&engine, "histogram_count(lat, 60)", 1200.0, end + 300.0)
+            .into_iter()
+            .filter(|(t, _)| *t <= end)
+            .collect();
+        assert_eq!(short, long, "to {end}");
+    }
+}
+
+/// A histogram whose buckets change scale after a strided range's end
+/// answers the range as before: the rows after the end at another scale
+/// are left out.
+#[test]
+fn a_scale_change_after_the_end_leaves_a_strided_range_answered() {
+    let mut source = hist_rows(1000, 1000, 2000, 1);
+    source.set_histogram_scale("lat", Labels::default(), 1501 * 1_000_000_000, 1000.0);
+    let engine = QueryEngine::new(Arc::new(source));
+    for q in [
+        "histogram_quantiles([0.5], lat, 60)",
+        "histogram_sum(lat, 60)",
+        "histogram_heatmap(lat, 60)",
+    ] {
+        engine
+            .query_range(q, 1200.0, 1500.0, 1.0)
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+        engine
+            .query(q, Some(1500.0))
+            .unwrap_or_else(|e| panic!("{q} instant: {e}"));
+    }
+    let points = strided_counts(&engine, "histogram_count(lat, 60)", 1200.0, 1500.0);
+    assert_eq!(points.last(), Some(&(1500.0, 60.0)));
+}
+
+/// A [`Memory`] source that records the end of each histogram read.
+struct ReadEnds {
+    inner: Memory,
+    ends: std::sync::Mutex<Vec<u64>>,
+}
+
+impl DataSource for ReadEnds {
+    fn counters(&self, n: &str, f: &Labels, a: u64, b: u64) -> Option<crate::types::Counters> {
+        self.inner.counters(n, f, a, b)
+    }
+    fn counter_streams<'s>(
+        &'s self,
+        n: &str,
+        f: &Labels,
+        a: u64,
+        b: u64,
+    ) -> Option<Vec<crate::types::CounterStream<'s>>> {
+        self.inner.counter_streams(n, f, a, b)
+    }
+    fn gauges(&self, n: &str, f: &Labels, a: u64, b: u64) -> Option<crate::types::Gauges> {
+        self.inner.gauges(n, f, a, b)
+    }
+    fn histogram_stream(
+        &self,
+        n: &str,
+        f: &Labels,
+        a: u64,
+        b: u64,
+    ) -> Option<crate::histogram_stream::HistogramStream> {
+        self.ends.lock().unwrap().push(b);
+        self.inner.histogram_stream(n, f, a, b)
+    }
+    fn interval(&self) -> f64 {
+        self.inner.interval()
+    }
+    fn time_range(&self) -> Option<(u64, u64)> {
+        self.inner.time_range()
+    }
+    fn counter_names(&self) -> Vec<String> {
+        self.inner.counter_names()
+    }
+    fn gauge_names(&self) -> Vec<String> {
+        self.inner.gauge_names()
+    }
+    fn histogram_names(&self) -> Vec<String> {
+        self.inner.histogram_names()
+    }
+    fn counter_labels(&self, n: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.inner.counter_labels(n)
+    }
+    fn gauge_labels(&self, n: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.inner.gauge_labels(n)
+    }
+    fn histogram_labels(&self, n: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.inner.histogram_labels(n)
+    }
+    fn column_map(
+        &self,
+    ) -> std::collections::HashMap<String, std::collections::HashMap<Labels, String>> {
+        self.inner.column_map()
+    }
+}
+
+/// A series that stopped before a strided range's end does not keep the
+/// read going: it stops holding the windows open two of its row intervals
+/// after its last row, so the rows after the end are read only until the
+/// other series' rows close the window at the end, not to the source's
+/// last row. The stopped series' last row, at 1200, counts only in the
+/// window closing at 1200.
+#[test]
+fn a_series_that_stopped_does_not_extend_the_read_after_the_end() {
+    let steady: Vec<u64> = (1000..=20_000).map(|s| s * 1000).collect();
+    let stopped: Vec<u64> = (1000..=1200).map(|s| s * 1000).collect();
+    let source = Arc::new(ReadEnds {
+        inner: hist_series(1_000, &[("steady", steady), ("stopped", stopped)], 100),
+        ends: Default::default(),
+    });
+    let engine = QueryEngine::new(source.clone());
+    let points = strided_counts(&engine, "histogram_count(lat, 60)", 1200.0, 1320.0);
+    assert_eq!(
+        points,
+        vec![(1200.0, 12000.0), (1260.0, 6000.0), (1320.0, 6000.0)]
+    );
+    let ends = source.ends.lock().unwrap().clone();
+    let furthest = ends.iter().max().copied().unwrap();
+    assert!(furthest <= 1400 * 1_000_000_000, "{ends:?}");
+}
+
+/// Rows of a series that has no row by a strided range's end do not keep
+/// the read going: once every series of the range has gone two of its row
+/// intervals without a row, nothing more is read.
+#[test]
+fn a_series_new_after_the_end_does_not_extend_the_read() {
+    let ended: Vec<u64> = (1000..=1290).map(|s| s * 1000).collect();
+    let new: Vec<u64> = (1295..=200_000).map(|s| s * 1000).collect();
+    let source = Arc::new(ReadEnds {
+        inner: hist_series(1_000, &[("ended", ended), ("new", new)], 100),
+        ends: Default::default(),
+    });
+    let engine = QueryEngine::new(source.clone());
+    let points = strided_counts(&engine, "histogram_count(lat, 60)", 1200.0, 1290.0);
+    assert_eq!(
+        points,
+        vec![(1200.0, 6000.0), (1260.0, 6000.0), (1290.0, 3000.0)]
+    );
+    let ends = source.ends.lock().unwrap().clone();
+    let furthest = ends.iter().max().copied().unwrap();
+    assert!(furthest <= 1400 * 1_000_000_000, "{ends:?}");
 }
 
 /// Across a gap in a series the delta of the row after it is shared over

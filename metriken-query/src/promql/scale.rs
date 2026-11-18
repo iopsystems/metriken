@@ -9,8 +9,10 @@
 //! their buckets cannot be added otherwise, so a group whose rows have two
 //! scales is refused ([`Scales::scale`], [`Scales::group_scales`]). The
 //! rows read include the baseline row before the range's start, which a
-//! delta is taken from. Counts (`histogram_count`, `histogram_irate`) do
-//! not depend on the scale and are neither divided nor refused.
+//! delta is taken from, and for a strided call a series' rows after the
+//! range's end at the scale of its last row at or before the end. Counts
+//! (`histogram_count`, `histogram_irate`) do not depend on the scale and
+//! are neither divided nor refused.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

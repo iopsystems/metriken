@@ -17,8 +17,9 @@
 //!   ([`Conflicts::add`]), at times up to the read's end.
 //!
 //! Gauge histograms are not compared. The rows compared include those read
-//! before the query's range: a range function's window, a selector's
-//! staleness window, a histogram's previous rows.
+//! before the query's range (a range function's window, a selector's
+//! staleness window, a histogram's previous rows) and a strided histogram
+//! call's rows after the range's end.
 //!
 //! Only an archive's queries have process groups, so without the `archive`
 //! feature `Recorded` is never built.

@@ -2047,6 +2047,70 @@ mod tests {
         }))
     }
 
+    /// A strided call over a process group reads the interval crossing the
+    /// range's end in the read of the range: each member's read starts its
+    /// cumulative counts afresh, so a read starting after the end has no
+    /// row before it to take that interval's delta from. Over two copies of
+    /// one series, rows every second 300 ms past it, a strided count at or
+    /// before the end is the one a longer range gives, and a strided instant
+    /// is the one source's alone.
+    #[test]
+    fn a_groups_strided_points_at_the_end_are_those_of_a_longer_range() {
+        let cpu0: &[(&str, &str)] = &[("cpu", "0")];
+        let rows: Vec<u64> = (1000..=2000).map(|s| s * S + 300_000_000).collect();
+        let (a, b) = (
+            histogram_source(1, &[(cpu0, rows.clone())]),
+            histogram_source(1, &[(cpu0, rows.clone())]),
+        );
+        let members: Vec<Member> = [a.clone(), b.clone()]
+            .into_iter()
+            .enumerate()
+            .map(|(m, source)| Member {
+                raw: Arc::clone(&source),
+                source,
+                lo: 0,
+                hi: u64::MAX,
+                uuid: Some(format!("u{m}")),
+                catalog_index: m,
+                position: m,
+                first_ns: u64::MAX,
+            })
+            .collect();
+        let group = crate::promql::QueryEngine::new(Arc::new(GroupSource::new(
+            vec![a, b],
+            members,
+            Default::default(),
+        )));
+        let one = crate::promql::QueryEngine::new(histogram_source(1, &[(cpu0, rows)]));
+        let q = "histogram_count(h, 60)";
+        let counts = |end: f64| {
+            let crate::promql::QueryResult::Matrix { result, .. } =
+                group.query_range(q, 1200.0, end, 1.0).unwrap()
+            else {
+                panic!("not a matrix");
+            };
+            result[0].values.clone()
+        };
+        for end in [1500.0, 1530.0, 1547.5, 1560.0] {
+            let long: Vec<_> = counts(end + 300.0)
+                .into_iter()
+                .filter(|(t, _)| *t <= end)
+                .collect();
+            assert_eq!(counts(end), long, "to {end}");
+        }
+        let instant = |engine: &crate::promql::QueryEngine, t: f64| {
+            let crate::promql::QueryResult::Vector { result, .. } =
+                engine.query(q, Some(t)).unwrap()
+            else {
+                panic!("not a vector");
+            };
+            result[0].value.1
+        };
+        for t in [1500.0, 1530.0] {
+            assert_eq!(instant(&group, t), instant(&one, t), "instant at {t}");
+        }
+    }
+
     /// A series of a test source: its labels and row times.
     type TestSeries<'a> = (&'a [(&'a str, &'a str)], Vec<u64>);
 
