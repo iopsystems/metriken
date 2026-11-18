@@ -2253,33 +2253,72 @@ pub(crate) mod tests {
                 let ts = [2 * k + 1, 2 * k + 2].map(|s| s * 1_000_000_000);
                 let a: Vec<Option<u64>> = ts.iter().map(|t| Some(t / 100_000_000)).collect();
                 let b: Vec<Option<u64>> = if k == 0 { a.clone() } else { vec![None; 2] };
-                let field = |id: &str, i: usize| {
-                    let meta: HashMap<String, String> =
-                        [("metric", "c"), ("metric_type", "counter"), ("id", id)]
-                            .into_iter()
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                            .collect();
-                    Field::new(format!("c__{i}"), DataType::UInt64, true).with_metadata(meta)
-                };
-                let schema = Arc::new(Schema::new(vec![
-                    Field::new("timestamp", DataType::UInt64, false),
-                    field("a", 0),
-                    field("b", 1),
-                ]));
-                let columns: Vec<ArrayRef> = vec![
-                    Arc::new(UInt64Array::from(ts.to_vec())),
-                    Arc::new(UInt64Array::from(a)),
-                    Arc::new(UInt64Array::from(b)),
-                ];
-                let mut buf = Vec::new();
-                let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), None).unwrap();
-                writer
-                    .write(&RecordBatch::try_new(schema, columns).unwrap())
-                    .unwrap();
-                writer.close().unwrap();
-                buf
+                two_series_segment(&ts, a, b)
             })
             .collect()
+    }
+
+    /// A segment of counter `c` with series `id="a"` and `id="b"`, each
+    /// cell `None` where the series has no row.
+    fn two_series_segment(ts: &[u64], a: Vec<Option<u64>>, b: Vec<Option<u64>>) -> Vec<u8> {
+        let field = |id: &str, i: usize| {
+            let meta: HashMap<String, String> =
+                [("metric", "c"), ("metric_type", "counter"), ("id", id)]
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+            Field::new(format!("c__{i}"), DataType::UInt64, true).with_metadata(meta)
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::UInt64, false),
+            field("a", 0),
+            field("b", 1),
+        ]));
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(UInt64Array::from(ts.to_vec())),
+            Arc::new(UInt64Array::from(a)),
+            Arc::new(UInt64Array::from(b)),
+        ];
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), None).unwrap();
+        writer
+            .write(&RecordBatch::try_new(schema, columns).unwrap())
+            .unwrap();
+        writer.close().unwrap();
+        buf
+    }
+
+    /// An archive whose last row is at the largest timestamp, with a series
+    /// that has no row after the range's end: the batched read for each
+    /// series' first row after the end stops at that last row.
+    #[test]
+    fn a_last_row_at_the_largest_time_ends_the_batched_read_after_the_range() {
+        let s = 1_000_000_000u64;
+        let segments = vec![
+            two_series_segment(
+                &[s, 2 * s],
+                vec![Some(10), Some(20)],
+                vec![Some(10), Some(20)],
+            ),
+            two_series_segment(&[3 * s, 4 * s], vec![Some(30), Some(40)], vec![None, None]),
+            two_series_segment(&[u64::MAX], vec![Some(50)], vec![None]),
+        ];
+        let r = SegmentedParquetReader::open_with_pool(
+            CountingStore::new(segments),
+            BufferPool::new(64 << 20),
+        )
+        .unwrap();
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let batched = || crate::promql::streaming::dispatch::BATCH_RATES.with(|n| n.get());
+            let before = batched();
+            r.query_range("rate(c[2s])", 1.0, 2.0, 1.0).unwrap();
+            let _ = done.send(batched() > before);
+        });
+        let batched = wait
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the query returns");
+        assert!(batched, "the batch path answered");
     }
 
     /// A grid rate's read takes each series' first row after the range's
@@ -2324,8 +2363,8 @@ pub(crate) mod tests {
         // A range in the middle segment, its lookback of one step
         // included, touches the middle segment, and the last, which holds
         // the series' first row after the range's end and is read first.
-        // Not the first. Per series, so the segments are opened as the
-        // series' stream reads them.
+        // It does not touch the first segment. Per series, so the segments
+        // are opened as the series' stream reads them.
         let opts = QueryOptions::default().with_per_series_rates(true);
         let _ = r.query_range_opts("irate(c[1s])", 3.25, 3.75, 1.0, &opts);
         assert_eq!(store.fetched(), vec![2, 1]);

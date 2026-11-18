@@ -3065,6 +3065,46 @@ fn a_rate_at_the_end_of_the_range_is_the_same_from_any_end() {
     }
 }
 
+/// A source whose last row is at the largest timestamp, with a series that
+/// has no row after the range's end: the read for each series' first row
+/// after the end stops at that last row. The in-memory source has no
+/// batched scan, so both runs take the per-series path; the segmented
+/// tests cover the batched one.
+#[test]
+fn a_last_row_at_the_largest_time_ends_the_read_after_the_range() {
+    const S: u64 = 1_000_000_000;
+    let ts: Vec<u64> = (1000..1020u64).map(|s| s * S).collect();
+    let mut source = Memory::new(1000);
+    for (id, last) in [("a", None), ("b", Some(u64::MAX))] {
+        let timestamps: Vec<u64> = ts.iter().copied().chain(last).collect();
+        let values: Vec<u64> = (0..timestamps.len() as u64).map(|k| k * 10).collect();
+        source.add_counter(
+            "c",
+            Counter {
+                labels: make_labels(&[("id", id)]),
+                timestamps,
+                values: values.into(),
+                windows: None,
+            },
+        );
+    }
+    let engine = QueryEngine::new(Arc::new(source));
+    let (done, wait) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for opts in [
+            crate::QueryOptions::default(),
+            crate::QueryOptions::default().with_per_series_rates(true),
+        ] {
+            engine
+                .query_range_opts("rate(c[3s])", 1005.0, 1025.0, 1.0, &opts)
+                .unwrap();
+        }
+        let _ = done.send(());
+    });
+    wait.recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the query returns");
+}
+
 /// A counter read every 10 s from a source whose interval says 1 s: a
 /// `rate` at one time has one value from any start.
 #[test]

@@ -232,11 +232,12 @@ fn rate_reach(ctx: &Ctx<'_>, name: &str) -> u64 {
 /// range's end and that end interpolates to, so that the point has the
 /// value it has in a longer range.
 ///
-/// The read is in windows of 16 of the counter's interval, doubling, each
-/// starting after the last, until every series in `want` has a sample or
-/// the window reaches the span's end or the source's last row; a series
-/// with no row before then has none. A window pulls one sample from the
-/// stream of each series still without one. `SegmentedSource` opens a
+/// The read is in windows ending 16, 32, 64, ... of the counter's interval
+/// after `after_ns`, each starting after the last, until every series in
+/// `want` has a sample or a window reaches the span's end or the source's
+/// last row; a series with no row before then has none. A series in `want`
+/// with no row after `after_ns` makes the read go to that bound. A window
+/// pulls one sample from the stream of each series still without one. `SegmentedSource` opens a
 /// series' segments in a window in order until one yields a row, skipping
 /// those whose footer statistics say its column is null throughout; a
 /// source using the default `counter_streams` reads every row of the
@@ -251,8 +252,11 @@ fn next_samples(
 ) -> std::collections::HashMap<crate::labels::Labels, crate::types::CounterSample> {
     let mut found = std::collections::HashMap::new();
     let after = after_ns.max(lo.saturating_sub(1));
+    if after == u64::MAX {
+        return found;
+    }
     let until = source.time_range().map_or(0, |(_, last)| last.min(hi));
-    let mut from = after.saturating_add(1);
+    let mut from = after + 1;
     let mut width = ((source.counter_interval(name) * 1e9) as u64)
         .max(1)
         .saturating_mul(16);
@@ -268,7 +272,10 @@ fn next_samples(
                 }
             }
         }
-        from = to.saturating_add(1);
+        if to >= until {
+            break;
+        }
+        from = to + 1;
         width = width.saturating_mul(2);
     }
     found
