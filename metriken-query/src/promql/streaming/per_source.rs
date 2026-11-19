@@ -4,8 +4,8 @@
 //! A process group is the set of sources of one producer process (copies, a
 //! recording and a hindsight dump of it, two recorders of one agent at once;
 //! metriken-storage's `process` module). Each source is evaluated up to the
-//! per-series function (`rate`, `irate`, a gauge read, a windowed gauge
-//! function) as one recording is evaluated, with its own rows, interval and
+//! per-series function (`rate`, `irate`, `increase`, a gauge read, a
+//! windowed gauge function) as one recording is evaluated, with its own rows, interval and
 //! acquisition windows, and the results are combined per series: at each
 //! point the finest source whose rows cover the function's whole window
 //! answers, ties going to the source with the earlier first row (Q16), then
@@ -63,6 +63,10 @@ pub(crate) struct Member {
     /// The source's first row, in nanoseconds (`u64::MAX` for a source
     /// with none): S4's tie rule at equal spacing (Q16).
     pub first_ns: u64,
+    /// The member's producer epoch, `None` for a source with none: members
+    /// of one epoch are copies of one process, whose counters run on from
+    /// one to another (`group_increase`).
+    pub epoch: Option<String>,
 }
 
 impl Member {
@@ -2074,6 +2078,7 @@ mod tests {
                 catalog_index: m,
                 position: m,
                 first_ns: u64::MAX,
+                epoch: None,
             })
             .collect();
         let group = crate::promql::QueryEngine::new(Arc::new(GroupSource::new(
@@ -2227,6 +2232,7 @@ mod tests {
                 catalog_index: m,
                 position: m,
                 first_ns: u64::MAX,
+                epoch: None,
             });
         }
         members
@@ -2313,6 +2319,7 @@ mod tests {
                 catalog_index: m,
                 position: m,
                 first_ns: u64::MAX,
+                epoch: None,
             })
             .collect();
         let conflicts = Arc::new(super::super::conflicts::Conflicts::default());
@@ -2362,6 +2369,7 @@ mod tests {
                     catalog_index: m,
                     position: m,
                     first_ns: u64::MAX,
+                    epoch: None,
                 })
                 .collect();
             let conflicts = Arc::new(super::super::conflicts::Conflicts::default());
@@ -2401,6 +2409,7 @@ mod tests {
                 catalog_index: m,
                 position: m,
                 first_ns: u64::MAX,
+                epoch: None,
             })
             .collect();
         let conflicts = Arc::new(super::super::conflicts::Conflicts::default());
@@ -2469,6 +2478,7 @@ mod tests {
             catalog_index: m,
             position: m,
             first_ns: u64::MAX,
+            epoch: None,
         })
         .collect()
     }
@@ -2632,6 +2642,7 @@ mod tests {
                 catalog_index: m,
                 position: m,
                 first_ns: u64::MAX,
+                epoch: None,
             })
             .collect();
         let end = 90 * S;

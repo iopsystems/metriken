@@ -484,7 +484,7 @@ impl<'a> Ctx<'a> {
     }
 }
 
-/// `rate`/`irate` of a matrix selector on the grid, computed by the source in
+/// `rate`/`irate`/`increase` of a matrix selector on the grid, computed by the source in
 /// one pass when it can (see [`crate::batch_rate`]). `None` for any other
 /// expression, for raw mode or explicit evaluation timestamps, and for a
 /// source that does not compute it: the caller then builds the per-series
@@ -528,7 +528,18 @@ fn scan_rates(
         let next = next_for_scan(&scan, from, name, filter, span, request.end_ns);
         return crate::batch_rate::grid_rates(scan, &request, next);
     };
-    let range = call.func.name == "rate";
+    // An increase over a group of several members sums its members' parts
+    // of the window (`group_increase`), which the union of the scan does
+    // not.
+    if call.func.name == "increase"
+        && groups
+            .parts
+            .iter()
+            .any(|p| matches!(p, per_source::Part::Group(m) if m.len() > 1))
+    {
+        return None;
+    }
+    let range = matches!(call.func.name, "rate" | "increase");
     let range_ns = match call.args.args.first().map(|a| &**a) {
         Some(Expr::MatrixSelector(sel)) => sel.range.as_nanos() as u64,
         _ => return None,
@@ -679,7 +690,7 @@ fn scan_rates(
     crate::batch_rate::grid_rates(metriken_storage::scan::interleave(scans), &request, next)
 }
 
-/// The metric, filter and request for a batch `rate`/`irate` of `call`, or
+/// The metric, filter and request for a batch `rate`/`irate`/`increase` of `call`, or
 /// `None` where the batch path does not apply; see [`batch_rates`].
 fn grid_request<'c, 'g>(
     ctx: &Ctx<'_>,
@@ -698,7 +709,7 @@ fn grid_request<'c, 'g>(
     {
         return None;
     }
-    if !matches!(call.func.name, "rate" | "irate") || call.args.args.len() != 1 {
+    if !matches!(call.func.name, "rate" | "irate" | "increase") || call.args.args.len() != 1 {
         return None;
     }
     let Expr::MatrixSelector(sel) = &*call.args.args[0] else {
@@ -716,8 +727,8 @@ fn grid_request<'c, 'g>(
     }
     let filter = selection.filter;
     let range_ns = sel.range.as_nanos() as u64;
-    // `rate` is over its `[range]`; `irate` over one step.
-    let range = call.func.name == "rate";
+    // `rate` and `increase` are over their `[range]`; `irate` over one step.
+    let range = matches!(call.func.name, "rate" | "increase");
     let (lookback, span_ns) = if range {
         (rate_lookback(ctx, name, range_ns), range_ns)
     } else {
@@ -730,6 +741,7 @@ fn grid_request<'c, 'g>(
         step_ns: ctx.step_ns,
         span_ns,
         range,
+        increase: call.func.name == "increase",
         reach_ns: rate_reach(ctx, name),
         group,
         display,
@@ -1315,7 +1327,7 @@ where
     if let Some(groups) = ctx.groups {
         if matches!(
             call.func.name,
-            "rate" | "irate" | "avg_over_time" | "idelta" | "deriv"
+            "rate" | "irate" | "increase" | "avg_over_time" | "idelta" | "deriv"
         ) {
             return build_per_source(ctx, groups, Leaf::Call(call));
         }
@@ -1349,11 +1361,13 @@ where
     };
 
     match call.func.name {
-        // `rate` is the rate over its `[range]` before each point; `irate`
-        // ignores the `[range]` and is the rate over one step, or between
-        // consecutive samples in raw mode (see `RateMode`).
-        "rate" | "irate" => {
-            let range = call.func.name == "rate";
+        // `rate` is the rate over its `[range]` before each point and
+        // `increase` the increase across it; `irate` ignores the `[range]`
+        // and is the rate over one step, or between consecutive samples in
+        // raw mode (see `RateMode`).
+        "rate" | "irate" | "increase" => {
+            let range = matches!(call.func.name, "rate" | "increase");
+            let increase = call.func.name == "increase";
             if let Some((series, _)) = batch_rates(ctx, call, None) {
                 return Ok(Built::Series {
                     series,
@@ -1432,6 +1446,7 @@ where
                             if range { range_ns } else { ctx.step_ns },
                         );
                         let rate = if range { rate.over_range(reach) } else { rate };
+                        let rate = if increase { rate.over_increase() } else { rate };
                         // Explicit timestamps replace the grid, so a value
                         // lands on a slow source's real reading instead of
                         // being interpolated to a grid point that source
@@ -1446,9 +1461,8 @@ where
                     }
                     // A point at every sample read, from before the range;
                     // the result is cut at `start` (`clip_raw`).
-                    RateMode::Raw if range => LabeledSeries::new(
-                        stream.labels,
-                        CounterGridRate::from_stream(
+                    RateMode::Raw if range => {
+                        let rate = CounterGridRate::from_stream(
                             stream.samples,
                             stream.windowed,
                             ctx.start_ns,
@@ -1457,8 +1471,10 @@ where
                             range_ns,
                         )
                         .over_range(reach)
-                        .at_samples(),
-                    ),
+                        .at_samples();
+                        let rate = if increase { rate.over_increase() } else { rate };
+                        LabeledSeries::new(stream.labels, rate)
+                    }
                     RateMode::Raw => LabeledSeries::new(
                         stream.labels,
                         // A pair spans up to four of the series' interval
@@ -1803,7 +1819,7 @@ impl<'e> Leaf<'e> {
     fn reads_counter(self, source: &dyn DataSource, name: &str) -> bool {
         match self {
             Leaf::Call(call) => match call.func.name {
-                "rate" | "irate" => true,
+                "rate" | "irate" | "increase" => true,
                 "deriv" => source.counter_names().iter().any(|n| n == name),
                 _ => false,
             },
@@ -1818,7 +1834,7 @@ impl<'e> Leaf<'e> {
         let gauge = || source.gauge_names().iter().any(|n| n == name);
         match self {
             Leaf::Call(call) => match call.func.name {
-                "rate" | "irate" => counter(),
+                "rate" | "irate" | "increase" => counter(),
                 "deriv" => counter() || gauge(),
                 _ => gauge(),
             },
@@ -1944,6 +1960,54 @@ where
         ranked.sort_by(|(ia, a), (ib, b)| {
             ia.cmp(ib).then_with(|| a.cmp_ties(b)).then(a.lo.cmp(&b.lo))
         });
+        if let Some((range_ns, offset_ns)) =
+            group_increase_range(ctx, leaf).filter(|_| ranked.len() > 1)
+        {
+            let selection = match leaf {
+                Leaf::Call(call) => match call.args.args.first().map(|a| &**a) {
+                    Some(Expr::MatrixSelector(sel)) => Selection::new(Some(name), &sel.vs.matchers),
+                    _ => unreachable!("group_increase_range takes a matrix selector"),
+                },
+                Leaf::Selector(_) => unreachable!("group_increase_range takes a call"),
+            };
+            let times: Vec<u64> = match &ctx.eval_timestamps {
+                Some(points) => points
+                    .iter()
+                    .copied()
+                    .filter(|t| (ctx.start_ns..=ctx.end_ns).contains(t))
+                    .collect(),
+                None if ctx.step_ns == 0 => vec![ctx.start_ns],
+                None => (ctx.start_ns..=ctx.end_ns)
+                    .step_by(usize::try_from(ctx.step_ns).unwrap_or(usize::MAX))
+                    .collect(),
+            };
+            // `offset`: each point is evaluated `offset` before its time
+            // and stamped at its time.
+            let shift = |t: u64| -> Option<u64> {
+                u64::try_from(i128::from(t) - i128::from(offset_ns)).ok()
+            };
+            let (shifted, stamps): (Vec<u64>, Vec<u64>) = times
+                .iter()
+                .filter_map(|&t| shift(t).map(|s| (s, t)))
+                .unzip();
+            let (Some(&first), Some(&last)) = (shifted.first(), shifted.last()) else {
+                continue;
+            };
+            let rows = ranked
+                .iter()
+                .map(|&(interval_ns, m)| {
+                    group_increase_rows(m, name, &selection, (first, last), range_ns, interval_ns)
+                })
+                .collect();
+            for (labels, mut points) in super::group_increase::increase(rows, &shifted, range_ns) {
+                for p in points.iter_mut() {
+                    let k = shifted.partition_point(|s| *s < p.t);
+                    p.t = stamps[k];
+                }
+                out.push((labels, points));
+            }
+            continue;
+        }
         // Every member is read over the whole range: a grid point
         // interpolates between rows on either side of its window's edges,
         // however far apart they are, so a narrower read can change a point.
@@ -1979,6 +2043,87 @@ where
         metric_name,
         metric_name_for_error: Some(name.to_string()),
     })
+}
+
+/// The `[range]` and `offset` (positive looking back) of `leaf` when it is
+/// a grid `increase` of a matrix selector without `@`, which over a group
+/// of several members is evaluated by [`super::group_increase`].
+fn group_increase_range(ctx: &Ctx<'_>, leaf: Leaf<'_>) -> Option<(u64, i64)> {
+    let Leaf::Call(call) = leaf else {
+        return None;
+    };
+    if call.func.name != "increase" || !matches!(ctx.rate_mode, RateMode::Grid) {
+        return None;
+    }
+    match call.args.args.first().map(|a| &**a) {
+        Some(Expr::MatrixSelector(sel)) if sel.vs.at.is_none() => {
+            let ns = |d: &std::time::Duration| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX);
+            let offset = match &sel.vs.offset {
+                None => 0,
+                Some(parser::Offset::Pos(d)) => ns(d),
+                Some(parser::Offset::Neg(d)) => -ns(d),
+            };
+            Some((sel.range.as_nanos() as u64, offset))
+        }
+        _ => None,
+    }
+}
+
+/// Member `m`'s samples of counter `name` for a group `increase` over
+/// `[range]` evaluated from `start_ns` to `end_ns`: its rows within its
+/// span from the start less the `[range]` and two reaches to the end, and
+/// each series' first row after the end (`next_samples`).
+fn group_increase_rows(
+    m: &per_source::Member,
+    name: &str,
+    selection: &Selection,
+    (start_ns, end_ns): (u64, u64),
+    range_ns: u64,
+    interval_ns: u64,
+) -> super::group_increase::MemberRows {
+    let reach = crate::batch_rate::interval_reach(interval_ns as f64 / 1e9);
+    let from = start_ns
+        .saturating_sub(range_ns.saturating_add(reach.saturating_mul(2)))
+        .max(m.lo);
+    let to = end_ns.min(m.hi);
+    let mut series: Vec<(crate::labels::Labels, Vec<crate::types::CounterSample>)> = match (from
+        <= to)
+        .then(|| m.source.counter_streams(name, &selection.filter, from, to))
+        .flatten()
+    {
+        Some(streams) => streams
+            .into_iter()
+            .filter(|s| selection.selects(&s.labels))
+            .map(|s| {
+                let samples = s
+                    .samples
+                    .filter(|x| (m.lo..=m.hi).contains(&x.ts))
+                    .collect();
+                (s.labels, samples)
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let labels: Vec<crate::labels::Labels> = series.iter().map(|(l, _)| l.clone()).collect();
+    let want: std::collections::HashSet<&crate::labels::Labels> = labels.iter().collect();
+    let mut next = next_samples(
+        m.source.as_ref(),
+        name,
+        &selection.filter,
+        (m.lo, m.hi),
+        end_ns,
+        &want,
+    );
+    for (labels, samples) in series.iter_mut() {
+        if let Some(s) = next.remove(labels) {
+            samples.push(s);
+        }
+    }
+    super::group_increase::MemberRows {
+        epoch: m.epoch.clone(),
+        interval_ns,
+        series,
+    }
 }
 
 #[cfg(test)]

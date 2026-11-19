@@ -6153,3 +6153,83 @@ fn a_bool_comparison_with_the_scalar_first_orders_the_bands() {
         Some(vec![(0.0, 0.0)])
     );
 }
+
+/// Over a whole window `increase(x[r])` is `rate(x[r])` times `r` in
+/// seconds: its points, and their acquisition-window bands, are the rate's
+/// times `r`, alone, aggregated and as an instant, with the rate's labels
+/// (`__name__` included where the rate keeps it).
+#[test]
+fn increase_is_the_rate_times_the_window() {
+    let mut source = Memory::new(1000);
+    for (x, per_s) in [("a", 10u64), ("b", 30)] {
+        let ts: Vec<u64> = (0u64..=300)
+            .map(|s| (1000 + s) * 1_000_000_000 + 300_000_000)
+            .collect();
+        source.add_counter(
+            "c",
+            Counter {
+                labels: make_labels(&[("x", x)]),
+                timestamps: ts.clone(),
+                values: (0u64..=300).map(|s| s * per_s).collect(),
+                windows: Some(ts.iter().map(|t| (t - 10_000_000, *t)).collect()),
+            },
+        );
+    }
+    let engine = QueryEngine::new(Arc::new(source));
+    for per_series in [false, true] {
+        let opts = QueryOptions::default().with_per_series_rates(per_series);
+        for (increase, rate, r) in [
+            ("increase(c[60s])", "rate(c[60s])", 60.0),
+            ("increase(c[1m30s])", "rate(c[1m30s])", 90.0),
+            ("sum(increase(c[60s]))", "sum(rate(c[60s]))", 60.0),
+            (
+                "sum by (x) (increase(c[60s]))",
+                "sum by (x) (rate(c[60s]))",
+                60.0,
+            ),
+        ] {
+            let matrix = |q: &str| {
+                let QueryResult::Matrix { result, .. } = engine
+                    .query_range_opts(q, 1100.0, 1200.0, 10.0, &opts)
+                    .unwrap_or_else(|e| panic!("{q}: {e}"))
+                else {
+                    panic!("{q}: not a matrix");
+                };
+                let mut result = result;
+                result.sort_by_key(|s| {
+                    let mut l: Vec<_> = s.metric.iter().collect();
+                    l.sort();
+                    format!("{l:?}")
+                });
+                result
+            };
+            let (inc, rat) = (matrix(increase), matrix(rate));
+            assert_eq!(inc.len(), rat.len(), "{increase}");
+            assert!(!inc.is_empty(), "{increase}");
+            for (i, s) in inc.iter().zip(&rat) {
+                assert_eq!(i.metric, s.metric, "{increase}");
+                assert_eq!(i.values.len(), s.values.len(), "{increase}");
+                for ((ti, vi), (ts, vs)) in i.values.iter().zip(&s.values) {
+                    assert_eq!(ti, ts, "{increase}");
+                    assert!(
+                        (vi - vs * r).abs() < 1e-6,
+                        "{increase} at {ti}: {vi} != {vs} * {r}"
+                    );
+                }
+                let bands = |m: &crate::MatrixSample| m.intervals.clone().expect("bands");
+                for ((ilo, ihi), (slo, shi)) in bands(i).iter().zip(&bands(s)) {
+                    assert!(
+                        (ilo - slo * r).abs() < 1e-6 && (ihi - shi * r).abs() < 1e-6,
+                        "{increase} band"
+                    );
+                }
+            }
+        }
+    }
+    let QueryResult::Vector { result, .. } =
+        engine.query("sum(increase(c[60s]))", Some(1200.0)).unwrap()
+    else {
+        panic!("not a vector");
+    };
+    assert!((result[0].value.1 - 2400.0).abs() < 1e-6, "{result:?}");
+}

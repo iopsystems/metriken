@@ -908,6 +908,301 @@ fn two_dumps_of_one_buffer_are_one_recording_with_a_gap() {
         .any(|p| (at(10, 12, 0)..at(10, 18, 0)).contains(&ns(p.0))));
 }
 
+/// `increase` over a process group sums its members' parts of the window:
+/// across a restart (a source with two producer epochs, one member each) a
+/// counter at 1000/s restarted at 10:05 gives, at 10:05:20, the 39,000 the
+/// first epoch read from 10:04:20 to its last row at 10:04:59 and the 20,000
+/// the second read from 10:05 (the second between them, across the
+/// restart, neither read), and 60,000 once the window is past the restart.
+/// Each path gives the same.
+#[test]
+fn increase_across_a_restart_sums_each_epochs_part() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("restart.dendro");
+    let restart = at(10, 5, 0);
+    let read = move |ts: u64| {
+        let value = if ts < restart {
+            10_000_000_000 + (ts - BASE) / MS
+        } else {
+            5_000_000_000 + (ts - restart) / MS
+        };
+        Read {
+            counters: vec![("cpu_cycles", value)],
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+            window: MS,
+        }
+    };
+    write(
+        &path,
+        &[spec(
+            &[("host", "a")],
+            &[("e1", at(10, 0, 0)), ("e2", restart)],
+            rows(at(10, 0, 0), at(10, 10, 0), S),
+            read,
+        )],
+    );
+    let reader = open(&path);
+    let s = one_series(
+        &reader,
+        "increase(cpu_cycles[1m])",
+        (at(10, 5, 20), at(10, 7, 0), 1.0),
+    );
+    let value = |t: u64| s.points.iter().find(|p| ns(p.0) == t).map(|p| p.1);
+    assert_eq!(value(at(10, 5, 20)), Some(59_000.0));
+    assert_eq!(value(at(10, 7, 0)), Some(60_000.0));
+}
+
+/// A record and a dump of one process (two sources of one producer epoch),
+/// for `increase`.
+fn record_and_dump(dir: &Path, record_rows: Vec<u64>, dump_rows: Vec<u64>) -> ArchiveReader {
+    let record = dir.join("record.dendro");
+    let one = |path: &Path, rows: Vec<u64>| {
+        write(
+            path,
+            &[spec(
+                &[("host", "a"), ("source", "rezolus")],
+                &[("e", at(10, 0, 0))],
+                rows,
+                cycles,
+            )],
+        )
+    };
+    one(&record, record_rows);
+    let buffer = dir.join("buffer.dendro");
+    one(&buffer, dump_rows);
+    let both = dir.join("both.dendro");
+    combine(&both, &[(&record, None), (&buffer, None)]);
+    let union = open(&both);
+    assert_eq!(union.read_groups().len(), 1);
+    union
+}
+
+/// Over a record to 10:10 and a dump from 10:05 to 10:20 of one process,
+/// `increase` counts the whole window where the record's rows end and the
+/// dump answers: a counter at 1000/s gives 60,000 at every point.
+#[test]
+fn increase_over_a_record_and_a_dump_counts_the_whole_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let union = record_and_dump(
+        dir.path(),
+        rows(at(10, 0, 0), at(10, 10, 0), S),
+        rows(at(10, 5, 0), at(10, 20, 0), S),
+    );
+    let s = one_series(
+        &union,
+        "increase(cpu_cycles[1m])",
+        (at(10, 8, 0), at(10, 15, 0), 1.0),
+    );
+    assert!(s.points.iter().any(|p| ns(p.0) == at(10, 10, 30)));
+    for &(t, v) in &s.points {
+        assert!(
+            (v - 60_000.0).abs() < 1e-6,
+            "at {}: {v}",
+            t - BASE as f64 / 1e9
+        );
+    }
+}
+
+/// Across a hole in the record's rows (10:12:00 to 10:12:19) that the dump
+/// does not cover, a group's `increase` is the record's alone: the
+/// counter's increase between the rows either side of the hole where the
+/// window holds both, and from the first row after it where the window
+/// starts inside it.
+#[test]
+fn increase_across_a_hole_no_member_read_is_the_members_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let hole = at(10, 12, 0)..at(10, 12, 20);
+    let record_rows: Vec<u64> = rows(at(10, 0, 0), at(10, 20, 0), S)
+        .into_iter()
+        .filter(|t| !hole.contains(t))
+        .collect();
+    let union = record_and_dump(
+        dir.path(),
+        record_rows.clone(),
+        rows(at(10, 5, 0), at(10, 10, 0), S),
+    );
+    let window = (at(10, 11, 30), at(10, 13, 30), 1.0);
+    let group = one_series(&union, "increase(cpu_cycles[1m])", window);
+    let alone_path = dir.path().join("alone.dendro");
+    write(
+        &alone_path,
+        &[spec(
+            &[("host", "a"), ("source", "rezolus")],
+            &[("e", at(10, 0, 0))],
+            record_rows,
+            cycles,
+        )],
+    );
+    let alone = one_series(&open(&alone_path), "increase(cpu_cycles[1m])", window);
+    assert!(group.points.iter().any(|p| ns(p.0) == at(10, 12, 20)));
+    for &(t, v) in &group.points {
+        let want = alone.points.iter().find(|p| p.0 == t).map(|p| p.1);
+        assert!(
+            want.is_some_and(|w| (v - w).abs() < 1e-6),
+            "at {}: {v} against {want:?}",
+            t - BASE as f64 / 1e9
+        );
+    }
+}
+
+/// Two recorders of one agent (one producer epoch) at 1 s and at 100 ms,
+/// over a counter that adds 1000 at 0.9 s past each second: where the
+/// recorders hand over, `increase(cpu_cycles[10s])` stays within one step
+/// of the counter's 10,000, as the coarse recorder's interpolated value at
+/// the handover is lower than the fine one's (a disagreement between two
+/// reads, not a reset).
+#[test]
+fn increase_over_two_recorders_at_different_intervals_counts_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("two.dendro");
+    let read = |window: u64| {
+        move |ts: u64| Read {
+            counters: vec![("cpu_cycles", 1000 * ((ts - BASE + 100 * MS) / S))],
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+            window,
+        }
+    };
+    write(
+        &path,
+        &[
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at(10, 0, 0), at(10, 4, 0), S),
+                read(10 * MS),
+            ),
+            spec(
+                &[("host", "a")],
+                &[("e", at(10, 0, 0))],
+                rows(at(10, 1, 0) + 550 * MS, at(10, 2, 0), 100 * MS),
+                read(MS),
+            ),
+        ],
+    );
+    let reader = open(&path);
+    let s = one_series(
+        &reader,
+        "increase(cpu_cycles[10s])",
+        (at(10, 1, 30), at(10, 3, 0), 1.0),
+    );
+    assert!(!s.points.is_empty());
+    for &(t, v) in &s.points {
+        assert!(
+            (v - 10_000.0).abs() <= 1000.0,
+            "at {}: {v}",
+            t - BASE as f64 / 1e9
+        );
+    }
+}
+
+/// Two copies of one process whose values disagree: the first, at 500 ms
+/// and so ranked first, ends at 10:02 and the second answers after it.
+/// `increase` adds nothing for the disagreement where they hand over: with
+/// the second reading 1000 more it counts 30,000, not 31,000, and with the
+/// first reading 10^9 more it takes the second's lower value for no reset.
+#[test]
+fn increase_over_disagreeing_copies_adds_nothing_at_the_handover() {
+    for (first_more, second_more) in [(0u64, 1000u64), (1_000_000_000, 0)] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("copies.dendro");
+        let read = move |more: u64| {
+            move |ts: u64| {
+                let mut read = cycles(ts);
+                read.counters = vec![("cpu_cycles", (ts - BASE) / MS + more)];
+                read
+            }
+        };
+        write(
+            &path,
+            &[
+                spec(
+                    &[("host", "a")],
+                    &[("e", at(10, 0, 0))],
+                    rows(at(10, 0, 0), at(10, 2, 0), 500 * MS),
+                    read(first_more),
+                ),
+                spec(
+                    &[("host", "a")],
+                    &[("e", at(10, 0, 0))],
+                    rows(at(10, 0, 0), at(10, 5, 0), S),
+                    read(second_more),
+                ),
+            ],
+        );
+        let reader = open(&path);
+        let s = one_series(
+            &reader,
+            "increase(cpu_cycles[30s])",
+            (at(10, 1, 40), at(10, 3, 0), 1.0),
+        );
+        assert!(s.points.iter().any(|p| ns(p.0) > at(10, 2, 0)));
+        for &(t, v) in &s.points {
+            assert!(
+                (v - 30_000.0).abs() < 1e-6,
+                "first +{first_more}, second +{second_more}: at {}: {v}",
+                t - BASE as f64 / 1e9
+            );
+        }
+    }
+}
+
+/// With `offset`, a group's `increase` is the sum over the shifted window:
+/// at 10:06:20 with `offset 1m` it is the 59,000 the restart test reads at
+/// 10:05:20. And a group's points end where its `rate`'s do, at the
+/// recording's last row.
+#[test]
+fn increase_over_a_group_with_offset_and_at_the_recordings_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("restart.dendro");
+    let restart = at(10, 5, 0);
+    let read = move |ts: u64| {
+        let value = if ts < restart {
+            10_000_000_000 + (ts - BASE) / MS
+        } else {
+            5_000_000_000 + (ts - restart) / MS
+        };
+        Read {
+            counters: vec![("cpu_cycles", value)],
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+            window: MS,
+        }
+    };
+    write(
+        &path,
+        &[spec(
+            &[("host", "a")],
+            &[("e1", at(10, 0, 0)), ("e2", restart)],
+            rows(at(10, 0, 0), at(10, 10, 0), S),
+            read,
+        )],
+    );
+    let reader = open(&path);
+    let shifted = one_series(
+        &reader,
+        "increase(cpu_cycles[1m] offset 1m)",
+        (at(10, 6, 20), at(10, 6, 20), 1.0),
+    );
+    assert_eq!(
+        shifted.points.iter().map(|p| p.1).collect::<Vec<_>>(),
+        vec![59_000.0]
+    );
+    let end = (at(10, 9, 50), at(10, 10, 10), 0.25);
+    let times = |q: &str| -> Vec<f64> {
+        one_series(&reader, q, end)
+            .points
+            .iter()
+            .map(|p| p.0)
+            .collect()
+    };
+    assert_eq!(
+        times("increase(cpu_cycles[1m])"),
+        times("rate(cpu_cycles[1m])")
+    );
+}
+
 /// Case 3: two recorders of one agent at once, at 1 s and 100 ms:
 /// `irate(cpu_cycles[5s])` at step 0.1 gives the 100 ms recording's points
 /// (1 ms windows; the 1 s recorder's are 10 ms) over its span.

@@ -224,6 +224,11 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   a 1 s step over rows between grid points). Under cross-cadence
   evaluation, when an evaluation timestamp falls in the range, it reads
   back from the last evaluation timestamp before the range's start.
+- **Added:** `increase(x[r])`: the counter's increase across the window
+  `rate(x[r])` is over. For a series that starts inside the window it is
+  the increase since its first row; it is not extrapolated to the window's
+  start. Over a process group it sums the members' parts of the window,
+  across a restart each epoch's own part.
 
 ### metriken-query 0.50.3
 
@@ -800,16 +805,6 @@ Requires metriken-storage 0.10.0.
   and labels, a histogram's included, keeps it, and that histogram gets no
   overflow series (warned once per endpoint, then logged at debug). A
   histogram without a `+Inf` bucket gets none either.
-
-### metriken-exposition 0.27.1
-
-- **Fixed:** in a long group, a slot whose metadata sets `id`, and a slot
-  with no metadata, got a new occupant key, and had its labels sent again,
-  on every `build_stream` after any change to the group's slot metadata. The
-  check for an unchanged occupant compared the cached `id` with the slot
-  number instead of the metadata's `id`, and expected no labels for a slot
-  without metadata, which has `id`. Both now keep their key while their own
-  metadata is unchanged.
 
 ### metriken-exposition 0.27.0
 

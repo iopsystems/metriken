@@ -162,6 +162,18 @@ fn pair_rate(
     })
 }
 
+/// `p`, a rate over a window `window_ns` long, as the increase across it:
+/// its value and band times the window's length in seconds. A window is
+/// shorter than the `[range]` where the series has no sample within the
+/// reach before the window's start (it starts inside the window, or has a
+/// gap there), so its increase is over the part of the window it was read.
+pub(crate) fn increase_point(mut p: Point, window_ns: u64) -> Point {
+    let s = window_ns as f64 / 1e9;
+    p.v *= s;
+    p.bounds = p.bounds.map(|(lo, hi)| (lo * s, hi * s));
+    p
+}
+
 /// Where a `rate`'s window `[from, at]` over `kept` (in time order) starts:
 /// at `from` when a sample at or before it is no more than `reach_ns` before
 /// it, so that the value at `from` interpolates from that sample; otherwise
@@ -243,6 +255,9 @@ pub struct CounterGridRate<'a> {
     /// starts as [`range_start`] says with `reach_ns`.
     range: bool,
     reach_ns: u64,
+    /// `increase(x[r])`: each point is the increase across its window
+    /// rather than the rate ([`increase_point`]).
+    increase: bool,
     /// Emit at each sample time rather than on the grid or at `points`: the
     /// time of the last sample emitted at, or `None` before the first.
     samples: Option<Option<u64>>,
@@ -316,6 +331,7 @@ impl<'a> CounterGridRate<'a> {
             step_ns,
             span_ns: span_ns.max(1),
             range: false,
+            increase: false,
             reach_ns: 0,
             samples: None,
 
@@ -497,6 +513,13 @@ impl<'a> CounterGridRate<'a> {
     pub(crate) fn over_range(mut self, reach_ns: u64) -> Self {
         self.range = true;
         self.reach_ns = reach_ns;
+        self
+    }
+
+    /// `increase(x[r])`: each point is the increase across its window,
+    /// the rate times the window's length ([`increase_point`]).
+    pub(crate) fn over_increase(mut self) -> Self {
+        self.increase = true;
         self
     }
 
@@ -700,6 +723,9 @@ impl<'a> Iterator for CounterGridRate<'a> {
                 interpolated,
                 timing: false,
             };
+            if self.increase {
+                return Some(increase_point(point, at - from));
+            }
             return Some(point);
         }
         None
