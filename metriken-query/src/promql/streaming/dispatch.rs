@@ -314,6 +314,24 @@ fn rate_lookback(ctx: &Ctx<'_>, name: &str, range_ns: u64) -> u64 {
     range_ns.saturating_add(rate_reach(ctx, name).saturating_mul(2))
 }
 
+/// How far before the range's start a grid `irate(name[range])` reads:
+/// [`rate_lookback`] over the span its first point is over (the step, a
+/// reach to the row at or before the span's start, and a reach for a point
+/// held past a series' last sample), or the `[range]` when that is further.
+/// With explicit evaluation timestamps a point is over the gap from the
+/// timestamp before it, so the span is from the last timestamp before the
+/// range's start, when there is one, a timestamp falls in the range, and it
+/// is further back than a step.
+fn irate_lookback(ctx: &Ctx<'_>, name: &str, range_ns: u64) -> u64 {
+    let before = ctx.eval_timestamps.as_deref().and_then(|ts| {
+        let first = ts.partition_point(|t| *t < ctx.start_ns);
+        ts.get(first).filter(|t| **t <= ctx.end_ns)?;
+        first.checked_sub(1).map(|i| ctx.start_ns - ts[i])
+    });
+    let span = before.unwrap_or(0).max(ctx.step_ns);
+    range_ns.max(rate_lookback(ctx, name, span))
+}
+
 /// In raw mode, `series` without the points before the range's start and
 /// without timing points.
 ///
@@ -518,12 +536,11 @@ fn scan_rates(
     // What a part's read starts at: as `grid_request` computes it over that
     // part alone.
     let data_start = |source: &dyn DataSource| -> u64 {
+        let reach = crate::batch_rate::interval_reach(source.counter_interval(name));
         let lookback = if range {
-            range_ns.saturating_add(
-                crate::batch_rate::interval_reach(source.counter_interval(name)).saturating_mul(2),
-            )
+            range_ns.saturating_add(reach.saturating_mul(2))
         } else {
-            range_ns.max(ctx.step_ns)
+            range_ns.max(ctx.step_ns.saturating_add(reach.saturating_mul(2)))
         };
         ctx.start_ns.saturating_sub(lookback)
     };
@@ -704,7 +721,7 @@ fn grid_request<'c, 'g>(
     let (lookback, span_ns) = if range {
         (rate_lookback(ctx, name, range_ns), range_ns)
     } else {
-        (range_ns.max(ctx.step_ns), ctx.step_ns)
+        (irate_lookback(ctx, name, range_ns), ctx.step_ns)
     };
     let request = crate::batch_rate::GridRateRequest {
         data_start: ctx.start_ns.saturating_sub(lookback),
@@ -1289,13 +1306,14 @@ where
                 });
             }
             // A `rate` reads back its window (`rate_lookback`). An `irate`
-            // on the grid needs at least one step of lookback to bracket the
-            // first interval's left edge. Raw reads as `raw_read_back` says:
-            // a raw `rate` over its window, a raw `irate` over the pair, no
-            // further apart than four of its interval (`max_gap`).
+            // on the grid reads back its step and two reaches, to bracket
+            // the first interval's left edge (`irate_lookback`). Raw reads
+            // as `raw_read_back` says: a raw `rate` over its window, a raw
+            // `irate` over the pair, no further apart than four of its
+            // interval (`max_gap`).
             let lookback = match (ctx.rate_mode, range) {
                 (RateMode::Grid, true) => rate_lookback(ctx, metric_name, range_ns),
-                (RateMode::Grid, false) => range_ns.max(ctx.step_ns),
+                (RateMode::Grid, false) => irate_lookback(ctx, metric_name, range_ns),
                 (RateMode::Raw, true) => {
                     raw_read_back(ctx, rate_lookback(ctx, metric_name, range_ns))
                 }

@@ -204,6 +204,16 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   every bound an integer), that it applies to `OVERFLOW_BOUND_KEY` too,
   and which readers divide by it.
 
+### metriken-query (unreleased)
+
+- **Fixed:** a grid `irate` reads back its step and four of the
+  counter's intervals, or its `[range]` when that is longer, so the
+  range's first point is no longer missing when the `[range]` did not
+  reach the row at or before `start - step` (for example `irate(x[1s])` at
+  a 1 s step over rows between grid points). Under cross-cadence
+  evaluation, when an evaluation timestamp falls in the range, it reads
+  back from the last evaluation timestamp before the range's start.
+
 ### metriken-query 0.50.3
 
 - **Fixed:** strided histogram functions read each series' rows after the
