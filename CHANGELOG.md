@@ -224,6 +224,11 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   a 1 s step over rows between grid points). Under cross-cadence
   evaluation, when an evaluation timestamp falls in the range, it reads
   back from the last evaluation timestamp before the range's start.
+- **Added:** `increase(x[r])`: the counter's increase across the window
+  `rate(x[r])` is over. For a series that starts inside the window it is
+  the increase since its first row; it is not extrapolated to the window's
+  start. Over a process group it sums the members' parts of the window,
+  across a restart each epoch's own part.
 
 ### metriken-query 0.50.3
 
