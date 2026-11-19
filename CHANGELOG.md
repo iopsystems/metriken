@@ -792,11 +792,13 @@ Requires metriken-storage 0.10.0.
 
 ### metriken-exposition (unreleased)
 
-- **Fixed:** a slot whose metadata sets `id` kept a new occupant key, and
-  had its labels sent again, on every `build_stream` after any change to its
-  group's slot metadata. The check for an unchanged occupant compared the
-  cached `id` with the slot number instead of the metadata's `id`. Such a
-  slot now keeps its key while its own metadata is unchanged.
+- **Fixed:** in a long group, a slot whose metadata sets `id`, and a slot
+  with no metadata, got a new occupant key, and had its labels sent again,
+  on every `build_stream` after any change to the group's slot metadata. The
+  check for an unchanged occupant compared the cached `id` with the slot
+  number instead of the metadata's `id`, and expected no labels for a slot
+  without metadata, which has `id`. Both now keep their key while their own
+  metadata is unchanged.
 
 ### metriken-exposition 0.27.0
 

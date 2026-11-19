@@ -1266,12 +1266,11 @@ pub struct LongMember {
     /// [`UID_LABEL`]: metriken::group::UID_LABEL
     pub key: u64,
     /// `id` (the slot, unless the slot's metadata sets `id`) and the slot's
-    /// metadata: the labels a wide member
-    /// carries beyond its metric's. Taken from the first of the group's
-    /// metrics, in registry order, that walks the slot this build, or the
-    /// labels cached from the last build when that metric's metadata
-    /// version is unchanged; a group whose metrics carry different metadata
-    /// for one slot shows only one metric's.
+    /// metadata: the labels a wide member carries beyond its metric's. Taken
+    /// from the first of the group's metrics, in registry order, that walks
+    /// the slot this build, or the labels cached from the last build when
+    /// that metric's metadata version is unchanged; a group whose metrics
+    /// carry different metadata for one slot shows only one metric's.
     pub labels: Arc<BTreeMap<String, String>>,
     /// One per counter column, `None` where the metric has no value.
     pub counters: Vec<Option<u64>>,
@@ -1394,7 +1393,9 @@ fn slot_occupant(
     let want_id = m.and_then(|m| m.get("id")).unwrap_or(&id);
     let same = uid.is_none()
         && cached.is_some_and(|c| {
-            let extra = m.map_or(0, |m| usize::from(!m.contains_key("id")));
+            // The built labels add `id` unless the metadata has one; with no
+            // metadata they are `id` alone.
+            let extra = m.map_or(1, |m| usize::from(!m.contains_key("id")));
             c.labels.get("id") == Some(want_id)
                 && c.labels.len() == m.map_or(0, HashMap::len) + extra
                 && m.is_none_or(|m| {
