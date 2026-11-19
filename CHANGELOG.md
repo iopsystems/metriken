@@ -217,6 +217,13 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   zero) no longer lets a join hold the point before it across it.
 - **Changed:** a scalar operation that leaves a histogram function's
   series without points drops the series, as the streaming path does.
+- **Fixed:** a grid `irate` reads back its step and four of the
+  counter's intervals, or its `[range]` when that is longer, so the
+  range's first point is no longer missing when the `[range]` did not
+  reach the row at or before `start - step` (for example `irate(x[1s])` at
+  a 1 s step over rows between grid points). Under cross-cadence
+  evaluation, when an evaluation timestamp falls in the range, it reads
+  back from the last evaluation timestamp before the range's start.
 
 ### metriken-query 0.50.3
 
