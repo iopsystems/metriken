@@ -1260,7 +1260,7 @@ pub struct LongMember {
     /// the order occupants first appear, and a slot gets a new one when its
     /// occupant changes: a new [`UID_LABEL`], new labels on a slot without
     /// one, or, in a group with a [`Membership::Slots`] metric, a return
-    /// after a build in which the slot carried no slot metadata. Small
+    /// after a build in which no metric of the group walked the slot. Small
     /// numbers keep a long row short on the wire.
     ///
     /// [`UID_LABEL`]: metriken::group::UID_LABEL
