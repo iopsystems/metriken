@@ -104,7 +104,7 @@ macro_rules! impl_at_points {
     )+};
 }
 
-impl_at_points!(GaugeStepGrid, GaugeAvgOverTime, GaugeIdelta, GaugeDeriv);
+impl_at_points!(GaugeStepGrid, GaugeOverTime, GaugeIdelta, GaugeDeriv);
 
 /// Value `i` of a gauge series, as an `f64`: an integer gauge's converted,
 /// a float gauge's as stored.
@@ -163,35 +163,210 @@ impl Iterator for GaugeStepGrid {
     }
 }
 
-pub struct GaugeAvgOverTime {
+/// The aggregation of a `*_over_time` function over the values of a
+/// window, as Prometheus defines it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum OverTime {
+    Avg,
+    Min,
+    Max,
+    Sum,
+    Count,
+    Last,
+    Present,
+    /// Population variance.
+    StdVar,
+    /// Population standard deviation.
+    StdDev,
+    /// `quantile_over_time(q, ..)`.
+    Quantile(f64),
+}
+
+impl OverTime {
+    /// The aggregation of the `*_over_time` function `name`, other than
+    /// `quantile_over_time`, which takes its quantile as an argument.
+    pub(crate) fn of(name: &str) -> Option<Self> {
+        Some(match name {
+            "avg_over_time" => Self::Avg,
+            "min_over_time" => Self::Min,
+            "max_over_time" => Self::Max,
+            "sum_over_time" => Self::Sum,
+            "count_over_time" => Self::Count,
+            "last_over_time" => Self::Last,
+            "present_over_time" => Self::Present,
+            "stdvar_over_time" => Self::StdVar,
+            "stddev_over_time" => Self::StdDev,
+            _ => return None,
+        })
+    }
+
+    /// The aggregation of `values`, which is not empty, as Prometheus
+    /// computes each: sums, means and variances with its Kahan-Neumaier
+    /// compensation (an infinite sum ends the compensation, and a mean
+    /// whose sum overflows is taken incrementally), the variance by
+    /// Welford's method, so a constant window's is 0. `min` and `max` leave
+    /// out NaN unless every value is NaN. A quantile below 0 is -inf, above
+    /// 1 +inf, and NaN for a NaN quantile; otherwise it interpolates
+    /// linearly between the values either side of rank `q·(n − 1)`, NaN
+    /// sorting first, and is the lower value where the rank is whole or the
+    /// two are the same.
+    pub(crate) fn reduce(self, values: &[f64]) -> f64 {
+        let n = values.len() as f64;
+        match self {
+            Self::Avg => mean(values),
+            Self::Min => values.iter().copied().fold(f64::NAN, f64::min),
+            Self::Max => values.iter().copied().fold(f64::NAN, f64::max),
+            Self::Sum => {
+                let (sum, c) = values
+                    .iter()
+                    .fold((0.0, 0.0), |(sum, c), &v| kahan_inc(v, sum, c));
+                if sum.is_infinite() {
+                    sum
+                } else {
+                    sum + c
+                }
+            }
+            Self::Count => n,
+            Self::Last => *values.last().expect("not empty"),
+            Self::Present => 1.0,
+            Self::StdVar | Self::StdDev => {
+                let var = variance(values);
+                if self == Self::StdDev {
+                    var.sqrt()
+                } else {
+                    var
+                }
+            }
+            Self::Quantile(q) => {
+                if q.is_nan() {
+                    return f64::NAN;
+                }
+                if q < 0.0 {
+                    return f64::NEG_INFINITY;
+                }
+                if q > 1.0 {
+                    return f64::INFINITY;
+                }
+                let mut sorted = values.to_vec();
+                sorted.sort_by(|a, b| match (a.is_nan(), b.is_nan()) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => a.total_cmp(b),
+                });
+                let rank = q * (n - 1.0);
+                let lower = rank.floor() as usize;
+                let upper = (lower + 1).min(sorted.len() - 1);
+                let weight = rank - rank.floor();
+                let (lo, hi) = (sorted[lower], sorted[upper]);
+                if weight == 0.0 || lo.to_bits() == hi.to_bits() {
+                    return lo;
+                }
+                lo * (1.0 - weight) + hi * weight
+            }
+        }
+    }
+}
+
+/// `inc` added to the compensated sum `(sum, c)`: Prometheus's
+/// `kahansum.Inc`.
+fn kahan_inc(inc: f64, sum: f64, mut c: f64) -> (f64, f64) {
+    let t = sum + inc;
+    if t.is_infinite() {
+        c = 0.0;
+    } else if sum.abs() >= inc.abs() {
+        c += (sum - t) + inc;
+    } else {
+        c += (inc - t) + sum;
+    }
+    (t, c)
+}
+
+/// The mean of `values` as Prometheus's `avg_over_time` takes it: a
+/// compensated sum over the count, and an incremental mean from the point
+/// the sum overflows.
+fn mean(values: &[f64]) -> f64 {
+    let (mut sum, mut c, mut mean, mut count) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+    let mut incremental = false;
+    for &f in values {
+        count += 1.0;
+        if !incremental {
+            let (new_sum, new_c) = kahan_inc(f, sum, c);
+            if count == 1.0 || !new_sum.is_infinite() {
+                (sum, c) = (new_sum, new_c);
+                continue;
+            }
+            incremental = true;
+            mean = sum / (count - 1.0);
+            c /= count - 1.0;
+        }
+        let q = (count - 1.0) / count;
+        (mean, c) = kahan_inc(f / count, q * mean, q * c);
+    }
+    if incremental {
+        mean + c
+    } else {
+        sum / count + c / count
+    }
+}
+
+/// The population variance of `values` as Prometheus's
+/// `stdvar_over_time` takes it: Welford's method with compensated sums.
+fn variance(values: &[f64]) -> f64 {
+    let (mut count, mut mean, mut c_mean, mut aux, mut c_aux) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for &f in values {
+        count += 1.0;
+        let delta = f - (mean + c_mean);
+        (mean, c_mean) = kahan_inc(delta / count, mean, c_mean);
+        (aux, c_aux) = kahan_inc(delta * (f - (mean + c_mean)), aux, c_aux);
+    }
+    (aux + c_aux) / count
+}
+
+/// A `*_over_time` function of a series: at each evaluation time `t`, the
+/// aggregation of its values stamped in `[t − range, t]`, both ends
+/// included, each counted once. A window with no value gives no point; one
+/// holding an interpolated value gives an interpolated point.
+pub struct GaugeOverTime {
     timestamps: Vec<u64>,
-    values: GaugeValues,
+    values: Vec<f64>,
+    interpolated: Vec<bool>,
     end_ns: u64,
     range_ns: u64,
+    agg: OverTime,
     place: Placement,
 }
 
-impl GaugeAvgOverTime {
-    pub fn new(
+impl GaugeOverTime {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         timestamps: Vec<u64>,
-        values: GaugeValues,
+        values: Vec<f64>,
+        interpolated: Vec<bool>,
         start_ns: u64,
         end_ns: u64,
         step_ns: u64,
         range_ns: u64,
         raw: bool,
+        agg: OverTime,
     ) -> Self {
         Self {
             timestamps,
             values,
+            interpolated,
             end_ns,
             range_ns,
+            agg,
             place: Placement::new(raw, start_ns, step_ns),
         }
     }
+
+    /// A gauge's values as `f64`.
+    pub(crate) fn gauge_values(values: &GaugeValues) -> Vec<f64> {
+        (0..values.len()).map(|i| value_at(values, i)).collect()
+    }
 }
 
-impl Iterator for GaugeAvgOverTime {
+impl Iterator for GaugeOverTime {
     type Item = Point;
 
     fn next(&mut self) -> Option<Point> {
@@ -204,13 +379,12 @@ impl Iterator for GaugeAvgOverTime {
             if hi == lo {
                 continue;
             }
-
-            let mut sum = 0.0_f64;
-            let count = hi - lo;
-            for i in lo..hi {
-                sum += value_at(&self.values, i);
-            }
-            return Some(Point::at(t, sum / count as f64));
+            let mut p = Point::at(t, self.agg.reduce(&self.values[lo..hi]));
+            p.interpolated = self
+                .interpolated
+                .get(lo..hi)
+                .is_some_and(|f| f.iter().any(|x| *x));
+            return Some(p);
         }
     }
 }

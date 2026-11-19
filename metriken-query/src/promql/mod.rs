@@ -718,6 +718,38 @@ fn instant_histogram_lookback(source: &dyn crate::DataSource, query: &str) -> f6
     }
 }
 
+/// Whether `expr` calls a histogram function outside every subquery.
+fn histogram_call_outside_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::Subquery(_) => false,
+        Expr::Call(call) => {
+            call.func.name.starts_with("histogram_")
+                || call
+                    .args
+                    .args
+                    .iter()
+                    .any(|a| histogram_call_outside_subquery(a))
+        }
+        Expr::Aggregate(agg) => {
+            histogram_call_outside_subquery(&agg.expr)
+                || agg
+                    .param
+                    .as_deref()
+                    .is_some_and(histogram_call_outside_subquery)
+        }
+        Expr::Unary(u) => histogram_call_outside_subquery(&u.expr),
+        Expr::Binary(b) => {
+            histogram_call_outside_subquery(&b.lhs) || histogram_call_outside_subquery(&b.rhs)
+        }
+        Expr::Paren(p) => histogram_call_outside_subquery(&p.expr),
+        Expr::VectorSelector(_)
+        | Expr::MatrixSelector(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::Extension(_) => false,
+    }
+}
+
 /// Whether `query` calls one of the histogram functions that give a value
 /// per tick, with or without a `by`/`without` clause after its name.
 /// `histogram_heatmap` is left out: an unstrided one's instant is the
@@ -1448,7 +1480,11 @@ impl QueryEngine {
         // A histogram function emits at the rows it reads, which an instant
         // rarely falls on, and needs the row before for a delta: it reads
         // back a few rows, and each series' latest point is kept below.
-        let start = if calls_histogram_function(query_str) {
+        // A histogram call inside a subquery is read over the subquery's
+        // range, so it needs no read back here.
+        let start = if calls_histogram_function(query_str)
+            && parser::parse(query_str).map_or(true, |e| histogram_call_outside_subquery(&e))
+        {
             target - instant_histogram_lookback(&*self.source, query_str)
         } else {
             target

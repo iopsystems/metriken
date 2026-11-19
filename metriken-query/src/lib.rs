@@ -31,6 +31,27 @@
 //!   weighted by how long each value held: over a window holding rows 100 ms
 //!   apart and rows 1 s apart, each fine row weighs as much as each coarse
 //!   one.
+//! * `min_over_time`, `max_over_time`, `sum_over_time`, `count_over_time`,
+//!   `last_over_time`, `present_over_time`, `stdvar_over_time`,
+//!   `stddev_over_time` and `quantile_over_time(q, g[r])` aggregate the same
+//!   samples of a gauge; a counter is refused, as for `avg_over_time`.
+//!   Variances are the population's. A quantile's `q` must be a number; it
+//!   interpolates linearly between ranks, with NaN values sorting first.
+//!   Sums, means and variances are computed as Prometheus computes them.
+//!   Each keeps the metric name, as `rate` does here; Prometheus keeps it
+//!   only for `last_over_time` (and `first_over_time`, which this engine
+//!   does not evaluate).
+//! * A `*_over_time` function of a subquery, `f(expr[r:s])`, evaluates
+//!   `expr` on the grid at the multiples of `s` and aggregates at `t` the
+//!   inner points in `(t − r, t]`, as Prometheus does. Without `s` it is
+//!   the query's step (for an instant, the source's interval, at least a
+//!   second), where Prometheus uses its evaluation interval. A
+//!   `histogram_quantile`'s points, one per row, are taken onto that grid;
+//!   the other histogram functions are refused inside a subquery. The
+//!   points carry no band and no metric name (Prometheus keeps the name for
+//!   `last_over_time`), and are on the grid in raw mode too. A subquery with `offset` or `@`, of a scalar, or of more than
+//!   100,000 inner points per series, and any other function of a
+//!   subquery, are refused.
 //! * An unstrided histogram function (`histogram_quantile(q, h)`,
 //!   `histogram_quantiles([..], h)`, `histogram_count(h)`, `histogram_sum(h)`,
 //!   `histogram_mean(h)`, `histogram_irate(h)`, and `histogram_heatmap(h)`,

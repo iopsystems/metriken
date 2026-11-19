@@ -36,8 +36,8 @@ use promql_parser::parser::{self, Expr};
 use crate::promql::streaming::{
     aggregate, braces, collect_to_matrix, distinct_label_sets, interval_binop, matrix_grouped_op,
     matrix_matrix_op, matrix_scalar_op, AggOp, AtPoints, BinOp, CounterGridRate,
-    CounterPairwiseRate, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid, GroupBy, Join,
-    LabeledSeries, MatchSpec, OneSide, SeriesSet,
+    CounterPairwiseRate, GaugeDeriv, GaugeIdelta, GaugeOverTime, GaugeStepGrid, GroupBy, Join,
+    LabeledSeries, MatchSpec, OneSide, OverTime, SeriesSet,
 };
 use crate::promql::Selection;
 use crate::promql::{nothing_read, MatrixSample, MetricKind, QueryError, QueryResult};
@@ -136,6 +136,20 @@ fn make_ctx<'a>(
 /// two of the longest interval of a metric the query reads, whichever is
 /// longer.
 fn raw_hold(source: &dyn DataSource, expr: &Expr, step_ns: u64) -> u64 {
+    let interval = metric_names(expr)
+        .iter()
+        .map(|n| {
+            source
+                .counter_interval(n)
+                .max(source.gauge_interval(n))
+                .max(source.histogram_interval(n))
+        })
+        .fold(source.interval(), f64::max);
+    step_ns.saturating_mul(2).max((interval * 2e9) as u64)
+}
+
+/// The names of the metrics `expr`'s selectors read.
+fn metric_names(expr: &Expr) -> Vec<String> {
     fn walk(expr: &Expr, names: &mut Vec<String>) {
         match expr {
             Expr::Aggregate(a) => walk(&a.expr, names),
@@ -158,16 +172,30 @@ fn raw_hold(source: &dyn DataSource, expr: &Expr, step_ns: u64) -> u64 {
     }
     let mut names = Vec::new();
     walk(expr, &mut names);
-    let interval = names
-        .iter()
-        .map(|n| {
-            source
-                .counter_interval(n)
-                .max(source.gauge_interval(n))
-                .max(source.histogram_interval(n))
-        })
-        .fold(source.interval(), f64::max);
-    step_ns.saturating_mul(2).max((interval * 2e9) as u64)
+    names
+}
+
+/// The name of a histogram function other than `histogram_quantile`
+/// called in `expr`, which a subquery does not evaluate.
+fn histogram_call_besides_quantile(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Call(call) => {
+            if call.func.name.starts_with("histogram_") && call.func.name != "histogram_quantile" {
+                return Some(call.func.name);
+            }
+            call.args
+                .args
+                .iter()
+                .find_map(|a| histogram_call_besides_quantile(a))
+        }
+        Expr::Aggregate(a) => histogram_call_besides_quantile(&a.expr),
+        Expr::Unary(u) => histogram_call_besides_quantile(&u.expr),
+        Expr::Binary(b) => histogram_call_besides_quantile(&b.lhs)
+            .or_else(|| histogram_call_besides_quantile(&b.rhs)),
+        Expr::Paren(p) => histogram_call_besides_quantile(&p.expr),
+        Expr::Subquery(s) => histogram_call_besides_quantile(&s.expr),
+        _ => None,
+    }
 }
 
 /// How many joins (aggregations and operators between two series sets) are
@@ -1311,6 +1339,239 @@ where
     })
 }
 
+/// The most inner points one series of a subquery may have.
+const MAX_SUBQUERY_POINTS: u64 = 100_000;
+
+/// A `*_over_time` function of a subquery `expr[range:step]`: `expr`
+/// evaluated on the grid at the multiples of `step` from the first after
+/// the range's start less `range` to its end, then aggregated at each of the
+/// query's points over the inner points in `(t − range, t]`, as Prometheus
+/// evaluates one. Without `step` it is the query's step (for an instant,
+/// the source's interval, at least a second; Prometheus uses its
+/// evaluation interval). A `histogram_quantile`'s points, one per row, are
+/// taken onto the inner grid ([`on_grid`]), read from a lookback before it;
+/// the other histogram functions are refused inside a subquery.
+/// The points carry no band and no metric name (Prometheus keeps the name
+/// for `last_over_time` of a subquery whose points carry one); one
+/// aggregating an
+/// interpolated inner point is interpolated. In raw mode the points are on
+/// the grid too. A subquery with `offset` or `@`, of a scalar, or of more
+/// than [`MAX_SUBQUERY_POINTS`] inner points per series is refused.
+fn build_subquery_over_time<'a, 'expr>(
+    ctx: &'a Ctx<'a>,
+    call: &'expr parser::Call,
+    sq: &'expr parser::SubqueryExpr,
+) -> Result<Built<'a>, QueryError>
+where
+    'expr: 'a,
+{
+    if sq.offset.is_some() || sq.at.is_some() {
+        return Err(QueryError::Unsupported(
+            "a subquery with offset or @ is not supported".to_string(),
+        ));
+    }
+    let agg = over_time_agg(call)?;
+    let range_ns = sq.range.as_nanos() as u64;
+    let step_ns = sq
+        .step
+        .map(|d| d.as_nanos() as u64)
+        .filter(|s| *s > 0)
+        .unwrap_or(if ctx.step_ns > 0 {
+            ctx.step_ns
+        } else {
+            1_000_000_000
+        });
+    // The first multiple of the step after the first window's start.
+    let inner_start = (ctx.start_ns.saturating_sub(range_ns) / step_ns + 1).saturating_mul(step_ns);
+    let per_series = ctx.end_ns.saturating_sub(inner_start) / step_ns + 1;
+    if per_series > MAX_SUBQUERY_POINTS {
+        return Err(QueryError::Unsupported(format!(
+            "this subquery evaluates {per_series} points per series, more than \
+             {MAX_SUBQUERY_POINTS}; use a larger subquery step or a shorter range"
+        )));
+    }
+    if let Some(name) = histogram_call_besides_quantile(&sq.expr) {
+        return Err(QueryError::Unsupported(format!(
+            "{name} is not evaluated inside a subquery; histogram_quantile is"
+        )));
+    }
+    // The inner expression is read from a lookback before the grid's first
+    // point (the range, at least a step, and at least the row interval of a
+    // histogram it reads, in whole steps), so a histogram's row before it is
+    // there to take onto the grid; the points before the grid are dropped.
+    let histogram_ns = metric_names(&sq.expr)
+        .iter()
+        .map(|n| (ctx.source.histogram_interval(n).max(0.0) * 1e9) as u64)
+        .max()
+        .unwrap_or(0);
+    let lookback = range_ns
+        .max(step_ns)
+        .max(histogram_ns)
+        .div_ceil(step_ns)
+        .saturating_mul(step_ns);
+    let inner = Ctx {
+        source: ctx.source,
+        next_source: ctx.next_source,
+        groups: ctx.groups,
+        start_ns: inner_start.saturating_sub(lookback),
+        end_ns: ctx.end_ns,
+        step_ns,
+        rate_mode: RateMode::Grid,
+        eval_timestamps: None,
+        per_series_rates: ctx.per_series_rates,
+        recording_keys: ctx.recording_keys.clone(),
+        raw_hold_ns: 0,
+        raw_depth: ctx.raw_depth,
+    };
+    /// One inner series: its labels, and its points' times, values and
+    /// interpolated flags.
+    type Inner = (crate::labels::Labels, Vec<u64>, Vec<f64>, Vec<bool>);
+    let series: Vec<Inner> = if inner_start > ctx.end_ns {
+        Vec::new()
+    } else {
+        match build(&inner, &sq.expr)? {
+            Built::Series { series, .. } => series
+                .into_iter()
+                .map(|ls| {
+                    let (mut ts, mut vs, mut fs) = (Vec::new(), Vec::new(), Vec::new());
+                    for p in ls.iter.filter(|p| !p.timing && p.t >= inner_start) {
+                        ts.push(p.t);
+                        vs.push(p.v);
+                        fs.push(p.interpolated);
+                    }
+                    (ls.labels, ts, vs, fs)
+                })
+                .collect(),
+            Built::Materialized { result, name } => result
+                .into_iter()
+                .map(|m| {
+                    let labels = crate::labels::Labels {
+                        inner: m
+                            .metric
+                            .into_iter()
+                            .filter(|(k, _)| k != "__name__")
+                            .collect(),
+                    };
+                    let rows: Vec<(u64, f64)> = m
+                        .values
+                        .iter()
+                        .map(|&(t, v)| ((t * 1e9).round() as u64, v))
+                        .collect();
+                    let lone = (ctx
+                        .source
+                        .histogram_interval(&name)
+                        .max(ctx.source.interval())
+                        .max(0.0)
+                        * 1e9) as u64;
+                    let (ts, vs) = on_grid(&rows, inner_start, ctx.end_ns, step_ns, lone);
+                    let fs = vec![false; ts.len()];
+                    (labels, ts, vs, fs)
+                })
+                .collect(),
+            Built::Scalar(_) => {
+                return Err(QueryError::Unsupported(
+                    "a subquery of a scalar is not supported".to_string(),
+                ))
+            }
+        }
+    };
+    let out: SeriesSet<'a> = series
+        .into_iter()
+        .map(|(labels, timestamps, values, interpolated)| {
+            // `(t − range, t]`: a window of `range` less a nanosecond, both
+            // ends included.
+            let producer = ctx.place(GaugeOverTime::new(
+                timestamps,
+                values,
+                interpolated,
+                ctx.start_ns,
+                ctx.end_ns,
+                ctx.step_ns,
+                range_ns.saturating_sub(1),
+                false,
+                agg,
+            ));
+            LabeledSeries::new(labels, producer)
+        })
+        .collect();
+    // A function of a subquery has no metric name; the plain functions
+    // keep theirs, as `rate` does here.
+    Ok(Built::Series {
+        series: out,
+        metric_name: None,
+        metric_name_for_error: None,
+    })
+}
+
+/// `rows` (time, value), one per histogram row, taken onto the multiples of
+/// `step_ns` from `start_ns` to `end_ns`: at each, the latest row at or
+/// before it. The last row is held for less than its spacing from the row
+/// before it, and a lone row for less than `lone_ns` (the histogram's row
+/// interval).
+fn on_grid(
+    rows: &[(u64, f64)],
+    start_ns: u64,
+    end_ns: u64,
+    step_ns: u64,
+    lone_ns: u64,
+) -> (Vec<u64>, Vec<f64>) {
+    let (mut ts, mut vs) = (Vec::new(), Vec::new());
+    if rows.is_empty() {
+        return (ts, vs);
+    }
+    let mut g = start_ns;
+    while g <= end_ns {
+        let i = rows.partition_point(|r| r.0 <= g);
+        if let Some(k) = i.checked_sub(1) {
+            let spacing = match (rows.get(k + 1), k.checked_sub(1).map(|j| rows[j])) {
+                (Some(next), _) => next.0 - rows[k].0,
+                (None, Some(prev)) => rows[k].0 - prev.0,
+                (None, None) => lone_ns,
+            };
+            if g - rows[k].0 < spacing.max(1) {
+                ts.push(g);
+                vs.push(rows[k].1);
+            }
+        }
+        match g.checked_add(step_ns) {
+            Some(next) => g = next,
+            None => break,
+        }
+    }
+    (ts, vs)
+}
+
+/// Whether `name` is a `*_over_time` function this engine evaluates.
+fn is_over_time(name: &str) -> bool {
+    name == "quantile_over_time" || OverTime::of(name).is_some()
+}
+
+/// The argument of `call` holding its range: the second of
+/// `quantile_over_time`, whose first is the quantile, and the first of
+/// every other function.
+fn range_arg(call: &parser::Call) -> Option<&Expr> {
+    let at = usize::from(call.func.name == "quantile_over_time");
+    call.args.args.get(at).map(|a| &**a)
+}
+
+/// The aggregation of the `*_over_time` call `call`. A
+/// `quantile_over_time`'s quantile must be a number.
+fn over_time_agg(call: &parser::Call) -> Result<OverTime, QueryError> {
+    if let Some(agg) = OverTime::of(call.func.name) {
+        return Ok(agg);
+    }
+    let mut q = call.args.args.first().map(|a| &**a);
+    while let Some(Expr::Paren(p)) = q {
+        q = Some(&p.expr);
+    }
+    match q {
+        Some(Expr::NumberLiteral(n)) => Ok(OverTime::Quantile(n.val)),
+        _ => Err(QueryError::Unsupported(
+            "quantile_over_time takes a number as its quantile".to_string(),
+        )),
+    }
+}
+
 fn build_call<'a, 'expr>(
     ctx: &'a Ctx<'a>,
     call: &'expr parser::Call,
@@ -1324,22 +1585,32 @@ where
     if call.func.name == "label_replace" {
         return build_label_replace(ctx, call);
     }
+    if let Some(Expr::Subquery(sq)) = range_arg(call) {
+        if is_over_time(call.func.name) {
+            return build_subquery_over_time(ctx, call, sq);
+        }
+        return Err(QueryError::Unsupported(format!(
+            "function {} does not take a subquery; the *_over_time functions do",
+            call.func.name
+        )));
+    }
     if let Some(groups) = ctx.groups {
         if matches!(
             call.func.name,
-            "rate" | "irate" | "increase" | "avg_over_time" | "idelta" | "deriv"
-        ) {
+            "rate" | "irate" | "increase" | "idelta" | "deriv"
+        ) || is_over_time(call.func.name)
+        {
             return build_per_source(ctx, groups, Leaf::Call(call));
         }
     }
 
-    let Some(first) = call.args.args.first() else {
+    let Some(first) = range_arg(call) else {
         return Err(QueryError::Unsupported(format!(
             "function {} requires arguments",
             call.func.name
         )));
     };
-    let Expr::MatrixSelector(sel) = &**first else {
+    let Expr::MatrixSelector(sel) = first else {
         return Err(QueryError::Unsupported(format!(
             "function {} requires a matrix-selector argument",
             call.func.name
@@ -1490,7 +1761,8 @@ where
                 metric_name_for_error: Some(metric_name.to_string()),
             })
         }
-        "avg_over_time" => {
+        name if is_over_time(name) => {
+            let agg = over_time_agg(call)?;
             let Some(mut gauges) = ctx
                 .source
                 .gauges(metric_name, filter, data_start, ctx.end_ns)
@@ -1507,14 +1779,17 @@ where
                 .series
                 .into_iter()
                 .map(|g| {
-                    let producer = ctx.place(GaugeAvgOverTime::new(
+                    let values = GaugeOverTime::gauge_values(&g.values);
+                    let producer = ctx.place(GaugeOverTime::new(
                         g.timestamps,
-                        g.values,
+                        values,
+                        Vec::new(),
                         ctx.start_ns,
                         ctx.end_ns,
                         ctx.step_ns,
                         range_ns,
                         matches!(ctx.rate_mode, RateMode::Raw),
+                        agg,
                     ));
                     LabeledSeries::new(g.labels, producer)
                 })
@@ -1787,7 +2062,7 @@ impl<'e> Leaf<'e> {
     /// The metric the leaf reads.
     fn metric(self) -> Option<&'e str> {
         match self {
-            Leaf::Call(call) => match call.args.args.first().map(|a| &**a) {
+            Leaf::Call(call) => match range_arg(call) {
                 Some(Expr::MatrixSelector(sel)) => sel.vs.name.as_deref(),
                 _ => None,
             },
@@ -1800,7 +2075,7 @@ impl<'e> Leaf<'e> {
         let raw = matches!(mode, RateMode::Raw);
         match self {
             Leaf::Call(call) => {
-                let range = match call.args.args.first().map(|a| &**a) {
+                let range = match range_arg(call) {
                     Some(Expr::MatrixSelector(sel)) => sel.range.as_nanos() as u64,
                     _ => 0,
                 };
@@ -1876,7 +2151,7 @@ where
     let Some(name) = leaf.metric() else {
         // The errors the single-source path gives these shapes.
         return Err(match leaf {
-            Leaf::Call(call) => match call.args.args.first().map(|a| &**a) {
+            Leaf::Call(call) => match range_arg(call) {
                 None => QueryError::Unsupported(format!(
                     "function {} requires arguments",
                     call.func.name

@@ -206,6 +206,12 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
 
 ### metriken-query (unreleased)
 
+- **Added:** `min_over_time`, `max_over_time`, `sum_over_time`,
+  `count_over_time`, `last_over_time`, `present_over_time`,
+  `stdvar_over_time`, `stddev_over_time` and `quantile_over_time`, of a
+  gauge (a counter is refused, as for `avg_over_time`).
+- **Added:** subqueries (`expr[r:s]`) as the argument of a `*_over_time`
+  function.
 - **Added:** comparison operators (`==`, `!=`, `>`, `<`, `>=`, `<=`), with
   and without `bool`, between a vector and a scalar and between vectors.
   Without `bool` a comparison keeps the points where it holds; with `bool`
