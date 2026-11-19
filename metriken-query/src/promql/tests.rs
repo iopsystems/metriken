@@ -6233,3 +6233,353 @@ fn increase_is_the_rate_times_the_window() {
     };
     assert!((result[0].value.1 - 2400.0).abs() < 1e-6, "{result:?}");
 }
+
+/// The `*_over_time` functions over a gauge reading 0, 1, …, 20 each
+/// second from 1000 s: at 1010 s the window `[1005, 1010]` holds 5 to 10,
+/// both ends included.
+#[test]
+fn over_time_functions_aggregate_the_window() {
+    let mut source = Memory::new(1000);
+    source.add_gauge(
+        "g",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: (1000u64..=1020).map(|t| t * 1_000_000_000).collect(),
+            values: (0i64..=20).collect::<Vec<_>>().into(),
+            windows: None,
+        },
+    );
+    let engine = QueryEngine::new(Arc::new(source));
+    let at = |q: &str| -> f64 {
+        let QueryResult::Matrix { result, .. } = engine
+            .query_range(q, 1010.0, 1010.0, 1.0)
+            .unwrap_or_else(|e| panic!("{q}: {e}"))
+        else {
+            panic!("{q}: not a matrix");
+        };
+        result[0].values[0].1
+    };
+    let var: f64 = 17.5 / 6.0;
+    for (q, want) in [
+        ("avg_over_time(g[5s])", 7.5),
+        ("min_over_time(g[5s])", 5.0),
+        ("max_over_time(g[5s])", 10.0),
+        ("sum_over_time(g[5s])", 45.0),
+        ("count_over_time(g[5s])", 6.0),
+        ("last_over_time(g[5s])", 10.0),
+        ("present_over_time(g[5s])", 1.0),
+        ("stdvar_over_time(g[5s])", var),
+        ("stddev_over_time(g[5s])", var.sqrt()),
+        ("quantile_over_time(0.5, g[5s])", 7.5),
+        ("quantile_over_time(0.9, g[5s])", 9.5),
+        ("quantile_over_time((0), g[5s])", 5.0),
+        ("quantile_over_time(-1, g[5s])", f64::NEG_INFINITY),
+        ("quantile_over_time(2, g[5s])", f64::INFINITY),
+    ] {
+        let got = at(q);
+        assert!(
+            got == want || (got - want).abs() < 1e-9,
+            "{q}: {got} != {want}"
+        );
+    }
+    let err = engine
+        .query_range("quantile_over_time(scalar(g), g[5s])", 1010.0, 1010.0, 1.0)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("quantile"), "{err}");
+}
+
+/// A counter `c` at 10/s until 1050 s and 30/s after, a gauge `g` reading
+/// its second since 1000 s, and a histogram `lat` adding one observation a
+/// second, rows each second from 1000 s to 1200 s.
+fn subquery_source() -> Memory {
+    let mut source = Memory::new(1000);
+    let secs: Vec<u64> = (0u64..=200).collect();
+    let ts: Vec<u64> = secs.iter().map(|s| (1000 + s) * 1_000_000_000).collect();
+    source.add_counter(
+        "c",
+        Counter {
+            labels: Labels::default(),
+            timestamps: ts.clone(),
+            values: secs
+                .iter()
+                .map(|&s| if s <= 50 { s * 10 } else { 500 + (s - 50) * 30 })
+                .collect(),
+            windows: None,
+        },
+    );
+    source.add_gauge(
+        "g",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: ts.clone(),
+            values: secs.iter().map(|&s| s as i64).collect::<Vec<_>>().into(),
+            windows: None,
+        },
+    );
+    source.add_histogram(
+        "lat",
+        Histogram {
+            labels: Labels::default(),
+            config: ::histogram::Config::new(4, 16).unwrap(),
+            timestamps: ts,
+            snapshots: secs.iter().map(|&s| hist_snap_cumulative(s)).collect(),
+        },
+    );
+    source
+}
+
+/// A `*_over_time` of a subquery aggregates the inner expression evaluated
+/// at the multiples of the subquery's step in `(t − range, t]`: at 1100 s,
+/// `rate(c[5s])[1m:10s]` is the rates at 1050, 1060, …, 1100 (10 at 1050,
+/// 30 after), six points.
+#[test]
+fn an_over_time_of_a_subquery_aggregates_the_inner_points() {
+    let engine = QueryEngine::new(Arc::new(subquery_source()));
+    let at = |q: &str| -> Vec<(f64, f64)> {
+        let QueryResult::Matrix { result, .. } = engine
+            .query_range(q, 1100.0, 1100.0, 1.0)
+            .unwrap_or_else(|e| panic!("{q}: {e}"))
+        else {
+            panic!("{q}: not a matrix");
+        };
+        result.iter().flat_map(|s| s.values.clone()).collect()
+    };
+    for (q, want) in [
+        ("max_over_time(rate(c[5s])[1m:10s])", 30.0),
+        ("min_over_time(rate(c[5s])[1m:10s])", 10.0),
+        ("count_over_time(rate(c[5s])[1m:10s])", 6.0),
+        ("count_over_time(g[1m:10s])", 6.0),
+        ("avg_over_time(g[30s:10s])", 90.0),
+        ("last_over_time(sum(rate(c[5s]))[1m:10s])", 30.0),
+        ("max_over_time(histogram_quantile(0.5, lat)[30s:10s])", 10.0),
+    ] {
+        assert_eq!(at(q), vec![(1100.0, want)], "{q}");
+    }
+    // A range: one point per step, each over its own window.
+    let QueryResult::Matrix { result, .. } = engine
+        .query_range("min_over_time(rate(c[5s])[1m:10s])", 1080.0, 1120.0, 10.0)
+        .unwrap()
+    else {
+        panic!("not a matrix");
+    };
+    assert_eq!(
+        result[0].values,
+        vec![
+            (1080.0, 10.0),
+            (1090.0, 10.0),
+            (1100.0, 10.0),
+            (1110.0, 30.0),
+            (1120.0, 30.0)
+        ]
+    );
+    // An instant query.
+    let QueryResult::Vector { result, .. } = engine
+        .query("max_over_time(rate(c[5s])[1m:10s])", Some(1100.0))
+        .unwrap()
+    else {
+        panic!("not a vector");
+    };
+    assert_eq!(result[0].value.1, 30.0);
+    for (q, want) in [
+        ("rate(c[5s])[1m:10s]", ""),
+        ("rate(rate(c[5s])[1m:10s])", "does not take a subquery"),
+        ("max_over_time(rate(c[5s])[1m:10s] offset 1m)", "offset"),
+    ] {
+        let err = engine.query_range(q, 1100.0, 1100.0, 1.0);
+        assert!(err.is_err(), "{q}: {err:?}");
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains(want), "{q}: {msg}");
+    }
+}
+
+/// The `*_over_time` aggregations at their edges, as Prometheus computes
+/// them: a quantile at a whole rank or between equal values is that value
+/// (not NaN beside an infinity), NaN sorts first, one value is every
+/// quantile, and a sum is compensated.
+#[test]
+fn over_time_aggregations_at_their_edges() {
+    use crate::promql::streaming::OverTime;
+    let q = |q: f64, v: &[f64]| OverTime::Quantile(q).reduce(v);
+    assert_eq!(q(0.0, &[1.0, f64::INFINITY]), 1.0);
+    assert_eq!(q(0.5, &[1.0, 2.0, f64::INFINITY]), 2.0);
+    assert_eq!(q(1.0, &[1.0, f64::NAN, 3.0]), 3.0);
+    assert!(q(0.0, &[1.0, f64::NAN, 3.0]).is_nan());
+    assert_eq!(q(1.0, &[7.0]), 7.0);
+    assert_eq!(q(0.3, &[7.0]), 7.0);
+    assert_eq!(OverTime::Sum.reduce(&[1e16, 1.0, -1e16]), 1.0);
+    assert_eq!(OverTime::Avg.reduce(&[1e16, 2.0, -1e16]), 2.0 / 3.0);
+    assert_eq!(OverTime::Min.reduce(&[f64::NAN, 2.0]), 2.0);
+    assert!(OverTime::Max.reduce(&[f64::NAN]).is_nan());
+    // Infinities, as Prometheus's compensated sums keep them.
+    assert_eq!(OverTime::Sum.reduce(&[f64::INFINITY]), f64::INFINITY);
+    assert_eq!(OverTime::Sum.reduce(&[1.0, f64::INFINITY]), f64::INFINITY);
+    assert_eq!(
+        OverTime::Sum.reduce(&[f64::NEG_INFINITY, 2.0]),
+        f64::NEG_INFINITY
+    );
+    assert_eq!(OverTime::Sum.reduce(&[1e308, 1e308]), f64::INFINITY);
+    assert_eq!(OverTime::Avg.reduce(&[1.0, f64::INFINITY]), f64::INFINITY);
+    assert_eq!(OverTime::Avg.reduce(&[1e308, 1e308]), 1e308);
+    // The incremental mean of Prometheus main once the sum overflows.
+    assert_eq!(
+        OverTime::Avg.reduce(&[1.7e308, 1.7e308, 1.7e308, -1.7e308]),
+        8.499999999999998e307
+    );
+    // A constant window's variance is 0.
+    assert_eq!(OverTime::StdVar.reduce(&[0.11; 5]), 0.0);
+    assert_eq!(OverTime::StdDev.reduce(&[0.11; 5]), 0.0);
+}
+
+/// A subquery of a histogram function over rows off its grid (3 ms after
+/// each second, or each minute) has a value at every grid point a row
+/// precedes, the first included, and an instant one is stamped at its
+/// time.
+#[test]
+fn a_histogram_subquery_holds_rows_off_its_grid() {
+    let source = |every: u64| {
+        let mut source = Memory::new(every * 1000);
+        let secs: Vec<u64> = (0u64..=400).step_by(every as usize).collect();
+        source.add_histogram(
+            "lat",
+            Histogram {
+                labels: Labels::default(),
+                config: ::histogram::Config::new(4, 16).unwrap(),
+                timestamps: secs
+                    .iter()
+                    .map(|s| (1000 + s) * 1_000_000_000 + 3_000_000)
+                    .collect(),
+                snapshots: (0u64..secs.len() as u64)
+                    .map(hist_snap_cumulative)
+                    .collect(),
+            },
+        );
+        QueryEngine::new(Arc::new(source))
+    };
+    let second = source(1);
+    let QueryResult::Matrix { result, .. } = second
+        .query_range(
+            "count_over_time(histogram_quantile(0.5, lat)[20s:10s])",
+            1090.0,
+            1100.0,
+            10.0,
+        )
+        .unwrap()
+    else {
+        panic!("not a matrix");
+    };
+    assert_eq!(result[0].values, vec![(1090.0, 2.0), (1100.0, 2.0)]);
+    let minute = source(60);
+    let instant = |engine: &QueryEngine, q: &str| {
+        let QueryResult::Vector { result, .. } = engine.query(q, Some(1300.0)).unwrap() else {
+            panic!("{q}: not a vector");
+        };
+        result.first().map(|s| s.value)
+    };
+    assert_eq!(
+        instant(
+            &minute,
+            "count_over_time(histogram_quantile(0.5, lat)[1m:10s])"
+        ),
+        Some((1300.0, 6.0))
+    );
+    // A range shorter than the rows' spacing reads back to the row before.
+    assert_eq!(
+        instant(
+            &minute,
+            "count_over_time(histogram_quantile(0.5, lat)[30s:10s])"
+        ),
+        Some((1300.0, 3.0))
+    );
+    // Beside a finer recording, the histogram's own row interval holds its
+    // rows.
+    use metriken_storage::recordings::RecordingsSource;
+    let mut gauge = Memory::new(1000);
+    gauge.add_gauge(
+        "g",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: (1000u64..=1400).map(|t| t * 1_000_000_000).collect(),
+            values: vec![1i64; 401].into(),
+            windows: None,
+        },
+    );
+    let mut hist = Memory::new(60_000);
+    let secs: Vec<u64> = (0u64..=400).step_by(60).collect();
+    hist.add_histogram(
+        "lat",
+        Histogram {
+            labels: Labels::default(),
+            config: ::histogram::Config::new(4, 16).unwrap(),
+            timestamps: secs
+                .iter()
+                .map(|s| (1000 + s) * 1_000_000_000 + 3_000_000)
+                .collect(),
+            snapshots: (0u64..secs.len() as u64)
+                .map(hist_snap_cumulative)
+                .collect(),
+        },
+    );
+    let both = QueryEngine::new(Arc::new(RecordingsSource::new(vec![
+        Arc::new(gauge) as Arc<dyn DataSource>,
+        Arc::new(hist),
+    ])));
+    assert_eq!(
+        instant(
+            &both,
+            "count_over_time(histogram_quantile(0.5, lat)[1m:10s])"
+        ),
+        Some((1300.0, 6.0))
+    );
+    // The other histogram functions are refused inside a subquery.
+    let err = minute
+        .query(
+            "count_over_time(histogram_count(lat)[1m:10s])",
+            Some(1300.0),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("inside a subquery"), "{err}");
+}
+
+/// A subquery of a histogram function aggregates its points on the
+/// subquery's grid, not one per histogram row; nested subqueries, and a
+/// subquery under an aggregation and an operator, evaluate; the plain
+/// functions keep the metric name and a function of a subquery has none;
+/// and a subquery of too many inner points per series is refused.
+#[test]
+fn subqueries_over_histograms_nested_and_bounded() {
+    let engine = QueryEngine::new(Arc::new(subquery_source()));
+    let one = |q: &str| -> Vec<crate::promql::MatrixSample> {
+        let QueryResult::Matrix { result, .. } = engine
+            .query_range(q, 1100.0, 1100.0, 1.0)
+            .unwrap_or_else(|e| panic!("{q}: {e}"))
+        else {
+            panic!("{q}: not a matrix");
+        };
+        result
+    };
+    for (q, want) in [
+        ("count_over_time(histogram_quantile(0.5, lat)[1m:10s])", 6.0),
+        ("count_over_time(max_over_time(g[30s:10s])[1m:20s])", 3.0),
+        ("sum(max_over_time(rate(c[5s])[1m:10s])) * 2", 60.0),
+    ] {
+        assert_eq!(one(q)[0].values, vec![(1100.0, want)], "{q}");
+    }
+    assert_eq!(
+        one("max_over_time(g[1m])")[0]
+            .metric
+            .get("__name__")
+            .map(String::as_str),
+        Some("g")
+    );
+    assert_eq!(
+        one("max_over_time(g[1m:10s])")[0].metric.get("__name__"),
+        None
+    );
+    let err = engine
+        .query_range("max_over_time(g[1000s:1ms])", 1100.0, 1100.0, 1.0)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("points per series"), "{err}");
+}

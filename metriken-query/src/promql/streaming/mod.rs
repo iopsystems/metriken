@@ -59,7 +59,7 @@ pub(crate) use binary::{
     braces, distinct_label_sets, interval_binop, matrix_grouped_op, matrix_matrix_op,
     matrix_scalar_op, scalar_point, BinOp, MatchSpec, OneSide,
 };
-pub(crate) use gauge::{AtPoints, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid};
+pub(crate) use gauge::{AtPoints, GaugeDeriv, GaugeIdelta, GaugeOverTime, GaugeStepGrid, OverTime};
 pub(crate) use rate::{
     counter_increase, increase_point, range_start, CounterGridRate, CounterPairwiseRate,
     SPACING_PROBE,
