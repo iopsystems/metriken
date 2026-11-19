@@ -5551,3 +5551,461 @@ fn group_left_joins_thread_names_onto_cpu_time() {
         assert!((total - 1.0).abs() < 1e-9, "{state}: {total}");
     }
 }
+
+/// Gauges `g{x="a"}` = 0, 1, …, 20 and `g{x="b"}` = 10 at each second from
+/// 1000 s, `h{x="a"}` and `h{x="b"}` = 5 beside them, and counters
+/// `c{x="a"}` at 10/s and `c{x="b"}` at 30/s, each read through a 10 ms
+/// acquisition window.
+fn comparison_source() -> Memory {
+    let mut source = Memory::new(1000);
+    let ts: Vec<u64> = (0u64..=20).map(|s| (1000 + s) * 1_000_000_000).collect();
+    for (x, g) in [("a", None), ("b", Some(10i64))] {
+        source.add_gauge(
+            "g",
+            Gauge {
+                labels: make_labels(&[("x", x)]),
+                timestamps: ts.clone(),
+                values: (0i64..=20)
+                    .map(|s| g.unwrap_or(s))
+                    .collect::<Vec<_>>()
+                    .into(),
+                windows: None,
+            },
+        );
+        source.add_gauge(
+            "h",
+            Gauge {
+                labels: make_labels(&[("x", x)]),
+                timestamps: ts.clone(),
+                values: vec![5i64; ts.len()].into(),
+                windows: None,
+            },
+        );
+    }
+    for (x, per_s) in [("a", 10u64), ("b", 30)] {
+        source.add_counter(
+            "c",
+            Counter {
+                labels: make_labels(&[("x", x)]),
+                timestamps: ts.clone(),
+                values: (0u64..=20).map(|s| s * per_s).collect(),
+                windows: Some(ts.iter().map(|t| (t - 10_000_000, *t)).collect()),
+            },
+        );
+    }
+    source
+}
+
+/// A series as `(sorted labels, points)`.
+type Compared = (Vec<(String, String)>, Vec<(f64, f64)>);
+
+/// `(labels, points)` of each series of `query` over 1005 s to 1015 s at a
+/// 1 s step, sorted by labels.
+fn compared(engine: &QueryEngine, query: &str) -> Vec<Compared> {
+    let QueryResult::Matrix { result, .. } = engine
+        .query_range(query, 1005.0, 1015.0, 1.0)
+        .unwrap_or_else(|e| panic!("{query}: {e}"))
+    else {
+        panic!("{query}: not a matrix");
+    };
+    let mut out: Vec<_> = result
+        .into_iter()
+        .map(|s| {
+            let mut labels: Vec<_> = s.metric.into_iter().collect();
+            labels.sort();
+            (labels, s.values)
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn labels(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut l: Vec<_> = pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    l.sort();
+    l
+}
+
+/// A comparison against a scalar keeps the vector's points where it holds,
+/// with their values and metric name, whichever side the scalar is on;
+/// with `bool` it gives 1 or 0 at every point, without the name.
+#[test]
+fn a_comparison_with_a_scalar_filters_or_gives_one_or_zero() {
+    let engine = QueryEngine::new(Arc::new(comparison_source()));
+    let a = |pts: &[f64]| -> Vec<(f64, f64)> { pts.iter().map(|t| (*t, *t - 1000.0)).collect() };
+    let named_a = labels(&[("__name__", "g"), ("x", "a")]);
+    let named_b = labels(&[("__name__", "g"), ("x", "b")]);
+    let b_all: Vec<(f64, f64)> = (1005..=1015).map(|t| (t as f64, 10.0)).collect();
+    for (query, want) in [
+        (
+            "g > 12",
+            vec![(named_a.clone(), a(&[1013.0, 1014.0, 1015.0]))],
+        ),
+        (
+            "12 < g",
+            vec![(named_a.clone(), a(&[1013.0, 1014.0, 1015.0]))],
+        ),
+        (
+            "g >= 13",
+            vec![(named_a.clone(), a(&[1013.0, 1014.0, 1015.0]))],
+        ),
+        ("g < 7", vec![(named_a.clone(), a(&[1005.0, 1006.0]))]),
+        ("g <= 6", vec![(named_a.clone(), a(&[1005.0, 1006.0]))]),
+        (
+            "g == 10",
+            vec![
+                (named_a.clone(), a(&[1010.0])),
+                (named_b.clone(), b_all.clone()),
+            ],
+        ),
+        (
+            "g != 10",
+            vec![(
+                named_a.clone(),
+                a(&[
+                    1005.0, 1006.0, 1007.0, 1008.0, 1009.0, 1011.0, 1012.0, 1013.0, 1014.0, 1015.0,
+                ]),
+            )],
+        ),
+    ] {
+        assert_eq!(compared(&engine, query), want, "{query}");
+    }
+    let bools = compared(&engine, "g > bool 12");
+    assert_eq!(bools[0].0, labels(&[("x", "a")]));
+    assert_eq!(
+        bools[0].1,
+        (1005..=1015)
+            .map(|t| (t as f64, f64::from(u8::from(t > 1012))))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(bools[1].0, labels(&[("x", "b")]));
+    assert!(bools[1].1.iter().all(|(_, v)| *v == 0.0));
+    // Aggregated: the series a filter drops are not summed.
+    assert_eq!(
+        compared(&engine, "sum(g > 12)"),
+        vec![(vec![], vec![(1013.0, 13.0), (1014.0, 14.0), (1015.0, 15.0)])]
+    );
+    assert_eq!(
+        compared(&engine, "count(g >= 10)")[0].1,
+        (1005..=1015)
+            .map(|t| (t as f64, if t >= 1010 { 2.0 } else { 1.0 }))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Between two vectors a comparison keeps the left series' points where it
+/// holds against the matching right series; with `bool` it gives 1 or 0.
+#[test]
+fn a_comparison_between_vectors_keeps_the_left_points() {
+    let engine = QueryEngine::new(Arc::new(comparison_source()));
+    // g{x="a"} is 5 or more from 1005 s, and g{x="b"} is 10: no point of
+    // either is below h's 5.
+    assert_eq!(compared(&engine, "g < h"), vec![]);
+    assert_eq!(
+        compared(&engine, "g > h"),
+        vec![
+            (
+                labels(&[("__name__", "g"), ("x", "a")]),
+                (1006..=1015)
+                    .map(|t| (t as f64, t as f64 - 1000.0))
+                    .collect()
+            ),
+            (
+                labels(&[("__name__", "g"), ("x", "b")]),
+                (1005..=1015).map(|t| (t as f64, 10.0)).collect()
+            ),
+        ]
+    );
+    let bools = compared(&engine, "g == bool h");
+    assert_eq!(bools[0].0, labels(&[("x", "a")]));
+    assert_eq!(
+        bools[0].1,
+        (1005..=1015)
+            .map(|t| (t as f64, f64::from(u8::from(t == 1005))))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A comparison of a rate keeps its band where it filters; with `bool` the
+/// band is the 1 or 0 where the rate's band decides the comparison, and
+/// `[0, 1]` where it does not.
+#[test]
+fn a_comparison_of_a_rate_carries_its_band() {
+    let engine = QueryEngine::new(Arc::new(comparison_source()));
+    let range = |q: &str| {
+        let QueryResult::Matrix { result, .. } =
+            engine.query_range(q, 1010.0, 1010.0, 1.0).unwrap()
+        else {
+            panic!("{q}: not a matrix");
+        };
+        let mut result = result;
+        result.sort_by_key(|s| s.metric.get("x").cloned());
+        result
+    };
+    let rate = range("rate(c[5s])");
+    let band_a = rate[0].intervals.as_ref().unwrap()[0];
+    assert!(band_a.0 < 10.0 && band_a.1 > 10.0, "{band_a:?}");
+    let kept = range("rate(c[5s]) > 20");
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].values, rate[1].values);
+    assert_eq!(kept[0].intervals, rate[1].intervals);
+    assert_eq!(
+        kept[0].metric.get("__name__").map(String::as_str),
+        Some("c")
+    );
+    // 10/s, read through 10 ms windows, against 10: undecided; against 20:
+    // decided for both series.
+    let undecided = range("rate(c[5s]) >= bool 10");
+    assert_eq!(undecided[0].values, vec![(1010.0, 1.0)]);
+    assert_eq!(undecided[0].intervals, Some(vec![(0.0, 1.0)]));
+    assert_eq!(undecided[1].intervals, Some(vec![(1.0, 1.0)]));
+    let decided = range("rate(c[5s]) > bool 20");
+    assert_eq!(decided[0].intervals, Some(vec![(0.0, 0.0)]));
+    assert_eq!(decided[1].intervals, Some(vec![(1.0, 1.0)]));
+    let between = range("rate(c[5s]) < bool on(x) rate(c[5s]) * 2");
+    assert_eq!(between[0].intervals, Some(vec![(1.0, 1.0)]));
+}
+
+/// A histogram function's result compares with a scalar as a series does,
+/// its bucket bands kept where it filters; and a scalar op on it keeps its
+/// `bands` aligned with its `intervals`.
+#[test]
+fn a_comparison_of_a_histogram_quantile_filters_its_points() {
+    let mut source = Memory::new(1000);
+    let ts: Vec<u64> = (0u64..=20).map(|s| (1000 + s) * 1_000_000_000).collect();
+    source.add_histogram(
+        "lat",
+        Histogram {
+            labels: Labels::default(),
+            config: ::histogram::Config::new(4, 16).unwrap(),
+            timestamps: ts,
+            snapshots: (0u64..=20).map(hist_snap_cumulative).collect(),
+        },
+    );
+    let engine = QueryEngine::new(Arc::new(source));
+    let one = |q: &str| {
+        let QueryResult::Matrix { result, .. } = engine
+            .query_range(q, 1005.0, 1010.0, 1.0)
+            .unwrap_or_else(|e| panic!("{q}: {e}"))
+        else {
+            panic!("{q}: not a matrix");
+        };
+        result
+    };
+    let q = one("histogram_quantile(0.5, lat)");
+    let v = q[0].values[0].1;
+    assert!(one(&format!("histogram_quantile(0.5, lat) > {}", v + 1.0)).is_empty());
+    let kept = one(&format!("histogram_quantile(0.5, lat) <= {v}"));
+    assert_eq!(kept[0].values, q[0].values);
+    assert_eq!(kept[0].intervals, q[0].intervals);
+    assert_eq!(kept[0].bands, q[0].bands);
+    let scaled = one("histogram_quantile(0.5, lat) * 2");
+    let doubled: Vec<(f64, f64)> = q[0]
+        .intervals
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|(lo, hi)| (lo * 2.0, hi * 2.0))
+        .collect();
+    assert_eq!(scaled[0].intervals.as_ref(), Some(&doubled));
+    assert_eq!(
+        scaled[0].bands.as_ref(),
+        Some(&doubled.iter().copied().map(Some).collect::<Vec<_>>())
+    );
+}
+
+/// In raw mode a point a filter drops leaves a timing point, so a join
+/// with another series does not hold the point the filter kept before it:
+/// `g` reads 10 at even seconds and 3 at odd ones, `h` 0 half a second
+/// after each, and `(g > 5) + h` has points only half a second after an
+/// even second, either way round, as has `(g > k) + h` with `k` a series
+/// reading 5 at `g`'s times. A division by zero drops a point the same
+/// way: `5 / (g - 3)` divides by zero at the odd seconds.
+#[test]
+fn a_raw_filter_does_not_hold_a_kept_point_across_a_dropped_one() {
+    let mut source = Memory::new(1000);
+    let s = 1_000_000_000u64;
+    source.add_gauge(
+        "g",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: (1000u64..=1020).map(|t| t * s).collect(),
+            values: (1000i64..=1020)
+                .map(|t| if t % 2 == 0 { 10 } else { 3 })
+                .collect::<Vec<_>>()
+                .into(),
+            windows: None,
+        },
+    );
+    source.add_gauge(
+        "h",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: (1000u64..=1020).map(|t| t * s + s / 2).collect(),
+            values: vec![0i64; 21].into(),
+            windows: None,
+        },
+    );
+    source.add_gauge(
+        "k",
+        Gauge {
+            labels: Labels::default(),
+            timestamps: (1000u64..=1020).map(|t| t * s).collect(),
+            values: vec![5i64; 21].into(),
+            windows: None,
+        },
+    );
+    let engine = QueryEngine::new(Arc::new(source));
+    let opts = QueryOptions::with_rate_mode(RateMode::Raw);
+    for q in [
+        "(g > 5) + h",
+        "h + (g > 5)",
+        "(g > k) + h",
+        "(5 / (g - 3)) + h",
+    ] {
+        let QueryResult::Matrix { result, .. } = engine
+            .query_range_opts(q, 1005.0, 1015.0, 1.0, &opts)
+            .unwrap_or_else(|e| panic!("{q}: {e}"))
+        else {
+            panic!("{q}: not a matrix");
+        };
+        let times: Vec<f64> = result
+            .iter()
+            .flat_map(|s| s.values.iter().map(|p| p.0))
+            .collect();
+        let held: Vec<f64> = times
+            .iter()
+            .copied()
+            .filter(|t| (t.floor() as u64) % 2 == 1)
+            .collect();
+        assert!(held.is_empty(), "{q}: points after an odd second {held:?}");
+        assert!(!times.is_empty(), "{q}");
+    }
+}
+
+/// A `bool` comparison between rates of two reads widens their bands over
+/// both reads' edges, as arithmetic does: it is undecided exactly where the
+/// difference's band spans zero.
+#[test]
+fn a_bool_comparison_of_two_reads_widens_their_bands() {
+    let mut source = Memory::new(1000);
+    let ts: Vec<u64> = (1000u64..=1020).map(|s| s * 1_000_000_000).collect();
+    for (name, (from, to)) in [
+        ("a", (10_000_000u64, 0u64)),
+        ("b", (400_000_000, 390_000_000)),
+    ] {
+        source.add_counter(
+            name,
+            Counter {
+                labels: Labels::default(),
+                timestamps: ts.clone(),
+                values: (0u64..=20).map(|s| s * 10).collect(),
+                windows: Some(ts.iter().map(|t| (t - from, t - to)).collect()),
+            },
+        );
+    }
+    let engine = QueryEngine::new(Arc::new(source));
+    let band = |q: &str| {
+        let QueryResult::Matrix { result, .. } =
+            engine.query_range(q, 1010.0, 1010.0, 1.0).unwrap()
+        else {
+            panic!("{q}: not a matrix");
+        };
+        result[0].intervals.clone()
+    };
+    let difference = band("rate(a[5s]) - rate(b[5s]) + 0.5").expect("a band")[0];
+    assert!(difference.0 < 0.0 && difference.1 > 0.0, "{difference:?}");
+    assert_eq!(
+        band("rate(a[5s]) - rate(b[5s]) + 0.5 > bool 0"),
+        Some(vec![(0.0, 1.0)])
+    );
+    assert_eq!(
+        band("rate(a[5s]) + 0.5 > bool rate(b[5s])"),
+        Some(vec![(0.0, 1.0)])
+    );
+}
+
+/// Under `group_right` a filter keeps the many side's metric name, as it
+/// keeps its labels, with the left side's value.
+#[test]
+fn a_group_right_filter_keeps_the_many_sides_name() {
+    let engine = QueryEngine::new(Arc::new(comparison_source()));
+    let got = compared(&engine, "h < on(x) group_right g");
+    assert_eq!(got.len(), 2, "{got:?}");
+    for (labels, points) in &got {
+        assert!(
+            labels.contains(&("__name__".to_string(), "g".to_string())),
+            "{labels:?}"
+        );
+        assert!(points.iter().all(|(_, v)| *v == 5.0), "{points:?}");
+    }
+}
+
+/// A scalar first in a `bool` comparison is the left operand of the band
+/// comparison too, on a rate and on a histogram function's result.
+#[test]
+fn a_bool_comparison_with_the_scalar_first_orders_the_bands() {
+    let engine = QueryEngine::new(Arc::new(comparison_source()));
+    let bands = |q: &str| {
+        let QueryResult::Matrix { result, .. } =
+            engine.query_range(q, 1010.0, 1010.0, 1.0).unwrap()
+        else {
+            panic!("{q}: not a matrix");
+        };
+        let mut result = result;
+        result.sort_by_key(|s| s.metric.get("x").cloned());
+        result.into_iter().map(|s| s.intervals).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        bands("10 <= bool rate(c[5s])"),
+        vec![Some(vec![(0.0, 1.0)]), Some(vec![(1.0, 1.0)])]
+    );
+    assert_eq!(
+        bands("20 < bool rate(c[5s])"),
+        vec![Some(vec![(0.0, 0.0)]), Some(vec![(1.0, 1.0)])]
+    );
+    let mut source = Memory::new(1000);
+    let ts: Vec<u64> = (0u64..=20).map(|s| (1000 + s) * 1_000_000_000).collect();
+    source.add_histogram(
+        "lat",
+        Histogram {
+            labels: Labels::default(),
+            config: ::histogram::Config::new(4, 16).unwrap(),
+            timestamps: ts,
+            // Bucket 200 spans several values, so its band has an inside.
+            snapshots: (0u64..=20)
+                .map(|n| HistogramSnapshot {
+                    index: vec![200],
+                    count: vec![n],
+                })
+                .collect(),
+        },
+    );
+    let engine = QueryEngine::new(Arc::new(source));
+    let one = |q: &str| {
+        let QueryResult::Matrix { result, .. } =
+            engine.query_range(q, 1010.0, 1010.0, 1.0).unwrap()
+        else {
+            panic!("{q}: not a matrix");
+        };
+        result
+    };
+    let q = one("histogram_quantile(0.5, lat)");
+    let (lo, hi) = q[0].intervals.as_ref().unwrap()[0];
+    let mid = (lo + hi) / 2.0;
+    assert_eq!(
+        one(&format!("{mid} <= bool histogram_quantile(0.5, lat)"))[0].intervals,
+        Some(vec![(0.0, 1.0)])
+    );
+    assert_eq!(
+        one(&format!("{} < bool histogram_quantile(0.5, lat)", lo - 1.0))[0].intervals,
+        Some(vec![(1.0, 1.0)])
+    );
+    assert_eq!(
+        one(&format!("{} < bool histogram_quantile(0.5, lat)", hi + 1.0))[0].intervals,
+        Some(vec![(0.0, 0.0)])
+    );
+}

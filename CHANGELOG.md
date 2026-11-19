@@ -204,6 +204,20 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   every bound an integer), that it applies to `OVERFLOW_BOUND_KEY` too,
   and which readers divide by it.
 
+### metriken-query (unreleased)
+
+- **Added:** comparison operators (`==`, `!=`, `>`, `<`, `>=`, `<=`), with
+  and without `bool`, between a vector and a scalar and between vectors.
+  Without `bool` a comparison keeps the points where it holds; with `bool`
+  it gives 1 or 0, with a band of `[0, 1]` where the operands' bands leave
+  the comparison undecided.
+- **Fixed:** a scalar operation on a histogram function's result scales
+  its `bands` as it scales its `intervals`.
+- **Fixed:** in raw mode, a point a binary operator drops (a division by
+  zero) no longer lets a join hold the point before it across it.
+- **Changed:** a scalar operation that leaves a histogram function's
+  series without points drops the series, as the streaming path does.
+
 ### metriken-query 0.50.3
 
 - **Fixed:** strided histogram functions read each series' rows after the
