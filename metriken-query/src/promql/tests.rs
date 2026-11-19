@@ -5551,3 +5551,147 @@ fn group_left_joins_thread_names_onto_cpu_time() {
         assert!((total - 1.0).abs() < 1e-9, "{state}: {total}");
     }
 }
+
+/// A grid `irate` at a step longer than its `[range]` has a point at the
+/// range's start: its interval runs back a step from there, and the read
+/// reaches the row at or before that, alone and summed. A `Memory` source
+/// has no counter scan, so both settings of `with_per_series_rates` read
+/// per series.
+#[test]
+fn an_irate_at_a_step_longer_than_its_range_has_a_point_at_the_start() {
+    let mut source = Memory::new(1000);
+    for x in ["a", "b"] {
+        source.add_counter(
+            "c",
+            Counter {
+                labels: make_labels(&[("x", x)]),
+                timestamps: (0u64..=2000)
+                    .map(|s| s * 1_000_000_000 + 300_000_000)
+                    .collect(),
+                values: (0u64..=2000).map(|s| s * 10).collect(),
+                windows: None,
+            },
+        );
+    }
+    let engine = QueryEngine::new(Arc::new(source));
+    for per_series in [false, true] {
+        let opts = QueryOptions::default().with_per_series_rates(per_series);
+        for (q, want) in [("irate(c[60s])", 10.0), ("sum(irate(c[60s]))", 20.0)] {
+            let QueryResult::Matrix { result, .. } = engine
+                .query_range_opts(q, 1200.0, 1800.0, 600.0, &opts)
+                .unwrap()
+            else {
+                panic!("not a matrix");
+            };
+            assert!(!result.is_empty(), "{q} per-series {per_series}");
+            for s in &result {
+                let times: Vec<f64> = s.values.iter().map(|(t, _)| *t).collect();
+                assert_eq!(times, vec![1200.0, 1800.0], "{q} per-series {per_series}");
+                for (t, v) in &s.values {
+                    assert!(
+                        (v - want).abs() < 1e-9,
+                        "{q} per-series {per_series} at {t}: {v}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A [`Memory`] source that records the start of each counter read.
+struct CounterReadStarts {
+    inner: Memory,
+    starts: std::sync::Mutex<Vec<u64>>,
+}
+
+impl DataSource for CounterReadStarts {
+    fn counters(&self, n: &str, f: &Labels, a: u64, b: u64) -> Option<crate::types::Counters> {
+        self.starts.lock().unwrap().push(a);
+        self.inner.counters(n, f, a, b)
+    }
+    fn counter_streams<'s>(
+        &'s self,
+        n: &str,
+        f: &Labels,
+        a: u64,
+        b: u64,
+    ) -> Option<Vec<crate::types::CounterStream<'s>>> {
+        self.starts.lock().unwrap().push(a);
+        self.inner.counter_streams(n, f, a, b)
+    }
+    fn gauges(&self, n: &str, f: &Labels, a: u64, b: u64) -> Option<crate::types::Gauges> {
+        self.inner.gauges(n, f, a, b)
+    }
+    fn histogram_stream(
+        &self,
+        n: &str,
+        f: &Labels,
+        a: u64,
+        b: u64,
+    ) -> Option<crate::histogram_stream::HistogramStream> {
+        self.inner.histogram_stream(n, f, a, b)
+    }
+    fn interval(&self) -> f64 {
+        self.inner.interval()
+    }
+    fn time_range(&self) -> Option<(u64, u64)> {
+        self.inner.time_range()
+    }
+    fn counter_names(&self) -> Vec<String> {
+        self.inner.counter_names()
+    }
+    fn gauge_names(&self) -> Vec<String> {
+        self.inner.gauge_names()
+    }
+    fn histogram_names(&self) -> Vec<String> {
+        self.inner.histogram_names()
+    }
+    fn counter_labels(&self, n: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.inner.counter_labels(n)
+    }
+    fn gauge_labels(&self, n: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.inner.gauge_labels(n)
+    }
+    fn histogram_labels(&self, n: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        self.inner.histogram_labels(n)
+    }
+    fn column_map(
+        &self,
+    ) -> std::collections::HashMap<String, std::collections::HashMap<Labels, String>> {
+        self.inner.column_map()
+    }
+}
+
+/// With explicit evaluation timestamps an `irate` reads back from the
+/// last one before the range's start, but only when one falls in the
+/// range: timestamps that all lie long before the range give no point, and
+/// the read goes back a step and the rows before it, as on the grid.
+#[test]
+fn an_irate_reads_back_to_an_evaluation_timestamp_only_when_one_is_in_range() {
+    let mut inner = Memory::new(1000);
+    inner.add_counter(
+        "c",
+        Counter {
+            labels: Labels::default(),
+            timestamps: (0u64..=10_000).map(|s| s * 1_000_000_000).collect(),
+            values: (0u64..=10_000).map(|s| s * 10).collect(),
+            windows: None,
+        },
+    );
+    let source = Arc::new(CounterReadStarts {
+        inner,
+        starts: Default::default(),
+    });
+    let engine = QueryEngine::new(source.clone());
+    let s = 1_000_000_000u64;
+    let read_from = |ts: Vec<u64>| {
+        source.starts.lock().unwrap().clear();
+        let opts = QueryOptions::default().with_eval_timestamps(Some(ts.into()));
+        let _ = engine
+            .query_range_opts("irate(c[1s])", 9000.0, 9010.0, 1.0, &opts)
+            .unwrap();
+        source.starts.lock().unwrap().iter().copied().min().unwrap()
+    };
+    assert_eq!(read_from(vec![0, 20 * s, 40 * s]), 8995 * s);
+    assert_eq!(read_from(vec![40 * s, 9005 * s]), 40 * s - 4 * s);
+}

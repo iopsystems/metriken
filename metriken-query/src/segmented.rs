@@ -2244,6 +2244,20 @@ pub(crate) mod tests {
         ]
     }
 
+    /// Three segments of counter `c`, 100 s apart, each with rows a second
+    /// apart from 100·k + 1 s to 100·k + 5 s: a rate's read back from one
+    /// segment does not reach the one before it.
+    fn three_spaced_segments() -> Vec<Vec<u8>> {
+        (0..3u64)
+            .map(|k| {
+                let rows: Vec<(u64, u64)> = (1..=5u64)
+                    .map(|s| ((100 * k + s) * 1_000_000_000, (100 * k + s) * 10))
+                    .collect();
+                segment("c", &[], &rows)
+            })
+            .collect()
+    }
+
     /// Three segments of two series, `a` with values in each and `b` only
     /// in the first: its column in the others is null throughout, as a wide
     /// table keeps a series' column after it stops.
@@ -2345,7 +2359,7 @@ pub(crate) mod tests {
     /// listing surface answers from what open kept.
     #[test]
     fn open_reads_each_segment_once_and_a_query_fetches_only_what_it_touches() {
-        let store = CountingStore::new(three_segments());
+        let store = CountingStore::new(three_spaced_segments());
         let pool = BufferPool::new(64 * 1024 * 1024);
         let r = SegmentedParquetReader::open_with_pool(store.clone(), pool).unwrap();
         assert_eq!(store.fetched(), vec![0, 1, 2], "open: each once, in order");
@@ -2353,29 +2367,29 @@ pub(crate) mod tests {
 
         assert_eq!(r.counter_names(), vec!["c".to_string()]);
         assert_eq!(r.counter_labels("c").len(), 1);
-        assert_eq!(r.time_range_ns(), Some((1_000_000_000, 5_000_000_000)));
+        assert_eq!(r.time_range_ns(), Some((1_000_000_000, 205_000_000_000)));
         assert_eq!(
             store.fetched(),
             Vec::<usize>::new(),
             "listing needs no bytes"
         );
 
-        // A range in the middle segment, its lookback of one step
-        // included, touches the middle segment, and the last, which holds
-        // the series' first row after the range's end and is read first.
-        // It does not touch the first segment. Per series, so the segments
-        // are opened as the series' stream reads them.
+        // A range at the end of the middle segment, its lookback included,
+        // touches the middle segment, and the last, which holds the series'
+        // first row after the range's end and is read first. It does not
+        // touch the first segment. Per series, so the segments are opened
+        // as the series' stream reads them.
         let opts = QueryOptions::default().with_per_series_rates(true);
-        let _ = r.query_range_opts("irate(c[1s])", 3.25, 3.75, 1.0, &opts);
+        let _ = r.query_range_opts("irate(c[1s])", 104.25, 105.75, 1.0, &opts);
         assert_eq!(store.fetched(), vec![2, 1]);
         assert_eq!(r.cached_segments().0, 2);
 
         // Again: served from the cache.
-        let _ = r.query_range_opts("irate(c[1s])", 3.25, 3.75, 1.0, &opts);
+        let _ = r.query_range_opts("irate(c[1s])", 104.25, 105.75, 1.0, &opts);
         assert_eq!(store.fetched(), Vec::<usize>::new());
 
         // The whole range: the one not yet cached.
-        let _ = r.query_range_opts("irate(c[1s])", 0.0, 6.0, 1.0, &opts);
+        let _ = r.query_range_opts("irate(c[1s])", 0.0, 210.0, 1.0, &opts);
         assert_eq!(store.fetched(), vec![0]);
         assert_eq!(r.cached_segments().0, 3);
     }
@@ -2385,7 +2399,7 @@ pub(crate) mod tests {
     /// kept.
     #[test]
     fn opened_segments_are_evicted_least_recently_used_within_the_pools_budget() {
-        let segments = three_segments();
+        let segments = three_spaced_segments();
         // What one opened segment is charged: its bytes plus the footer
         // estimate, the same figure the pool is charged.
         let one =
@@ -2397,7 +2411,7 @@ pub(crate) mod tests {
         let pool = BufferPool::new(2 * one + one / 2);
         let r = SegmentedParquetReader::open_with_pool(store.clone(), pool).unwrap();
         let opts = QueryOptions::default().with_per_series_rates(true);
-        let _ = r.query_range_opts("irate(c[1s])", 0.0, 6.0, 1.0, &opts);
+        let _ = r.query_range_opts("irate(c[1s])", 0.0, 210.0, 1.0, &opts);
         store.fetched();
         let (n, bytes) = r.cached_segments();
         assert_eq!(n, 2, "two fit, the first opened was evicted");
@@ -2405,17 +2419,17 @@ pub(crate) mod tests {
 
         // The last two opened are the ones held: a query touching only the
         // last segment fetches nothing, one touching the first fetches it.
-        let _ = r.query_range_opts("irate(c[1s])", 4.5, 5.5, 1.0, &opts);
+        let _ = r.query_range_opts("irate(c[1s])", 203.5, 204.5, 1.0, &opts);
         assert_eq!(store.fetched(), Vec::<usize>::new());
-        let _ = r.query_range_opts("irate(c[1s])", 0.5, 1.5, 1.0, &opts);
+        let _ = r.query_range_opts("irate(c[1s])", 2.5, 3.5, 1.0, &opts);
         assert_eq!(store.fetched(), vec![0]);
 
         // A budget smaller than one segment keeps none, and a query still
         // opens each segment it touches.
-        let store = CountingStore::new(three_segments());
+        let store = CountingStore::new(three_spaced_segments());
         let r = SegmentedParquetReader::open_with_pool(store.clone(), BufferPool::new(1)).unwrap();
         store.fetched();
-        let _ = r.query_range_opts("irate(c[1s])", 0.0, 6.0, 1.0, &opts);
+        let _ = r.query_range_opts("irate(c[1s])", 0.0, 210.0, 1.0, &opts);
         assert_eq!(store.fetched(), vec![0, 1, 2]);
         assert_eq!(r.cached_segments().0, 0);
     }
@@ -2456,11 +2470,13 @@ pub(crate) mod tests {
     /// fetched again.
     #[test]
     fn sample_timestamps_read_every_segment_and_cache_none() {
-        let store = CountingStore::new(three_segments());
+        let store = CountingStore::new(three_spaced_segments());
         let pool = BufferPool::new(64 * 1024 * 1024);
         let r = SegmentedParquetReader::open_with_pool(store.clone(), pool).unwrap();
         store.fetched();
-        let want = vec![1_000_000_000, 3_000_000_000, 5_000_000_000];
+        let want: Vec<u64> = (0..3u64)
+            .flat_map(|k| (1..=5u64).map(move |s| (100 * k + s) * 1_000_000_000))
+            .collect();
         assert_eq!(MetricsSource::sample_timestamps(&r), want);
         assert_eq!(store.fetched(), vec![0, 1, 2]);
         assert_eq!(r.cached_segments().0, 0, "a scan keeps no segment");
@@ -2468,7 +2484,7 @@ pub(crate) mod tests {
         let opts = QueryOptions::default().with_per_series_rates(true);
         // The query reads the middle segment and, for the row after its
         // end, the last, first.
-        let _ = r.query_range_opts("irate(c[1s])", 3.25, 3.75, 1.0, &opts);
+        let _ = r.query_range_opts("irate(c[1s])", 104.25, 105.75, 1.0, &opts);
         assert_eq!(store.fetched(), vec![2, 1]);
         assert_eq!(MetricsSource::sample_timestamps(&r), want);
         assert_eq!(store.fetched(), vec![0], "the cached segments are reused");
@@ -3481,11 +3497,14 @@ pub(crate) mod tests {
     }
 
     /// Samples outside the range a query reads do not make edges outside
-    /// it observed: with samples half a second off the grid, an `irate` over
-    /// 10-15 s has points at 11-15 s on both paths.
+    /// it observed: with samples half a second off the grid and none from
+    /// 1.5 s to 8.5 s, the row at 0.5 s is before the read (5 s before the
+    /// range), so the edge at 9 s is not observed on either path, and an
+    /// `irate` over 10-15 s has points at 11-15 s on both.
     #[test]
     fn a_batch_read_keeps_to_the_range() {
-        let rows: Vec<(u64, u64)> = (0..30u64)
+        let rows: Vec<(u64, u64)> = std::iter::once(0u64)
+            .chain(9..30u64)
             .map(|k| (k * 1_000_000_000 + 500_000_000, k * 10))
             .collect();
         let r = SegmentedParquetReader::open_bytes_with_pool(
@@ -3504,8 +3523,8 @@ pub(crate) mod tests {
         let QueryResult::Matrix { result, .. } = batch else {
             panic!("a matrix");
         };
-        // 15 s is past the last sample read (14.5 s) and within a spacing of
-        // the range's end, so the rate is held there.
+        // The point at 15 s interpolates to the row at 15.5 s, after the
+        // range's end.
         let times: Vec<f64> = result[0].values.iter().map(|(t, _)| *t).collect();
         assert_eq!(times, vec![11.0, 12.0, 13.0, 14.0, 15.0]);
     }

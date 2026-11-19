@@ -2381,6 +2381,84 @@ mod tests {
         }
     }
 
+    /// A grid `irate` at a step longer than its `[range]` has a point at the
+    /// range's start, through the batched rates, per series, and per part:
+    /// the read reaches the row at or before the time a step before it.
+    #[test]
+    fn an_irate_at_a_step_longer_than_its_range_has_a_point_at_the_start() {
+        let rows: Vec<(u64, u64)> = (0..60u64).map(|k| (k * S + S / 2, k * 10)).collect();
+        let reader = archive(vec![recording(
+            &[("source", "a")],
+            vec![("t", explicit_table("c", "counter", &rows))],
+        )]);
+        let scoped = |span: Option<(u64, u64)>| {
+            use crate::{Scope, ScopedSource, SourceRef};
+            QueryOptions::default().with_scope(Some(Arc::new(
+                Scope::new(vec![ScopedSource {
+                    source: SourceRef::Position(0),
+                    span,
+                }])
+                .unwrap(),
+            )))
+        };
+        for opts in [
+            QueryOptions::default(),
+            QueryOptions::default().with_per_series_rates(true),
+            scoped(None),
+            scoped(Some((0, 100 * S))),
+        ] {
+            for query in ["irate(c[2s])", "sum(irate(c[2s]))"] {
+                let QueryResult::Matrix { result, .. } = reader
+                    .query_range_opts(query, 20.0, 40.0, 10.0, &opts)
+                    .unwrap()
+                else {
+                    panic!("{query}: not a matrix");
+                };
+                let points = &result.first().expect(query).values;
+                assert_eq!(
+                    points,
+                    &vec![(20.0, 10.0), (30.0, 10.0), (40.0, 10.0)],
+                    "{query} {opts:?}"
+                );
+            }
+        }
+    }
+
+    /// Under cross-cadence evaluation an `irate` point is over the gap from
+    /// the evaluation timestamp before it, which can be a slow sampler's row
+    /// interval: the read reaches the row at or before that timestamp, so
+    /// the range's first point is the one a range starting earlier has.
+    #[test]
+    fn a_cross_cadence_irate_has_its_first_point() {
+        let fast: Vec<(u64, u64)> = (0..=120u64).map(|k| (k * S, k * 10)).collect();
+        let slow: Vec<(u64, u64)> = (0..=6u64).map(|k| (k * 20 * S, k * 100)).collect();
+        let reader = archive(vec![recording(
+            &[("source", "a")],
+            vec![
+                ("f", explicit_table("f", "counter", &fast)),
+                ("sl", explicit_table("sl", "counter", &slow)),
+            ],
+        )]);
+        let q = "irate(f[1s]) + irate(sl[1s])";
+        let points = |start: f64| -> Vec<(f64, f64)> {
+            let QueryResult::Matrix { result, .. } =
+                reader.query_range(q, start, 100.0, 1.0).unwrap()
+            else {
+                panic!("not a matrix");
+            };
+            result.first().map(|s| s.values.clone()).unwrap_or_default()
+        };
+        let from_30: Vec<(f64, f64)> = points(30.0)
+            .into_iter()
+            .filter(|(t, _)| *t >= 50.0)
+            .collect();
+        assert_eq!(
+            from_30.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            vec![60.0, 80.0, 100.0]
+        );
+        assert_eq!(points(50.0), from_30);
+    }
+
     fn values(
         reader: &ArchiveReader,
         query: &str,
