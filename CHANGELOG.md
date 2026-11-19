@@ -206,6 +206,17 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
 
 ### metriken-query (unreleased)
 
+- **Added:** comparison operators (`==`, `!=`, `>`, `<`, `>=`, `<=`), with
+  and without `bool`, between a vector and a scalar and between vectors.
+  Without `bool` a comparison keeps the points where it holds; with `bool`
+  it gives 1 or 0, with a band of `[0, 1]` where the operands' bands leave
+  the comparison undecided.
+- **Fixed:** a scalar operation on a histogram function's result scales
+  its `bands` as it scales its `intervals`.
+- **Fixed:** in raw mode, a point a binary operator drops (a division by
+  zero) no longer lets a join hold the point before it across it.
+- **Changed:** a scalar operation that leaves a histogram function's
+  series without points drops the series, as the streaming path does.
 - **Fixed:** a grid `irate` reads back its step and four of the
   counter's intervals, or its `[range]` when that is longer, so the
   range's first point is no longer missing when the `[range]` did not

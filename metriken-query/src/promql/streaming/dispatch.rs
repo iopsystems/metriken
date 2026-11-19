@@ -771,7 +771,11 @@ fn batch_display(
         match e {
             Expr::Paren(p) => e = &p.expr,
             Expr::Binary(bin) if bin.modifier.is_none() => {
-                let Some(op) = BinOp::from_token(&bin.op) else {
+                // A comparison keeps or drops points, which the batched
+                // display reduction does not.
+                let Some(op) =
+                    BinOp::from_token(&bin.op, false).filter(|op| !matches!(op, BinOp::Cmp { .. }))
+                else {
                     return Ok(None);
                 };
                 match (&*bin.lhs, &*bin.rhs) {
@@ -995,7 +999,8 @@ fn build_binary<'a, 'expr>(
 where
     'expr: 'a,
 {
-    let Some(op) = BinOp::from_token(&bin.op) else {
+    let return_bool = bin.modifier.as_ref().is_some_and(|m| m.return_bool);
+    let Some(op) = BinOp::from_token(&bin.op, return_bool) else {
         return Err(QueryError::Unsupported(format!(
             "binary operator not supported: {}",
             bin.op
@@ -1028,24 +1033,47 @@ where
     let lhs = build(ctx, &bin.lhs)?;
     let rhs = build(ctx, &bin.rhs)?;
 
+    // A comparison without `bool` passes the vector operand's points on
+    // unchanged, so they keep its metric name (Prometheus keeps the name
+    // through a comparison too); every other operator gives a value of its
+    // own, without one. Between vectors the name is the many side's under
+    // `group_right`, as the labels are, and the left side's otherwise.
+    let keep_name = |name: Option<&'a str>| if op.is_filter() { name } else { None };
+    let raw = matches!(ctx.rate_mode, RateMode::Raw);
     match (lhs, rhs) {
-        (Built::Series { series, .. }, Built::Scalar(s)) => Ok(Built::Series {
-            series: matrix_scalar_op(series, op, s, false),
-            metric_name: None,
+        (
+            Built::Series {
+                series,
+                metric_name,
+                ..
+            },
+            Built::Scalar(s),
+        ) => Ok(Built::Series {
+            series: matrix_scalar_op(series, op, s, false, raw),
+            metric_name: keep_name(metric_name),
             metric_name_for_error: None,
         }),
-        (Built::Scalar(s), Built::Series { series, .. }) => Ok(Built::Series {
-            series: matrix_scalar_op(series, op, s, true),
-            metric_name: None,
+        (
+            Built::Scalar(s),
+            Built::Series {
+                series,
+                metric_name,
+                ..
+            },
+        ) => Ok(Built::Series {
+            series: matrix_scalar_op(series, op, s, true, raw),
+            metric_name: keep_name(metric_name),
             metric_name_for_error: None,
         }),
         (
             Built::Series {
                 series: left_series,
+                metric_name: left_name,
                 ..
             },
             Built::Series {
                 series: right_series,
+                metric_name: right_name,
                 ..
             },
         ) => Ok(Built::Series {
@@ -1070,7 +1098,10 @@ where
                     ctx.start_ns,
                 )?,
             },
-            metric_name: None,
+            metric_name: keep_name(match grouped {
+                Some((OneSide::Left, _)) => right_name,
+                _ => left_name,
+            }),
             metric_name_for_error: None,
         }),
         (Built::Scalar(a), Built::Scalar(b)) => {
@@ -1094,55 +1125,80 @@ where
     }
 }
 
-/// Apply a scalar op to each materialized `MatrixSample`'s values and, when
-/// present, its uncertainty bands (interval arithmetic against a constant:
-/// apply to both endpoints, `min`/`max` to normalize sign; drop on div-by-zero).
-/// Keeps values and bands aligned point-for-point.
+/// Apply a scalar op to each materialized `MatrixSample`'s values and their
+/// uncertainty bands, keeping `values`, `intervals`, `bands` and
+/// `interpolated` aligned point for point. An arithmetic op takes a band
+/// through interval arithmetic against the scalar as exact `[scalar,
+/// scalar]`, so a spanning-zero denominator under `scalar / value` gives no
+/// band instead of a bogus narrow one, and drops a point on division by
+/// zero. A comparison keeps or drops each point, or gives 1 or 0 with
+/// `bool` (see [`binary`](super::binary)). A series left without points is
+/// dropped.
 fn scalar_op_matrix(
     mut result: Vec<crate::promql::MatrixSample>,
     op: BinOp,
     scalar: f64,
     scalar_first: bool,
 ) -> Vec<crate::promql::MatrixSample> {
-    let apply = |x: f64| -> Option<f64> {
-        if scalar_first {
-            op.apply(scalar, x)
-        } else {
-            op.apply(x, scalar)
-        }
-    };
+    let sb = (scalar, scalar);
+    let ordered = |x: super::Band| if scalar_first { (sb, x) } else { (x, sb) };
     for sample in &mut result {
-        let had_intervals = sample.intervals.is_some();
-        let mut vals = Vec::with_capacity(sample.values.len());
-        let mut ivls = Vec::with_capacity(sample.values.len());
-        for (i, (t, v)) in sample.values.iter().enumerate() {
-            let Some(nv) = apply(*v) else { continue };
-            vals.push((*t, nv));
-            // Propagate the band via the same interval arithmetic as the
-            // streaming scalar op (treat the scalar as exact `[scalar, scalar]`),
-            // so a spanning-zero denominator under `scalar / value` yields no
-            // band instead of a bogus narrow one. Histogram bands are currently
-            // non-negative so this path can't hit that case today, but it stays
-            // consistent with ScalarBroadcast.
-            let sb = (scalar, scalar);
-            if let Some((lo, hi)) = sample.intervals.as_ref().and_then(|iv| iv.get(i)) {
-                let band = if scalar_first {
-                    interval_binop(op, sb, (*lo, *hi))
-                } else {
-                    interval_binop(op, (*lo, *hi), sb)
-                };
-                if let Some(bb) = band {
-                    ivls.push(bb);
-                }
+        let n = sample.values.len();
+        let band_at = |i: usize| -> Option<super::Band> {
+            match &sample.bands {
+                Some(bands) => bands.get(i).copied().flatten(),
+                None => sample.intervals.as_ref().and_then(|iv| iv.get(i)).copied(),
             }
-        }
-        sample.intervals = if had_intervals && ivls.len() == vals.len() {
-            Some(ivls)
-        } else {
-            None
         };
-        sample.values = vals;
+        let interpolated_at = |i: usize| {
+            sample
+                .interpolated
+                .as_ref()
+                .is_some_and(|f| f.get(i) == Some(&true))
+        };
+        let mut values = Vec::with_capacity(n);
+        let mut bands: Vec<Option<super::Band>> = Vec::with_capacity(n);
+        let mut interpolated = Vec::with_capacity(n);
+        for (i, &(t, v)) in sample.values.iter().enumerate() {
+            let (l, r) = if scalar_first {
+                (scalar, v)
+            } else {
+                (v, scalar)
+            };
+            let band = band_at(i);
+            let out = match op {
+                BinOp::Cmp { cmp, bool: false } => cmp.holds(l, r).then_some((v, band)),
+                BinOp::Cmp { cmp, bool: true } => {
+                    let holds = cmp.holds(l, r);
+                    let band = band.map(|b| {
+                        let (lb, rb) = ordered(b);
+                        super::binary::compare_band(cmp, lb, rb, holds)
+                    });
+                    Some((f64::from(u8::from(holds)), band))
+                }
+                _ => op.apply(l, r).map(|nv| {
+                    let band = band.and_then(|b| {
+                        let (lb, rb) = ordered(b);
+                        interval_binop(op, lb, rb)
+                    });
+                    (nv, band)
+                }),
+            };
+            let Some((nv, band)) = out else { continue };
+            values.push((t, nv));
+            bands.push(band);
+            interpolated.push(interpolated_at(i));
+        }
+        let any_band = bands.iter().any(Option::is_some);
+        sample.intervals = (any_band && bands.iter().all(Option::is_some))
+            .then(|| bands.iter().map(|b| b.unwrap()).collect());
+        sample.bands = any_band.then_some(bands);
+        sample.interpolated = interpolated.iter().any(|f| *f).then_some(interpolated);
+        sample.values = values;
     }
+    // A series the op left without points is not in the result, as a
+    // streamed series without points is not.
+    result.retain(|s| !s.values.is_empty());
     result
 }
 

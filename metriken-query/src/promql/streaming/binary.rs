@@ -1,4 +1,5 @@
-//! Streaming binary operators (`+`, `-`, `*`, `/`).
+//! Streaming binary operators (`+`, `-`, `*`, `/`, and the comparisons
+//! `==`, `!=`, `>`, `<`, `>=`, `<=`).
 //!
 //! Three shapes are wired up:
 //!
@@ -23,11 +24,15 @@
 //!   `group_right`) reads each series of the one side into memory once and
 //!   replays it against every series of the many side matching it.
 //!
-//! What's NOT covered here:
+//! A comparison without `bool` keeps the vector operand's point (the left
+//! one between two vectors) where the comparison of the nominal values
+//! holds, with its value, band and edges, and drops it elsewhere. With
+//! `bool` it gives 1 or 0 at every point; the result has a band when an
+//! operand has one: `[1, 1]` or `[0, 0]` when the comparison holds for
+//! every value within the operands' bands or for none, and `[0, 1]` when
+//! the bands leave it undecided.
 //!
-//! * Comparison operators (`==`, `!=`, `<`, `>`, `<=`, `>=`) and
-//!   the `bool` modifier — not implemented in the eager engine
-//!   today either.
+//! What's NOT covered here: the set operators `and`, `or` and `unless`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
@@ -54,28 +59,98 @@ type PointIter<'a> = Box<dyn Iterator<Item = Point> + 'a>;
 /// Subset of PromQL binary operators the streaming pipeline
 /// recognises. `from_token` returns `None` for any token outside this
 /// set, which the dispatcher reports as unsupported.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BinOp {
     Add,
     Sub,
     Mul,
     Div,
+    /// A comparison; `bool` when it has the `bool` modifier.
+    Cmp {
+        cmp: Cmp,
+        bool: bool,
+    },
+}
+
+/// A comparison operator.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Cmp {
+    Eq,
+    Ne,
+    Gt,
+    Lt,
+    Ge,
+    Le,
+}
+
+impl Cmp {
+    /// Whether `l cmp r` holds.
+    pub fn holds(self, l: f64, r: f64) -> bool {
+        match self {
+            Self::Eq => l == r,
+            Self::Ne => l != r,
+            Self::Gt => l > r,
+            Self::Lt => l < r,
+            Self::Ge => l >= r,
+            Self::Le => l <= r,
+        }
+    }
+
+    /// Whether `l cmp r` holds for every pair of values within the bands
+    /// `l` and `r` (`Some(true)`), for none (`Some(false)`), or for some and
+    /// not others (`None`).
+    pub fn over(self, l: Band, r: Band) -> Option<bool> {
+        let ((a, b), (c, d)) = (l, r);
+        let all_eq = a == b && c == d && a == c;
+        let none_eq = b < c || d < a;
+        match self {
+            Self::Gt if a > d => Some(true),
+            Self::Gt if b <= c => Some(false),
+            Self::Ge if a >= d => Some(true),
+            Self::Ge if b < c => Some(false),
+            Self::Lt if b < c => Some(true),
+            Self::Lt if a >= d => Some(false),
+            Self::Le if b <= c => Some(true),
+            Self::Le if a > d => Some(false),
+            Self::Eq if all_eq => Some(true),
+            Self::Eq if none_eq => Some(false),
+            Self::Ne if none_eq => Some(true),
+            Self::Ne if all_eq => Some(false),
+            _ => None,
+        }
+    }
 }
 
 impl BinOp {
-    pub fn from_token(t: &TokenType) -> Option<Self> {
+    /// The operator of token `t`; `bool` is the binary expression's `bool`
+    /// modifier, which only a comparison takes.
+    pub fn from_token(t: &TokenType, bool: bool) -> Option<Self> {
+        let cmp = |cmp| Some(Self::Cmp { cmp, bool });
         match t.to_string().as_str() {
             "+" => Some(Self::Add),
             "-" => Some(Self::Sub),
             "*" => Some(Self::Mul),
             "/" => Some(Self::Div),
+            "==" => cmp(Cmp::Eq),
+            "!=" => cmp(Cmp::Ne),
+            ">" => cmp(Cmp::Gt),
+            "<" => cmp(Cmp::Lt),
+            ">=" => cmp(Cmp::Ge),
+            "<=" => cmp(Cmp::Le),
             _ => None,
         }
     }
 
+    /// Whether this is a comparison without `bool`, which keeps or drops
+    /// the vector operand's point rather than computing a value.
+    pub fn is_filter(self) -> bool {
+        matches!(self, Self::Cmp { bool: false, .. })
+    }
+
     /// Apply the binop. Returns `None` for a division by zero so
     /// the caller can drop the point — matching the eager engine,
-    /// which uses `continue` in the same case.
+    /// which uses `continue` in the same case — and for a comparison
+    /// without `bool` that does not hold; one that holds gives `lhs`.
     pub fn apply(self, lhs: f64, rhs: f64) -> Option<f64> {
         match self {
             Self::Add => Some(lhs + rhs),
@@ -88,7 +163,55 @@ impl BinOp {
                     None
                 }
             }
+            Self::Cmp { cmp, bool: true } => Some(f64::from(u8::from(cmp.holds(lhs, rhs)))),
+            Self::Cmp { cmp, bool: false } => cmp.holds(lhs, rhs).then_some(lhs),
         }
+    }
+}
+
+/// The point of a vector operand `p` against `scalar` for a comparison:
+/// `p` where a filter holds, a 1 or 0 point for `bool` (see the module
+/// docs for its band), `None` where a filter does not hold.
+fn compare_scalar(
+    p: Point,
+    cmp: Cmp,
+    bool: bool,
+    scalar: f64,
+    scalar_first: bool,
+) -> Option<Point> {
+    let (l, r) = if scalar_first {
+        (scalar, p.v)
+    } else {
+        (p.v, scalar)
+    };
+    let holds = cmp.holds(l, r);
+    if !bool {
+        return holds.then_some(p);
+    }
+    let bounds = p.bounds.map(|b| {
+        let s = (scalar, scalar);
+        let (lb, rb) = if scalar_first { (s, b) } else { (b, s) };
+        compare_band(cmp, lb, rb, holds)
+    });
+    Some(Point {
+        t: p.t,
+        v: f64::from(u8::from(holds)),
+        bounds: if p.interpolated { None } else { bounds },
+        edges: None,
+        interpolated: p.interpolated,
+        timing: false,
+    })
+}
+
+/// A `bool` comparison's band over operand bands `l` and `r`, whose
+/// nominal values compare as `holds`.
+pub(crate) fn compare_band(cmp: Cmp, l: Band, r: Band, holds: bool) -> Band {
+    match cmp.over(l, r) {
+        Some(_) => {
+            let v = f64::from(u8::from(holds));
+            (v, v)
+        }
+        None => (0.0, 1.0),
     }
 }
 
@@ -111,6 +234,8 @@ pub(crate) fn interval_binop(op: BinOp, l: (f64, f64), r: (f64, f64)) -> Option<
             }
             [a / c, a / d, b / c, b / d]
         }
+        // A comparison's band is not interval arithmetic (`compare_band`).
+        BinOp::Cmp { .. } => return None,
     };
     if corners.iter().any(|x| !x.is_finite()) {
         return None;
@@ -192,18 +317,33 @@ fn combine_bounds(
     if lb.is_none() && rb.is_none() {
         return None;
     }
-    let (mut lb, mut rb) = (lb, rb);
-    if let (Some(l), Some(r)) = (le, re) {
-        if l != r {
+    let (lb, rb) = widened(lv, lb, le, rv, rb, re);
+    interval_binop(op, lb.unwrap_or((lv, lv)), rb.unwrap_or((rv, rv)))
+}
+
+/// Two operands' bands, each re-derived over the union of both operands'
+/// edges when the edges differ (see [`combine_bounds`]).
+fn widened(
+    lv: f64,
+    lb: Option<Band>,
+    le: Option<RateEdges>,
+    rv: f64,
+    rb: Option<Band>,
+    re: Option<RateEdges>,
+) -> (Option<Band>, Option<Band>) {
+    match (le, re) {
+        (Some(l), Some(r)) if l != r => {
             let union = RateEdges {
                 left: (l.left.0.min(r.left.0), l.left.1.max(r.left.1)),
                 right: (l.right.0.min(r.right.0), l.right.1.max(r.right.1)),
             };
-            lb = lb.map(|b| widen_band(b, &l, &union, lv));
-            rb = rb.map(|b| widen_band(b, &r, &union, rv));
+            (
+                lb.map(|b| widen_band(b, &l, &union, lv)),
+                rb.map(|b| widen_band(b, &r, &union, rv)),
+            )
         }
+        _ => (lb, rb),
     }
-    interval_binop(op, lb.unwrap_or((lv, lv)), rb.unwrap_or((rv, rv)))
 }
 
 /// Wrap an upstream `(t, v)` iterator, applying `op` against a
@@ -215,6 +355,10 @@ pub struct ScalarBroadcast<I> {
     op: BinOp,
     scalar: f64,
     scalar_first: bool,
+    /// Pass a timing point on where the op drops one (raw mode, whose joins
+    /// hold a point until the next one, timing or not), rather than
+    /// nothing.
+    timing_on_drop: bool,
 }
 
 impl<I: Iterator<Item = Point>> Iterator for ScalarBroadcast<I> {
@@ -232,6 +376,14 @@ impl<I: Iterator<Item = Point>> Iterator for ScalarBroadcast<I> {
         for p in self.upstream.by_ref() {
             if p.timing {
                 return Some(p);
+            }
+            let t = p.t;
+            if let BinOp::Cmp { cmp, bool } = op {
+                match compare_scalar(p, cmp, bool, scalar, scalar_first) {
+                    Some(p) => return Some(p),
+                    None if self.timing_on_drop => return Some(Point::timing_at(t)),
+                    None => continue,
+                }
             }
             if let Some(r) = apply(p.v) {
                 // Propagate the uncertainty band through the scalar op via the
@@ -262,8 +414,11 @@ impl<I: Iterator<Item = Point>> Iterator for ScalarBroadcast<I> {
                     timing: false,
                 });
             }
-            // Skip on division by zero, mirroring the eager path's
-            // `continue` in the same situation.
+            // Division by zero drops the point; in raw mode a timing point
+            // stands in for it.
+            if self.timing_on_drop {
+                return Some(Point::timing_at(t));
+            }
         }
         None
     }
@@ -277,17 +432,20 @@ pub(crate) fn scalar_point(p: Point, op: BinOp, scalar: f64, scalar_first: bool)
         op,
         scalar,
         scalar_first,
+        timing_on_drop: false,
     }
     .next()
 }
 
 /// `series OP scalar` (or `scalar OP series` if `scalar_first`)
-/// applied across every input series.
+/// applied across every input series; `raw` for raw mode, where a point the
+/// op drops leaves a timing point.
 pub fn matrix_scalar_op<'a>(
     series: SeriesSet<'a>,
     op: BinOp,
     scalar: f64,
     scalar_first: bool,
+    raw: bool,
 ) -> SeriesSet<'a> {
     series
         .into_iter()
@@ -297,6 +455,7 @@ pub fn matrix_scalar_op<'a>(
                 op,
                 scalar,
                 scalar_first,
+                timing_on_drop: raw,
             };
             LabeledSeries::new(ls.labels, iter)
         })
@@ -354,8 +513,46 @@ fn match_key(labels: &Labels, spec: MatchSpec<'_>) -> BTreeMap<String, String> {
 }
 
 /// `op` over one left and one right point at the left's time; `None` where
-/// the op drops the point (division by zero).
+/// the op drops the point (a comparison that does not hold, a division by zero).
 fn combine_points(op: BinOp, left: Point, right: Point) -> Option<Point> {
+    if let BinOp::Cmp { cmp, bool } = op {
+        let holds = cmp.holds(left.v, right.v);
+        if !bool {
+            return holds.then_some(left);
+        }
+        // As for arithmetic: bands of two reads are widened over the union of
+        // their edges, and two reads too far apart give no band.
+        let apart = matches!(
+            (&left.edges, &right.edges),
+            (Some(l), Some(r)) if l != r && spans_apart(l, r)
+        );
+        let interpolated = left.interpolated || right.interpolated || apart;
+        let (lb, rb) = widened(
+            left.v,
+            left.bounds,
+            left.edges,
+            right.v,
+            right.bounds,
+            right.edges,
+        );
+        let bounds = match (lb, rb) {
+            (None, None) => None,
+            (lb, rb) => Some(compare_band(
+                cmp,
+                lb.unwrap_or((left.v, left.v)),
+                rb.unwrap_or((right.v, right.v)),
+                holds,
+            )),
+        };
+        return Some(Point {
+            t: left.t,
+            v: f64::from(u8::from(holds)),
+            bounds: if interpolated { None } else { bounds },
+            edges: None,
+            interpolated,
+            timing: false,
+        });
+    }
     let v = op.apply(left.v, right.v)?;
     let bounds = combine_bounds(
         op,
@@ -458,9 +655,10 @@ impl<'a> Iterator for LatestBinary<'a> {
                 continue;
             };
             left.t = t;
-            if let Some(p) = combine_points(self.op, left, right) {
-                return Some(p);
-            }
+            // Where the op drops the point (a comparison that does not hold,
+            // a division by zero), a timing point stands in for it, so a
+            // join of this result does not hold the point before across it.
+            return Some(combine_points(self.op, left, right).unwrap_or(Point::timing_at(t)));
         }
     }
 }
@@ -1142,6 +1340,7 @@ mod interval_tests {
             op: BinOp::Div,
             scalar: 10.0,
             scalar_first: true,
+            timing_on_drop: false,
         };
         let p = sb.next().unwrap();
         assert!((p.v - 100.0).abs() < 1e-9, "nominal 10/0.1 = 100");
@@ -1169,6 +1368,7 @@ mod interval_tests {
             op: BinOp::Div,
             scalar: 10.0,
             scalar_first: true,
+            timing_on_drop: false,
         };
         let p = sb.next().unwrap();
         let (lo, hi) = p.bounds.expect("positive denominator band propagates");
