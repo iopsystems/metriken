@@ -204,23 +204,24 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   every bound an integer), that it applies to `OVERFLOW_BOUND_KEY` too,
   and which readers divide by it.
 
-### metriken-query (unreleased)
+### metriken-query 0.51.0
 
+- **Added:** `increase(x[r])`: the counter's increase across the window
+  `rate(x[r])` is over. For a series that starts inside the window it is
+  the increase since its first row; it is not extrapolated to the window's
+  start. Over a process group it sums the members' parts of the window,
+  across a restart each epoch's own part.
+- **Added:** comparison operators (`==`, `!=`, `>`, `<`, `>=`, `<=`), with
+  and without `bool`, between a vector and a scalar and between vectors.
+  Without `bool` a comparison keeps the points where it holds; with `bool`
+  it gives 1 or 0, with a band of `[0, 1]` where the operands' bands leave
+  the comparison undecided.
 - **Added:** `min_over_time`, `max_over_time`, `sum_over_time`,
   `count_over_time`, `last_over_time`, `present_over_time`,
   `stdvar_over_time`, `stddev_over_time` and `quantile_over_time`, of a
   gauge (a counter is refused, as for `avg_over_time`).
 - **Added:** subqueries (`expr[r:s]`) as the argument of a `*_over_time`
   function.
-- **Added:** comparison operators (`==`, `!=`, `>`, `<`, `>=`, `<=`), with
-  and without `bool`, between a vector and a scalar and between vectors.
-  Without `bool` a comparison keeps the points where it holds; with `bool`
-  it gives 1 or 0, with a band of `[0, 1]` where the operands' bands leave
-  the comparison undecided.
-- **Fixed:** a scalar operation on a histogram function's result scales
-  its `bands` as it scales its `intervals`.
-- **Fixed:** in raw mode, a point a binary operator drops (a division by
-  zero) no longer lets a join hold the point before it across it.
 - **Changed:** a scalar operation that leaves a histogram function's
   series without points drops the series, as the streaming path does.
 - **Fixed:** a grid `irate` reads back its step and four of the
@@ -230,11 +231,10 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   a 1 s step over rows between grid points). Under cross-cadence
   evaluation, when an evaluation timestamp falls in the range, it reads
   back from the last evaluation timestamp before the range's start.
-- **Added:** `increase(x[r])`: the counter's increase across the window
-  `rate(x[r])` is over. For a series that starts inside the window it is
-  the increase since its first row; it is not extrapolated to the window's
-  start. Over a process group it sums the members' parts of the window,
-  across a restart each epoch's own part.
+- **Fixed:** a scalar operation on a histogram function's result scales
+  its `bands` as it scales its `intervals`.
+- **Fixed:** in raw mode, a point a binary operator drops (a division by
+  zero) no longer lets a join hold the point before it across it.
 
 ### metriken-query 0.50.3
 
