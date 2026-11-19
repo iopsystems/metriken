@@ -790,6 +790,14 @@ Requires metriken-storage 0.10.0.
   overflow series (warned once per endpoint, then logged at debug). A
   histogram without a `+Inf` bucket gets none either.
 
+### metriken-exposition (unreleased)
+
+- **Fixed:** a slot whose metadata sets `id` kept a new occupant key, and
+  had its labels sent again, on every `build_stream` after any change to its
+  group's slot metadata. The check for an unchanged occupant compared the
+  cached `id` with the slot number instead of the metadata's `id`. Such a
+  slot now keeps its key while its own metadata is unchanged.
+
 ### metriken-exposition 0.27.0
 
 Requires dendro 0.7.0.
