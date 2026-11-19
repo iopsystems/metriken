@@ -801,7 +801,7 @@ Requires metriken-storage 0.10.0.
   overflow series (warned once per endpoint, then logged at debug). A
   histogram without a `+Inf` bucket gets none either.
 
-### metriken-exposition (unreleased)
+### metriken-exposition 0.27.1
 
 - **Fixed:** in a long group, a slot whose metadata sets `id`, and a slot
   with no metadata, got a new occupant key, and had its labels sent again,
