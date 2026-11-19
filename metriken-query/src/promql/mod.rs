@@ -353,8 +353,8 @@ pub(crate) fn nothing_read(
         ))),
         Some(MetricKind::Counter) if kind == MetricKind::Gauge => {
             Err(QueryError::Unsupported(format!(
-                "{name} is a counter: read it through rate() or irate(), \
-                 e.g. rate({name}[1m])"
+                "{name} is a counter: read it through rate(), irate() or \
+                 increase(), e.g. rate({name}[1m])"
             )))
         }
         Some(held) => Err(QueryError::Unsupported(format!(

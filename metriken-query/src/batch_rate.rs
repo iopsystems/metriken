@@ -80,6 +80,9 @@ pub(crate) struct GridRateRequest<'a> {
     /// `rate(x[r])` with `span_ns` as `r`: a window starts as
     /// `CounterGridRate::over_range` says.
     pub range: bool,
+    /// `increase(x[r])`: each point is the increase across its window
+    /// (`CounterGridRate::over_increase`). Set with `range`.
+    pub increase: bool,
     /// The reach of a series' window start (`range_start`), for a series
     /// that does not carry its table's interval.
     pub reach_ns: u64,
@@ -827,7 +830,10 @@ impl SeriesRate {
                 from
             };
             self.trim(from);
-            if let Some(mut p) = self.point(at, from) {
+            if let Some(mut p) = self.point(at, from).map(|p| match grid.increase {
+                true => crate::promql::streaming::increase_point(p, at - from),
+                false => p,
+            }) {
                 p.t = t;
                 sink.emit(series, grid.index(t), p);
             }
@@ -949,6 +955,8 @@ pub(crate) struct Grid {
     pub span_ns: u64,
     /// See [`GridRateRequest::range`].
     pub range: bool,
+    /// See [`GridRateRequest::increase`].
+    pub increase: bool,
 }
 
 impl Grid {
@@ -959,6 +967,7 @@ impl Grid {
             step_ns: r.step_ns,
             span_ns: r.span_ns.max(1),
             range: r.range,
+            increase: r.increase,
         }
     }
 
@@ -2208,6 +2217,7 @@ mod tests {
                     step_ns: step,
                     span_ns: span,
                     range,
+                    increase: false,
                 };
                 assert_eq!(
                     format!("{:?}", batch(&input, windowed, &grid, reach_ns)),
@@ -2246,6 +2256,7 @@ mod tests {
             step_ns: S,
             span_ns: S,
             range: false,
+            increase: false,
         };
         let edges = [
             None,
@@ -2417,6 +2428,7 @@ mod tests {
             step_ns: 10,
             span_ns: 10,
             range: false,
+            increase: false,
         };
         for (t, n) in [
             (0, 0),
@@ -2443,6 +2455,7 @@ mod tests {
             step_ns: 1,
             span_ns: 1,
             range: false,
+            increase: false,
         };
         let labels = vec![Labels::default()];
         // One series per partition, all in group 0, whose sum depends on
@@ -2517,6 +2530,7 @@ mod tests {
                     step_ns: 10,
                     span_ns: span,
                     range,
+                    increase: false,
                 };
                 let w = 5_000;
                 let mut rate = SeriesRate::new(windowed, grid.start_ns, reach_ns);

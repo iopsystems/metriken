@@ -204,6 +204,14 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   every bound an integer), that it applies to `OVERFLOW_BOUND_KEY` too,
   and which readers divide by it.
 
+### metriken-query (unreleased)
+
+- **Added:** `increase(x[r])`: the counter's increase across the window
+  `rate(x[r])` is over. For a series that starts inside the window it is
+  the increase since its first row; it is not extrapolated to the window's
+  start. Over a process group each point is one member's, so across a
+  restart it counts only the increase after it.
+
 ### metriken-query 0.50.3
 
 - **Fixed:** strided histogram functions read each series' rows after the

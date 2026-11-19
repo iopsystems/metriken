@@ -60,7 +60,8 @@ pub(crate) use binary::{
 };
 pub(crate) use gauge::{AtPoints, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid};
 pub(crate) use rate::{
-    counter_increase, range_start, CounterGridRate, CounterPairwiseRate, SPACING_PROBE,
+    counter_increase, increase_point, range_start, CounterGridRate, CounterPairwiseRate,
+    SPACING_PROBE,
 };
 
 #[cfg(test)]

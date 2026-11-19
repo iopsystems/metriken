@@ -164,7 +164,7 @@ pub use scope::{Scope, ScopedSource, SourceRef};
 pub use segmented::SegmentedParquetReader;
 pub use union::UnionMetricsSource;
 
-/// Where `rate()` / `irate()` points are placed in time.
+/// Where `rate()` / `irate()` / `increase()` points are placed in time.
 ///
 /// `rate(x[r])` at `t` is the increase of the reset-adjusted cumulative
 /// counter across `[t − r, t]`, interpolated at both ends, divided by the
@@ -177,7 +177,15 @@ pub use union::UnionMetricsSource;
 /// `t − r` and is shorter than `r`, and with no sample in `(t − r, t)` such
 /// a window gives no point. `irate(x[r])` ignores `r`: on the grid its
 /// window is one step, and in raw mode it is the gap to the previous
-/// sample.
+/// sample. `increase(x[r])` is the increase across the same window as
+/// `rate(x[r])`, interpolated at both ends: the rate times the window's
+/// length, which is `r` except where the window is shorter (the series
+/// starts inside it, or has a gap at its start). Unlike Prometheus, it does
+/// not extrapolate to the window's start. Over a process group (copies,
+/// dumps, or a source with several producer epochs) each point is one
+/// member's, as for `rate`, so across a restart or a member boundary it
+/// counts only the increase since the answering member's first row in the
+/// window. It keeps `__name__`, as `rate` does.
 ///
 /// The value at `t` is interpolated from the samples either side of it, so
 /// a grid read takes each series' first sample after the range's end,
@@ -250,7 +258,7 @@ pub struct QueryOptions {
     /// so the uniform grid is the case where those gaps are all equal; a
     /// `rate`'s window is its `[range]`.
     pub eval_timestamps: Option<std::sync::Arc<[u64]>>,
-    /// Compute `rate`/`irate` from one sample stream per series rather than
+    /// Compute `rate`/`irate`/`increase` from one sample stream per series rather than
     /// in one pass over a segmented reader's columns. For samples in
     /// increasing time order the two give the same series and timestamps; an
     /// aggregate's values and bands can differ in the last bits, from

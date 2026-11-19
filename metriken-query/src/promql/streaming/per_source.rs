@@ -4,8 +4,8 @@
 //! A process group is the set of sources of one producer process (copies, a
 //! recording and a hindsight dump of it, two recorders of one agent at once;
 //! metriken-storage's `process` module). Each source is evaluated up to the
-//! per-series function (`rate`, `irate`, a gauge read, a windowed gauge
-//! function) as one recording is evaluated, with its own rows, interval and
+//! per-series function (`rate`, `irate`, `increase`, a gauge read, a
+//! windowed gauge function) as one recording is evaluated, with its own rows, interval and
 //! acquisition windows, and the results are combined per series: at each
 //! point the finest source whose rows cover the function's whole window
 //! answers, ties going to the source with the earlier first row (Q16), then

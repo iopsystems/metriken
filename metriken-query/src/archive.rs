@@ -2381,6 +2381,80 @@ mod tests {
         }
     }
 
+    /// On an archive, `increase(x[r])` is `rate(x[r])` times `r` through
+    /// the batched rates, per series, and per part; for a series that
+    /// starts inside the window it is the increase since its first row, on
+    /// each path.
+    #[test]
+    fn increase_is_the_rate_times_the_window_on_every_path() {
+        let rows: Vec<(u64, u64)> = (0..60u64).map(|k| (k * S + S / 2, k * k)).collect();
+        let reader = archive(vec![recording(
+            &[("source", "a")],
+            vec![("t", explicit_table("c", "counter", &rows))],
+        )]);
+        let scoped = |span: Option<(u64, u64)>| {
+            use crate::{Scope, ScopedSource, SourceRef};
+            QueryOptions::default().with_scope(Some(Arc::new(
+                Scope::new(vec![ScopedSource {
+                    source: SourceRef::Position(0),
+                    span,
+                }])
+                .unwrap(),
+            )))
+        };
+        let points = |q: &str, opts: &QueryOptions| -> Vec<(f64, f64)> {
+            let QueryResult::Matrix { result, .. } =
+                reader.query_range_opts(q, 10.0, 50.0, 1.0, opts).unwrap()
+            else {
+                panic!("{q}: not a matrix");
+            };
+            result.first().expect(q).values.clone()
+        };
+        for opts in [
+            QueryOptions::default(),
+            QueryOptions::default().with_per_series_rates(true),
+            scoped(None),
+            scoped(Some((0, 100 * S))),
+        ] {
+            for (increase, rate) in [
+                ("increase(c[5s])", "rate(c[5s])"),
+                ("sum(increase(c[5s]))", "sum(rate(c[5s]))"),
+            ] {
+                let (inc, rat) = (points(increase, &opts), points(rate, &opts));
+                assert_eq!(inc.len(), rat.len(), "{increase} {opts:?}");
+                assert!(!inc.is_empty(), "{increase}");
+                for ((ti, vi), (tr, vr)) in inc.iter().zip(&rat) {
+                    assert_eq!(ti, tr, "{increase}");
+                    assert!(
+                        (vi - vr * 5.0).abs() < 1e-9,
+                        "{increase} at {ti}: {vi} {vr}"
+                    );
+                }
+            }
+        }
+        // A counter from 30.5 s, 1 a second from 0: over a 60 s window its
+        // increase at 40 s is the 9.5 since its first row, not the rate
+        // times 60.
+        let late: Vec<(u64, u64)> = (30..60u64).map(|k| (k * S + S / 2, k - 30)).collect();
+        let reader = archive(vec![recording(
+            &[("source", "a")],
+            vec![("t", explicit_table("late", "counter", &late))],
+        )]);
+        for opts in [
+            QueryOptions::default(),
+            QueryOptions::default().with_per_series_rates(true),
+            scoped(None),
+        ] {
+            let QueryResult::Matrix { result, .. } = reader
+                .query_range_opts("increase(late[60s])", 40.0, 40.0, 1.0, &opts)
+                .unwrap()
+            else {
+                panic!("not a matrix");
+            };
+            assert_eq!(result[0].values, vec![(40.0, 9.5)], "{opts:?}");
+        }
+    }
+
     fn values(
         reader: &ArchiveReader,
         query: &str,
@@ -2845,6 +2919,9 @@ mod tests {
             "sum(rate(c[3s]))",
             "sum by (cpu) (rate(c[3s]))",
             "max by (source) (rate(c[3s]))",
+            "increase(c[3s])",
+            "sum(increase(c[3s]))",
+            "sum by (cpu) (increase(c[3s]))",
         ] {
             let before = batched();
             let fast = reader

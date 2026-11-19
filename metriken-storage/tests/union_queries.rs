@@ -908,6 +908,50 @@ fn two_dumps_of_one_buffer_are_one_recording_with_a_gap() {
         .any(|p| (at(10, 12, 0)..at(10, 18, 0)).contains(&ns(p.0))));
 }
 
+/// `increase` over a process group takes each point from one member, as
+/// `rate` does, so across a restart (a source with two producer epochs, one
+/// member each) a point counts only the increase since the answering
+/// member's first row in its window: a counter at 1000/s restarted at
+/// 10:05 gives 20,000 at 10:05:20, the part after the restart, and 60,000
+/// once the window is past it. Each path gives the same.
+#[test]
+fn increase_across_a_restart_counts_the_part_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("restart.dendro");
+    let restart = at(10, 5, 0);
+    let read = move |ts: u64| {
+        let value = if ts < restart {
+            10_000_000_000 + (ts - BASE) / MS
+        } else {
+            5_000_000_000 + (ts - restart) / MS
+        };
+        Read {
+            counters: vec![("cpu_cycles", value)],
+            gauges: Vec::new(),
+            histograms: Vec::new(),
+            window: MS,
+        }
+    };
+    write(
+        &path,
+        &[spec(
+            &[("host", "a")],
+            &[("e1", at(10, 0, 0)), ("e2", restart)],
+            rows(at(10, 0, 0), at(10, 10, 0), S),
+            read,
+        )],
+    );
+    let reader = open(&path);
+    let s = one_series(
+        &reader,
+        "increase(cpu_cycles[1m])",
+        (at(10, 5, 20), at(10, 7, 0), 1.0),
+    );
+    let value = |t: u64| s.points.iter().find(|p| ns(p.0) == t).map(|p| p.1);
+    assert_eq!(value(at(10, 5, 20)), Some(20_000.0));
+    assert_eq!(value(at(10, 7, 0)), Some(60_000.0));
+}
+
 /// Case 3: two recorders of one agent at once, at 1 s and 100 ms:
 /// `irate(cpu_cycles[5s])` at step 0.1 gives the 100 ms recording's points
 /// (1 ms windows; the 1 s recorder's are 10 ms) over its span.

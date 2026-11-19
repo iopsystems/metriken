@@ -466,7 +466,7 @@ impl<'a> Ctx<'a> {
     }
 }
 
-/// `rate`/`irate` of a matrix selector on the grid, computed by the source in
+/// `rate`/`irate`/`increase` of a matrix selector on the grid, computed by the source in
 /// one pass when it can (see [`crate::batch_rate`]). `None` for any other
 /// expression, for raw mode or explicit evaluation timestamps, and for a
 /// source that does not compute it: the caller then builds the per-series
@@ -510,7 +510,7 @@ fn scan_rates(
         let next = next_for_scan(&scan, from, name, filter, span, request.end_ns);
         return crate::batch_rate::grid_rates(scan, &request, next);
     };
-    let range = call.func.name == "rate";
+    let range = matches!(call.func.name, "rate" | "increase");
     let range_ns = match call.args.args.first().map(|a| &**a) {
         Some(Expr::MatrixSelector(sel)) => sel.range.as_nanos() as u64,
         _ => return None,
@@ -662,7 +662,7 @@ fn scan_rates(
     crate::batch_rate::grid_rates(metriken_storage::scan::interleave(scans), &request, next)
 }
 
-/// The metric, filter and request for a batch `rate`/`irate` of `call`, or
+/// The metric, filter and request for a batch `rate`/`irate`/`increase` of `call`, or
 /// `None` where the batch path does not apply; see [`batch_rates`].
 fn grid_request<'c, 'g>(
     ctx: &Ctx<'_>,
@@ -681,7 +681,7 @@ fn grid_request<'c, 'g>(
     {
         return None;
     }
-    if !matches!(call.func.name, "rate" | "irate") || call.args.args.len() != 1 {
+    if !matches!(call.func.name, "rate" | "irate" | "increase") || call.args.args.len() != 1 {
         return None;
     }
     let Expr::MatrixSelector(sel) = &*call.args.args[0] else {
@@ -699,8 +699,8 @@ fn grid_request<'c, 'g>(
     }
     let filter = selection.filter;
     let range_ns = sel.range.as_nanos() as u64;
-    // `rate` is over its `[range]`; `irate` over one step.
-    let range = call.func.name == "rate";
+    // `rate` and `increase` are over their `[range]`; `irate` over one step.
+    let range = matches!(call.func.name, "rate" | "increase");
     let (lookback, span_ns) = if range {
         (rate_lookback(ctx, name, range_ns), range_ns)
     } else {
@@ -713,6 +713,7 @@ fn grid_request<'c, 'g>(
         step_ns: ctx.step_ns,
         span_ns,
         range,
+        increase: call.func.name == "increase",
         reach_ns: rate_reach(ctx, name),
         group,
         display,
@@ -1242,7 +1243,7 @@ where
     if let Some(groups) = ctx.groups {
         if matches!(
             call.func.name,
-            "rate" | "irate" | "avg_over_time" | "idelta" | "deriv"
+            "rate" | "irate" | "increase" | "avg_over_time" | "idelta" | "deriv"
         ) {
             return build_per_source(ctx, groups, Leaf::Call(call));
         }
@@ -1276,11 +1277,13 @@ where
     };
 
     match call.func.name {
-        // `rate` is the rate over its `[range]` before each point; `irate`
-        // ignores the `[range]` and is the rate over one step, or between
-        // consecutive samples in raw mode (see `RateMode`).
-        "rate" | "irate" => {
-            let range = call.func.name == "rate";
+        // `rate` is the rate over its `[range]` before each point and
+        // `increase` the increase across it; `irate` ignores the `[range]`
+        // and is the rate over one step, or between consecutive samples in
+        // raw mode (see `RateMode`).
+        "rate" | "irate" | "increase" => {
+            let range = matches!(call.func.name, "rate" | "increase");
+            let increase = call.func.name == "increase";
             if let Some((series, _)) = batch_rates(ctx, call, None) {
                 return Ok(Built::Series {
                     series,
@@ -1358,6 +1361,7 @@ where
                             if range { range_ns } else { ctx.step_ns },
                         );
                         let rate = if range { rate.over_range(reach) } else { rate };
+                        let rate = if increase { rate.over_increase() } else { rate };
                         // Explicit timestamps replace the grid, so a value
                         // lands on a slow source's real reading instead of
                         // being interpolated to a grid point that source
@@ -1372,9 +1376,8 @@ where
                     }
                     // A point at every sample read, from before the range;
                     // the result is cut at `start` (`clip_raw`).
-                    RateMode::Raw if range => LabeledSeries::new(
-                        stream.labels,
-                        CounterGridRate::from_stream(
+                    RateMode::Raw if range => {
+                        let rate = CounterGridRate::from_stream(
                             stream.samples,
                             stream.windowed,
                             ctx.start_ns,
@@ -1383,8 +1386,10 @@ where
                             range_ns,
                         )
                         .over_range(reach)
-                        .at_samples(),
-                    ),
+                        .at_samples();
+                        let rate = if increase { rate.over_increase() } else { rate };
+                        LabeledSeries::new(stream.labels, rate)
+                    }
                     RateMode::Raw => LabeledSeries::new(
                         stream.labels,
                         // A pair spans up to four of the series' interval
@@ -1729,7 +1734,7 @@ impl<'e> Leaf<'e> {
     fn reads_counter(self, source: &dyn DataSource, name: &str) -> bool {
         match self {
             Leaf::Call(call) => match call.func.name {
-                "rate" | "irate" => true,
+                "rate" | "irate" | "increase" => true,
                 "deriv" => source.counter_names().iter().any(|n| n == name),
                 _ => false,
             },
@@ -1744,7 +1749,7 @@ impl<'e> Leaf<'e> {
         let gauge = || source.gauge_names().iter().any(|n| n == name);
         match self {
             Leaf::Call(call) => match call.func.name {
-                "rate" | "irate" => counter(),
+                "rate" | "irate" | "increase" => counter(),
                 "deriv" => counter() || gauge(),
                 _ => gauge(),
             },
