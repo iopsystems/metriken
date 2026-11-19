@@ -386,3 +386,63 @@ fn a_relabelled_slot_without_a_uid_is_a_new_occupant() {
     assert_ne!(o.key, k0);
     assert_eq!(*o.labels, labels(&[("dev", "sdb"), ("id", "0")]));
 }
+
+#[metric(name = "stream_caller_id_bytes", metadata = { acq_group = "slots_caller_id" })]
+static CALLER_ID: metriken::GaugeGroup = metriken::GaugeGroup::new(4);
+
+/// A slot whose metadata sets `id` keeps that `id` and its key while its
+/// metadata is unchanged, including across a build in which another slot's
+/// metadata changed.
+#[test]
+fn a_caller_set_id_keeps_its_key_when_another_slot_changes() {
+    let _one = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let md = |name: &str, id: &str| {
+        [
+            ("name".to_string(), name.to_string()),
+            ("id".to_string(), id.to_string()),
+        ]
+        .into()
+    };
+    SlotMetadata::set_metadata(&CALLER_ID, 0, md("a", "1000"));
+    SlotMetadata::set_metadata(&CALLER_ID, 1, md("b", "2000"));
+    CALLER_ID.set(0, 1);
+    CALLER_ID.set(1, 2);
+    let mut b = GroupBuilder::new(TestRouter);
+    let first = stream(&mut b);
+    let before: Vec<(u64, BTreeMap<String, String>)> = long(&first, "slots_caller_id")
+        .occupants
+        .iter()
+        .map(|o| (o.key, (*o.labels).clone()))
+        .collect();
+    assert_eq!(before[0].1, labels(&[("id", "1000"), ("name", "a")]));
+
+    SlotMetadata::set_metadata(&CALLER_ID, 2, md("c", "3000"));
+    CALLER_ID.set(2, 3);
+    let second = stream(&mut b);
+    let g = long(&second, "slots_caller_id");
+    assert_eq!(g.occupants.len(), 3);
+    let after: Vec<(u64, BTreeMap<String, String>)> = g.occupants[..2]
+        .iter()
+        .map(|o| (o.key, (*o.labels).clone()))
+        .collect();
+    assert_eq!(after, before);
+}
+
+#[metric(name = "stream_bare_slots", metadata = { acq_group = "bare" })]
+static BARE: metriken::CounterGroup = metriken::CounterGroup::new(4);
+
+/// A slot with no metadata keeps its key when another slot's metadata changes.
+#[test]
+fn a_slot_without_metadata_keeps_its_key_when_another_slot_changes() {
+    let _one = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    BARE.set(0, 1);
+    let mut b = GroupBuilder::new(TestRouter);
+    let first = stream(&mut b);
+    let before = long(&first, "bare").occupants[0].key;
+
+    SlotMetadata::set_metadata(&BARE, 1, [("name".to_string(), "x".to_string())].into());
+    let second = stream(&mut b);
+    let o = &long(&second, "bare").occupants[0];
+    assert_eq!(*o.labels, labels(&[("id", "0")]));
+    assert_eq!(o.key, before);
+}
