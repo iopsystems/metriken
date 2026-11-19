@@ -204,26 +204,14 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   every bound an integer), that it applies to `OVERFLOW_BOUND_KEY` too,
   and which readers divide by it.
 
-### metriken-query (unreleased)
+### metriken-query 0.50.3
 
 - **Fixed:** strided histogram functions read each series' rows after the
   end of the range until the windows at the end are closed, instead of
-  stopping at the end of the range. A strided instant query between two
-  rows now includes its share of the next row. Points at or before the end
-  can still differ from a longer range's when the bucket configuration or
-  scale changes after the end; when every series of the range goes two of
-  its row intervals without a row across the end; or, on a process group,
-  when a series' next row after the end is more than 16 of the metric's
-  row intervals after it.
-- **Changed:** while rows follow the end of a range, a strided call gives
-  no point for the window holding an end that is not a multiple of the
-  stride. A longer range stamps that window at its close, after the end.
-  It was stamped at its last row.
-- **Changed:** a strided call whose rows after the range's end hold a
-  series out of time order fails with the out-of-order error, as a range
-  holding those rows does.
-- **Changed:** on an archive's process group, a strided call's conflict
-  notices include rows read after the range's end.
+  stopping at the end of the range.
+- **Changed:** while rows follow the end of a range, the partial window
+  holding an end that is not a multiple of the stride gives no point; it
+  was stamped at its last row.
 
 ### metriken-query 0.50.2
 
