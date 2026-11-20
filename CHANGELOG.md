@@ -114,6 +114,15 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   as every series is. A `# HELP` text is kept under the exporter's name
   only.
 
+### metriken-storage (unreleased)
+
+- **Changed:** opening a segmented table stores each series' label set
+  once, shared by the indexes built at open, where it was copied into
+  each. The first query on a table of 161,222 task series takes 1.43 s
+  where it took 2.13 s, and leaves 1.47 GB resident where it left 2.27 GB.
+  On a 9.6 h recording with a wide task table, it takes 4.07 s where it
+  took 4.36 s, with the same resident memory.
+
 ### metriken-storage 0.13.2
 
 - **Changed:** `SegmentedSource::counter_streams` no longer fetches
