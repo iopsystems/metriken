@@ -757,7 +757,15 @@ impl SeriesRate {
         // no value outside the samples), so it emits nothing: start at the
         // first point at or after that sample.
         let first = self.probe[0].ts;
-        let skipped = points_before(grid, first) as u64;
+        #[cfg(test)]
+        let skip = !tests::WALK_FROM_START.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let skip = true;
+        let skipped = if skip {
+            points_before(grid, first) as u64
+        } else {
+            0
+        };
         self.cursor_ns = self.cursor_ns.max(
             grid.start_ns
                 .saturating_add(skipped.saturating_mul(grid.step_ns)),
@@ -2514,6 +2522,135 @@ mod tests {
             "{got} against {expected}"
         );
         assert_ne!(((0.3 + 0.2) + 0.1f64).to_bits(), expected.to_bits());
+    }
+
+    thread_local! {
+        /// Set by a test to make `SeriesRate::settle` walk from the range's
+        /// start, as it did before it started at the first sample.
+        pub(super) static WALK_FROM_START: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// Starting a series at its first sample changes nothing it emits or
+    /// reports: the points, and after every push its pending point, last
+    /// sample, spacing and earliest point, are the same as when it walks
+    /// from the range's start. Late starts, `increase`, a `rate`'s
+    /// `[range]` and not, windowed and not, steps down to 1 ms, grids that
+    /// start off the step, `end_early` and a sample after the range's end.
+    #[test]
+    fn starting_at_the_first_sample_matches_walking_from_the_start() {
+        struct Record(Vec<(usize, Point)>);
+        impl Sink for Record {
+            fn emit(&mut self, _series: usize, index: usize, point: Point) {
+                self.0.push((index, point));
+            }
+        }
+        struct Case<'a> {
+            input: &'a [Sample],
+            windowed: bool,
+            grid: &'a Grid,
+            reach_ns: u64,
+            end_early_at: Option<usize>,
+            next: Option<Sample>,
+        }
+        fn run(c: &Case<'_>, walk: bool) -> String {
+            WALK_FROM_START.with(|w| w.set(walk));
+            let mut sink = Record(Vec::new());
+            let mut r = SeriesRate::new(c.windowed, c.grid.start_ns, c.reach_ns).with_next(c.next);
+            let mut trace = Vec::new();
+            for (i, s) in c.input.iter().enumerate() {
+                if Some(i) == c.end_early_at {
+                    r.end_early(c.grid, 0, &mut sink);
+                }
+                r.push(*s, c.grid, 0, &mut sink);
+                trace.push((
+                    r.pending_ns(),
+                    r.last_ts(),
+                    r.spacing_ns(),
+                    earliest_point(&r, s.ts, c.grid),
+                    sink.0.len(),
+                ));
+            }
+            if let Some(n) = r.take_next() {
+                r.push(n, c.grid, 0, &mut sink);
+            }
+            r.finish(c.grid, 0, &mut sink);
+            trace.push((
+                r.pending_ns(),
+                r.last_ts(),
+                r.spacing_ns(),
+                None,
+                sink.0.len(),
+            ));
+            WALK_FROM_START.with(|w| w.set(false));
+            format!("{:?} {:?}", sink.0, trace)
+        }
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        let mut late = 0;
+        for case in 0..60_000 {
+            let windowed = rng.below(2) == 0;
+            let mut input = samples(&mut rng, true, true, true, windowed);
+            if rng.below(3) == 0 {
+                as_floats(&mut input, rng.below(6) as usize);
+            }
+            let shift = rng.below(4) * 7 * S + rng.below(S);
+            for s in input.iter_mut() {
+                s.ts += shift;
+                if let Some(w) = s.window.as_mut() {
+                    w.0 += shift;
+                    w.1 += shift;
+                }
+            }
+            let step = [S, S / 2, 2 * S, 2_500_000_000, S / 10, S / 1000][rng.below(6) as usize];
+            let span = match rng.below(3) {
+                0 => step,
+                1 => step * (1 + rng.below(3)),
+                _ => 1 + rng.below(step),
+            };
+            let start = rng.below(8) * step
+                + if rng.below(4) == 0 {
+                    rng.below(step)
+                } else {
+                    0
+                };
+            let grid = Grid {
+                start_ns: start,
+                end_ns: start + rng.below(60) * step,
+                step_ns: step,
+                span_ns: span.max(1),
+                range: rng.below(2) == 0,
+                increase: rng.below(2) == 0,
+            };
+            let reach_ns = [0, S / 2, S, 2 * S, 10 * S][rng.below(5) as usize];
+            let end_early_at = (rng.below(5) == 0 && !input.is_empty())
+                .then(|| rng.below(input.len() as u64) as usize);
+            let next = if rng.below(3) == 0 {
+                input.last().map(|l| {
+                    let after = l.ts.max(grid.end_ns);
+                    Sample {
+                        ts: after + 1 + rng.below(3 * S),
+                        value: l.value,
+                        window: l.window.map(|_| (after + 1, after + 2)),
+                    }
+                })
+            } else {
+                None
+            };
+            let c = Case {
+                input: &input,
+                windowed,
+                grid: &grid,
+                reach_ns,
+                end_early_at,
+                next,
+            };
+            if input.first().is_some_and(|f| f.ts > grid.start_ns + step) {
+                late += 1;
+            }
+            assert_eq!(run(&c, false), run(&c, true), "case {case}");
+        }
+        // The cases the change is about are most of them.
+        assert!(late > 30_000, "{late} late starts");
     }
 
     /// A series with no sample yet emits nothing before its earliest point
