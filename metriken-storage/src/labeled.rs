@@ -666,6 +666,10 @@ impl DataSource for LabeledSource {
         self.inner.columns_desc()
     }
 
+    fn columns_desc_ref(&self) -> Option<&[parquet::ColDesc]> {
+        self.inner.columns_desc_ref()
+    }
+
     fn column_count(&self) -> usize {
         self.inner.column_count()
     }
