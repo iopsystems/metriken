@@ -151,7 +151,11 @@ impl SegmentStore for InMemorySegments {
 #[derive(Default)]
 struct IdentityMemo {
     /// metric -> column labels -> what is known about the column.
-    columns: HashMap<String, HashMap<Arc<Labels>, ColumnMemo, LabelsHash>, LabelsHash>,
+    columns: hashbrown::HashMap<
+        String,
+        hashbrown::HashMap<Arc<Labels>, ColumnMemo, LabelsHash>,
+        LabelsHash,
+    >,
 }
 
 /// What [`IdentityMemo`] holds for one column of one metric.
@@ -180,24 +184,24 @@ enum Kind {
 
 impl IdentityMemo {
     /// The entry for a column of `name` with `labels`, made on first use.
+    /// One hash of each key; the labels are copied only when the entry is
+    /// made.
     fn column(&mut self, name: &str, labels: &Labels) -> &mut ColumnMemo {
-        if !self.columns.contains_key(name) {
-            self.columns.insert(name.to_string(), HashMap::default());
+        match self.columns.entry_ref(name).or_default().entry_ref(labels) {
+            hashbrown::hash_map::EntryRef::Occupied(e) => e.into_mut(),
+            hashbrown::hash_map::EntryRef::Vacant(e) => {
+                let own = Arc::new(labels.clone());
+                e.insert_with_key(
+                    Arc::clone(&own),
+                    ColumnMemo {
+                        own,
+                        sets: None,
+                        registered: [false; 3],
+                        positions: None,
+                    },
+                )
+            }
         }
-        let metric = self.columns.get_mut(name).expect("inserted above");
-        if !metric.contains_key(labels) {
-            let own = Arc::new(labels.clone());
-            metric.insert(
-                Arc::clone(&own),
-                ColumnMemo {
-                    own,
-                    sets: None,
-                    registered: [false; 3],
-                    positions: None,
-                },
-            );
-        }
-        metric.get_mut(labels).expect("inserted above")
     }
 
     /// The column's own labels, shared.
@@ -215,10 +219,20 @@ impl IdentityMemo {
         labels: &Labels,
         unresolved: &mut bool,
     ) -> Arc<[Arc<Labels>]> {
-        let column = self.column(name, labels);
+        Self::sets_of(self.column(name, labels), relabel, name, unresolved)
+    }
+
+    /// [`presents`](Self::presents) for a column already looked up.
+    fn sets_of(
+        column: &mut ColumnMemo,
+        relabel: Option<&Arc<dyn ColumnRelabel>>,
+        name: &str,
+        unresolved: &mut bool,
+    ) -> Arc<[Arc<Labels>]> {
         if let Some(sets) = &column.sets {
             return Arc::clone(sets);
         }
+        let labels: &Labels = &column.own;
         let sets: Arc<[Arc<Labels>]> = match relabel.and_then(|r| r.identities(name, labels)) {
             Some(sets) => sets.into_iter().map(Arc::new).collect(),
             None => {
@@ -249,12 +263,13 @@ impl IdentityMemo {
         labels: &Labels,
         unresolved: &mut bool,
     ) -> Positions {
-        if let Some(p) = &self.column(name, labels).positions {
+        let column = self.column(name, labels);
+        if let Some(p) = &column.positions {
             return Arc::clone(p);
         }
-        let sets = self.presents(relabel, name, labels, unresolved);
+        let sets = Self::sets_of(column, relabel, name, unresolved);
         let p: Positions = sets.iter().map(|l| identity.position(name, l)).collect();
-        self.column(name, labels).positions = Some(Arc::clone(&p));
+        column.positions = Some(Arc::clone(&p));
         p
     }
 }
