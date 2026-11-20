@@ -145,39 +145,31 @@ impl SegmentStore for InMemorySegments {
 /// What one open asks of a relabel and of the identity indexes, kept so
 /// each is done once per column rather than once per segment: a relabel's
 /// answer depends on the metric and the column's labels, not the segment.
+///
+/// A column's labels are copied once, into its entry, and the label sets it
+/// presents as are shared (`Arc`) with every index built from them.
 #[derive(Default)]
 struct IdentityMemo {
-    /// metric -> column labels -> the sets the column presents as.
-    sets: HashMap<String, HashMap<Labels, Presented>>,
-    /// metric -> column labels -> counter positions of its sets, once they
-    /// are registered.
-    positions: HashMap<String, HashMap<Labels, Positions>>,
-    /// Per [`Kind`], metric -> the column labels already registered.
-    registered: [HashMap<String, std::collections::HashSet<Labels>>; 3],
+    /// metric -> column labels -> what is known about the column.
+    columns: HashMap<String, HashMap<Arc<Labels>, ColumnMemo, LabelsHash>, LabelsHash>,
+}
+
+/// What [`IdentityMemo`] holds for one column of one metric.
+struct ColumnMemo {
+    /// The column's own labels, shared with the tables that name the column.
+    own: Arc<Labels>,
+    /// The sets the column presents as, once asked: its own, unless the
+    /// relabel says otherwise.
+    sets: Option<Arc<[Arc<Labels>]>>,
+    /// Per [`Kind`], whether the column has been registered.
+    registered: [bool; 3],
+    /// The counter positions of its sets, once asked.
+    positions: Option<Positions>,
 }
 
 /// The counter positions of a column's sets; `None` for a set the index
 /// does not hold.
 type Positions = Arc<[Option<usize>]>;
-
-/// The label sets a column presents as.
-#[derive(Clone)]
-enum Presented {
-    /// Its own labels.
-    Own,
-    /// The relabel's.
-    Sets(Arc<[Labels]>),
-}
-
-impl Presented {
-    /// The sets, given the column's own labels.
-    fn of<'a>(&'a self, own: &'a Labels) -> &'a [Labels] {
-        match self {
-            Presented::Own => std::slice::from_ref(own),
-            Presented::Sets(sets) => sets,
-        }
-    }
-}
 
 #[derive(Clone, Copy)]
 enum Kind {
@@ -187,6 +179,32 @@ enum Kind {
 }
 
 impl IdentityMemo {
+    /// The entry for a column of `name` with `labels`, made on first use.
+    fn column(&mut self, name: &str, labels: &Labels) -> &mut ColumnMemo {
+        if !self.columns.contains_key(name) {
+            self.columns.insert(name.to_string(), HashMap::default());
+        }
+        let metric = self.columns.get_mut(name).expect("inserted above");
+        if !metric.contains_key(labels) {
+            let own = Arc::new(labels.clone());
+            metric.insert(
+                Arc::clone(&own),
+                ColumnMemo {
+                    own,
+                    sets: None,
+                    registered: [false; 3],
+                    positions: None,
+                },
+            );
+        }
+        metric.get_mut(labels).expect("inserted above")
+    }
+
+    /// The column's own labels, shared.
+    fn own(&mut self, name: &str, labels: &Labels) -> Arc<Labels> {
+        Arc::clone(&self.column(name, labels).own)
+    }
+
     /// The label sets a column of `name` with `labels` presents as: its
     /// own, unless the relabel says otherwise. Sets `unresolved` for a
     /// column naming an occupant the relabel did not describe.
@@ -196,39 +214,28 @@ impl IdentityMemo {
         name: &str,
         labels: &Labels,
         unresolved: &mut bool,
-    ) -> Presented {
-        let Some(r) = relabel else {
-            return Presented::Own;
-        };
-        if let Some(sets) = self.sets.get(name).and_then(|m| m.get(labels)) {
-            return sets.clone();
+    ) -> Arc<[Arc<Labels>]> {
+        let column = self.column(name, labels);
+        if let Some(sets) = &column.sets {
+            return Arc::clone(sets);
         }
-        let sets = match r.identities(name, labels) {
-            Some(sets) => Presented::Sets(sets.into()),
+        let sets: Arc<[Arc<Labels>]> = match relabel.and_then(|r| r.identities(name, labels)) {
+            Some(sets) => sets.into_iter().map(Arc::new).collect(),
             None => {
-                if labels.inner.contains_key(crate::long::OCCUPANT_LABEL) {
+                if relabel.is_some() && labels.inner.contains_key(crate::long::OCCUPANT_LABEL) {
                     *unresolved = true;
                 }
-                Presented::Own
+                Arc::from([Arc::clone(&column.own)])
             }
         };
-        self.sets
-            .entry(name.to_string())
-            .or_default()
-            .insert(labels.clone(), sets.clone());
+        column.sets = Some(Arc::clone(&sets));
         sets
     }
 
     /// Whether this is the first time `(kind, name, labels)` is seen.
     fn register(&mut self, kind: Kind, name: &str, labels: &Labels) -> bool {
-        let seen = &mut self.registered[kind as usize];
-        if seen.get(name).is_some_and(|m| m.contains(labels)) {
-            return false;
-        }
-        seen.entry(name.to_string())
-            .or_default()
-            .insert(labels.clone());
-        true
+        let seen = &mut self.column(name, labels).registered[kind as usize];
+        !std::mem::replace(seen, true)
     }
 
     /// The positions in `identity` of the sets a counter column presents
@@ -242,19 +249,12 @@ impl IdentityMemo {
         labels: &Labels,
         unresolved: &mut bool,
     ) -> Positions {
-        if let Some(p) = self.positions.get(name).and_then(|m| m.get(labels)) {
+        if let Some(p) = &self.column(name, labels).positions {
             return Arc::clone(p);
         }
         let sets = self.presents(relabel, name, labels, unresolved);
-        let p: Positions = sets
-            .of(labels)
-            .iter()
-            .map(|l| identity.position(name, l))
-            .collect();
-        self.positions
-            .entry(name.to_string())
-            .or_default()
-            .insert(labels.clone(), Arc::clone(&p));
+        let p: Positions = sets.iter().map(|l| identity.position(name, l)).collect();
+        self.column(name, labels).positions = Some(Arc::clone(&p));
         p
     }
 }
@@ -420,7 +420,7 @@ impl Listing {
             for (name, labels) in columns.into_iter().flatten() {
                 let sets = memo.presents(relabel, name, labels, unresolved);
                 if memo.register(kind, name, labels) {
-                    identity.extend(sets.of(labels).iter().map(|l| (name.clone(), l.clone())));
+                    identity.extend(name, sets.iter().cloned());
                 }
             }
         }
@@ -440,19 +440,20 @@ impl Listing {
                 &columns.gauge_histogram_configs,
             ),
         ] {
-            let histogram_columns: Vec<(String, Labels)> = columns
+            let histogram_columns: Vec<(&String, Arc<Labels>)> = columns
                 .iter()
                 .flat_map(|(name, labels)| {
                     let sets = memo.presents(relabel, name, labels, unresolved);
-                    sets.of(labels)
-                        .iter()
-                        .map(|l| (name.clone(), l.clone()))
+                    sets.iter()
+                        .map(|l| (name, Arc::clone(l)))
                         .collect::<Vec<_>>()
                 })
                 .collect();
             runs.observe(idx, configs.clone());
             runs.observe_labels(idx, &histogram_columns);
-            identity.extend(histogram_columns);
+            for (name, labels) in histogram_columns {
+                identity.extend(name, [labels]);
+            }
         }
     }
 
@@ -575,7 +576,7 @@ impl OpenState {
             }
             let sets = memo.presents(relabel, &name, &labels, &mut unresolved);
             let held = self.duplicated.entry(name).or_default();
-            held.extend(sets.of(&labels).iter().map(|l| l.inner.clone()));
+            held.extend(sets.iter().map(|l| l.inner.clone()));
             held.sort();
             held.dedup();
         }
@@ -597,10 +598,9 @@ impl OpenState {
             let column_labels = match table.labels_index.get(&col.labels) {
                 Some(i) => *i,
                 None => {
-                    table.labels.push(col.labels.clone());
-                    table
-                        .labels_index
-                        .insert(col.labels.clone(), table.labels.len() - 1);
+                    let own = memo.own(&col.name, &col.labels);
+                    table.labels.push(Arc::clone(&own));
+                    table.labels_index.insert(own, table.labels.len() - 1);
                     table.labels.len() - 1
                 }
             } as u32;
@@ -645,8 +645,8 @@ impl OpenState {
                 if run.is_none() && !memo.register(Kind::ColumnMap, &metric, &labels) {
                     continue;
                 }
-                for set in sets.of(&labels) {
-                    let mut set = set.clone();
+                for set in sets.iter() {
+                    let mut set = Labels::clone(set);
                     if let Some(run) = run {
                         set.inner.insert("__run__".to_string(), run.to_string());
                     }
@@ -754,9 +754,9 @@ fn check_histogram_configs(
     Ok(())
 }
 
-/// The hasher for maps keyed by a series' labels, which the reader builds at
-/// open and probes per column: foldhash rather than SipHash, being faster on
-/// these keys and still seeded per process.
+/// The hasher for maps the reader builds at open and probes per column, keyed
+/// by a series' labels or a metric's name: foldhash rather than SipHash, being
+/// faster on these keys and still seeded per process.
 type LabelsHash = foldhash::fast::RandomState;
 
 /// `(name, labels) -> position` for one metric kind (counter, gauge, or raw
@@ -787,26 +787,31 @@ type LabelsHash = foldhash::fast::RandomState;
 #[derive(Clone, Default)]
 struct SeriesIdentity {
     /// name -> distinct label sets, index == position.
-    order: HashMap<String, Vec<Labels>>,
-    /// name -> (labels -> position), mirrors `order`.
-    pos: HashMap<String, HashMap<Labels, usize, LabelsHash>>,
+    order: HashMap<String, Vec<Arc<Labels>>>,
+    /// name -> (labels -> position), mirrors `order`; each set is shared
+    /// with `order`.
+    pos: HashMap<String, HashMap<Arc<Labels>, usize, LabelsHash>>,
 }
 
 impl SeriesIdentity {
-    /// Fold one segment's columns in, in its schema order.
-    fn extend(&mut self, columns: impl IntoIterator<Item = (String, Labels)>) {
-        for (name, labels) in columns {
-            let list = self.order.entry(name.clone()).or_default();
-            let p = self.pos.entry(name).or_default();
+    /// Fold label sets of `name` in, in order.
+    fn extend(&mut self, name: &str, sets: impl IntoIterator<Item = Arc<Labels>>) {
+        if !self.order.contains_key(name) {
+            self.order.insert(name.to_string(), Vec::new());
+            self.pos.insert(name.to_string(), HashMap::default());
+        }
+        let list = self.order.get_mut(name).expect("inserted above");
+        let p = self.pos.get_mut(name).expect("inserted above");
+        for labels in sets {
             if !p.contains_key(&labels) {
-                p.insert(labels.clone(), list.len());
+                p.insert(Arc::clone(&labels), list.len());
                 list.push(labels);
             }
         }
     }
 
     /// Ordered distinct label sets for `name` (empty if `name` is unknown).
-    fn order(&self, name: &str) -> &[Labels] {
+    fn order(&self, name: &str) -> &[Arc<Labels>] {
         self.order.get(name).map(Vec::as_slice).unwrap_or(&[])
     }
 
@@ -878,12 +883,12 @@ impl HistogramRunIndex {
     /// Record the label sets a segment carries for its histograms, under the
     /// run that segment belongs to. Called after [`observe`](Self::observe)
     /// for the same segment.
-    fn observe_labels(&mut self, idx: usize, columns: &[(String, Labels)]) {
+    fn observe_labels(&mut self, idx: usize, columns: &[(&String, Arc<Labels>)]) {
         for (name, labels) in columns {
             let Some(run) = self.segment_run(name, idx) else {
                 continue;
             };
-            let list = self.run_labels.entry(name.clone()).or_default();
+            let list = self.run_labels.entry((*name).clone()).or_default();
             if !list.iter().any(|(r, l)| *r == run && *l == labels.inner) {
                 list.push((run, labels.inner.clone()));
             }
@@ -976,8 +981,8 @@ type CounterColumns = HashMap<String, ColumnTable>;
 /// the columns that feed it, in segment order.
 #[derive(Clone, Default)]
 struct ColumnTable {
-    labels: Vec<Labels>,
-    labels_index: HashMap<Labels, usize, LabelsHash>,
+    labels: Vec<Arc<Labels>>,
+    labels_index: HashMap<Arc<Labels>, usize, LabelsHash>,
     by_series: Vec<Vec<Location>>,
 }
 
@@ -1298,7 +1303,7 @@ impl SegmentedSource {
             }
             last_held.push(held);
             series.push(ScanSeries {
-                labels: l.clone(),
+                labels: Labels::clone(l),
                 windowed,
                 interval: None,
             });
@@ -1917,8 +1922,8 @@ impl DataSource for SegmentedSource {
             let float = locations.iter().any(|l| {
                 l.position.float && self.state.catalog[l.segment as usize].touches(start_ns, end_ns)
             });
-            let labels = labels.clone();
-            let series_labels = labels.clone();
+            let series_labels = Arc::clone(labels);
+            let labels = Labels::clone(labels);
             let name = Arc::clone(&name);
             // A column whose footer says every cell is null gives no
             // sample, so its segment is not fetched: a read past a series'
@@ -1950,16 +1955,17 @@ impl DataSource for SegmentedSource {
                             .as_deref()
                             .is_none_or(|r| r.identities_are_fixed())
                     {
-                        return Some(vec![chunk.labeled(series_labels.clone())]);
+                        return Some(vec![chunk.labeled(Labels::clone(&series_labels))]);
                     }
-                    let chunk = chunk.labeled(table.labels[l.column_labels as usize].clone());
+                    let chunk =
+                        chunk.labeled(Labels::clone(&table.labels[l.column_labels as usize]));
                     // A relabelled column carries every occupant's samples;
                     // this stream is one occupant's.
                     let pieces =
                         relabel_counter(self.relabel.as_deref(), &name, &Labels::default(), chunk);
                     let mine: Vec<Counter> = pieces
                         .into_iter()
-                        .filter(|c| c.labels == series_labels)
+                        .filter(|c| c.labels == *series_labels)
                         .collect();
                     Some(mine)
                 })
