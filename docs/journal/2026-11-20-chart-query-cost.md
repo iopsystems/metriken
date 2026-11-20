@@ -1,7 +1,9 @@
 # Chart query cost: opening a high-cardinality table, and rates over many series
 
 **Status:** OPEN. Opened 2026-11-20. Baseline measured; criteria written
-before any change.
+before any change. Change 1 measured: NO-GO against its criterion
+(0.294 s against 0.25 s), output unchanged, kept (see "Change 1:
+results").
 
 ## Goal
 
@@ -189,6 +191,77 @@ host.
    they leave.
 
 Each change is its own PR, with its own measurement here.
+
+## Change 1: results
+
+Two commits, measured apart:
+
+- `perf(query): start a series' grid rate at its first sample`
+  (`metriken-query/src/batch_rate.rs`, `SeriesRate::settle`): the cursor
+  starts at the first grid point at or after the series' first sample.
+- `perf(query): skip the read past a range's end when no row can follow`
+  (`metriken-query/src/promql/streaming/dispatch.rs`, `next_for_scan`).
+  Found by profiling the first commit, so it was not in the criteria.
+  - The profile of the first commit put 16% of self time in SipHash, and
+    983 of those 1,653 samples were under `next_for_scan`.
+  - For a range that ends at or after the source's last row,
+    `next_samples` finds nothing. `next_for_scan` still collected every
+    series' labels into a `HashSet` and hashed each again to take it out
+    of the empty result.
+  - It now checks the bounds `next_samples` would read between first. The
+    check is the old loop's condition (`after + 1 <= until`) moved before
+    the set is built.
+
+Measured as the baseline was: three fresh processes per arm, the three
+arms interleaved, on the same host. Medians, warm runs:
+
+| query | baseline | rate cursor | + bounds check |
+|---|---|---|---|
+| fresh 100 ms, `sum(irate(task_cpu_usage[5m]))` | 0.849 s | 0.414 s | 0.294 s |
+| fresh 100 ms, `sum by (op) (irate(cgroup_syscall[5m]))` | 0.416 s | 0.326 s | 0.297 s |
+| 9.6 h, `sum(irate(task_cpu_usage[5m]))` | 0.656 s | 0.568 s | 0.565 s |
+| 9.6 h, `sum by (op) (irate(cgroup_syscall[5m]))` | 0.239 s | 0.181 s | 0.176 s |
+
+No query in either table is slower, first run or warm.
+
+Peak RSS on fresh 100 ms rose with the bounds check: 2,579 MB
+(2,578–2,607) at baseline, 2,591 MB (2,578–2,595) with the rate cursor,
+2,735 MB (2,687–2,739) with both. On 9.6 h it moved from 2,546 MB to
+2,624 MB, inside the baseline's range (2,497–2,621 in this set, 2,602–2,664
+in the first). The bounds check allocates nothing that lives past the
+query, and I don't know why the peak rose. It is left for change 3, which
+measures what holds the memory.
+
+- **Output.** Every query on both recordings gives the same points as
+  the baseline: same text, same count of numbers, each within 7e-16
+  relative. The baseline does not reproduce itself more closely than
+  that.
+  - Two runs of the baseline binary differ in the last bit on 40 of 2,812
+    values of `sum(irate(cpu_usage[5m]))`.
+  - `sum` merges partitions in the order the threads finish
+    (`run_partitions`).
+  - The comparison is `ARCHIVE_QUERY_DUMP` from the bench, then a
+    comparison of each number at 1e-12 relative.
+- **Tests.** `series_rate_matches_counter_grid_rate` compares
+  `SeriesRate` with `CounterGridRate` on 28,000 random series, including
+  ones that start after the grid. Starting one point later than the
+  first sample makes it fail (checked).
+  `cargo nextest run --all-targets --all-features`: 1,552 passed.
+- **Against the criterion: NO-GO.**
+  - Warm `task_sum` on fresh 100 ms is 0.294 s, above the 0.25 s
+    criterion.
+  - The rate cursor alone gives 0.414 s, above the 0.4 s refutation bar:
+    the walk before the first sample was about half of the time, not
+    nearly all of it as predicted.
+  - Both commits are kept: each is faster and changes no output.
+- **What is left on 9.6 h,** from a profile of the two commits together
+  (34,892 samples: the first task query, then 8 warm `task_sum` runs):
+  - `SeriesRate::advance` and `edge` are 37% of samples. That is the rate
+    at each of the 34,677 grid points (9.6 h at 1 s), all computed before
+    the display reduces them to 500 points.
+  - Reading the segments is 30% (lz4 decompression and column building).
+  - Computing fewer points would change what the display's bands show,
+    so it is not a change of this kind.
 
 ## Not yet measured here
 
