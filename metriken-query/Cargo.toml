@@ -33,6 +33,9 @@ twox-hash = { version = "2", default-features = false, features = ["xxhash3_128"
 rmp-serde = "1.3"
 tempfile.workspace = true
 sysinfo = "0.32"
+
+[target.'cfg(unix)'.dev-dependencies]
+# `getrusage`, for the peak resident memory `benches/archive_query.rs` prints.
 libc = "0.2"
 
 [features]

@@ -9,14 +9,20 @@
 //! - `QUERIES`: a file of `name|mode|query` lines, where mode is `display`
 //!   (a range query at the recording's interval, reduced to 500 points, as
 //!   the viewer's charts ask) or `grid` (a plain range query at a step of
-//!   range / 500). Without it, the built-in list below runs.
+//!   range / 500 rounded up to a multiple of the interval). Without it, the
+//!   built-in list below runs.
 //! - `REPS`: runs of each query, in order, in one process (default 3). The
 //!   first run of a query that opens a table pays for the open.
 //! - `POOL_MB`: the buffer pool budget (default 8192, the viewer's default
 //!   on a large host).
 //!
-//! Prints, per run, the wall time and the process's resident memory after
-//! it, then the peak resident memory.
+//! Prints the time to open the archive and the resident memory before and
+//! after; per run, the wall time and the resident memory after it; then the
+//! peak resident memory (Unix only).
+//!
+//! With `ARCHIVE_QUERY_DUMP=DIR`, each query's first result is written to
+//! `DIR/<name>.txt`, one series per line, sorted, so two builds' output can
+//! be compared.
 
 use std::time::Instant;
 
@@ -65,6 +71,7 @@ fn rss_mb(sys: &mut System) -> f64 {
     sys.process(pid).map(|p| p.memory()).unwrap_or(0) as f64 / (1024.0 * 1024.0)
 }
 
+#[cfg(unix)]
 fn peak_rss_mb() -> f64 {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
@@ -75,6 +82,11 @@ fn peak_rss_mb() -> f64 {
     } else {
         raw / 1024.0
     }
+}
+
+#[cfg(not(unix))]
+fn peak_rss_mb() -> f64 {
+    f64::NAN
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
