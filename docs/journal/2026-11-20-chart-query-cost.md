@@ -199,6 +199,48 @@ before change 3.
     (`segment_kept`, 22%);
   - building each footer's Arrow schema (27.5%, overlapping the above).
 
+**Change 5, opening a table from its segments' indexes.** Written
+2026-11-20, after change 4's results and before any code. The owner chose
+this over keeping parsed footers in the pool (faster, but up to about
+1.6 GB more resident on the 9.6 h task table by the pool's own estimate),
+and chose an in-place re-index for existing archives over a copy.
+
+- **What:** the names index gains a version (`MNI4`) with a third frame
+  holding what `OpenState::fold` takes from a parsed footer:
+  - the counter column refs (`ColumnPosition` per column, one per occupant
+    per metric in a long segment);
+  - the column map;
+  - units per metric, duplicated series and file metadata;
+  - the segment's time span and interval;
+  - the histogram config check, run when the segment is sealed.
+
+  When every segment of a table has that frame, the open folds the frames
+  and fetches no segment. Otherwise it takes today's path. A query still
+  fetches and parses the footer of each segment it reads.
+- **Existing archives:** a re-index rewrites each segment's index in place
+  through a new dendro call, `ArchiveMut::replace_segment_index`, without
+  rewriting the segment. metriken and rezolus are on dendro 0.7.1, so that
+  call is backported to a dendro 0.7.2.
+- **GO, measured on the 9.6 h recording after a re-index:**
+  - the first `task_cpu_usage{pid="1"}` at most 1.8 s, from 2.67 s at
+    change 4's head;
+  - no query slower by more than 10% on either recording;
+  - output unchanged;
+  - each table's indexes at most 25% of its segments' bytes;
+  - the re-index of the 9.6 h archive under 60 s.
+- **Prediction:** about 1.6 s. In change 4's profile:
+  - fetching segment bytes from SQLite is 11.4%;
+  - opening each segment's footer for the open is 17.5%;
+  - `SegmentColumns::of` and `column_map` are 11.5%.
+
+  An index row is smaller than a segment, so most of those samples go.
+  The query's own parse (`segment_kept`, 29.8%) stays.
+- **Refutation:** under a 20% reduction, which would mean the open's footer
+  work is not where the time is.
+- **Unknown before building:** how large the third frame is for a long
+  table with 161,222 occupants, whose refs are one per occupant per
+  metric.
+
 ## Plan
 
 1. The bench and this entry.
