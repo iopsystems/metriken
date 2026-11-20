@@ -177,6 +177,26 @@ host.
 **Change 3, memory after the open.** Criteria to be written after changes
 1 and 2, against the RSS they leave.
 
+**Change 4, footer work on a wide table.** Written 2026-11-20, after
+change 2's results and before measuring this change; the owner chose this
+before change 3.
+
+- The first step: `SegmentColumns::of` borrows each segment's column
+  descriptors (`DataSource::columns_desc_ref`), where each of its ten
+  accessor calls cloned all of them (`FileSource::columns_desc` is
+  `self.0.columns().to_vec()`).
+- GO: on 9.6 h, the first `task_cpu_usage{pid="1"}` at most 3.4 s, from
+  4.07 s at change 2's head; no query slower by more than 10%; output
+  unchanged.
+- Prediction: about 3.3 s. In change 2's profile, cloning column
+  descriptors is 15% of samples and the histogram config checks, which
+  also clone them, 9%.
+- Refutation: under a 10% reduction.
+- Later steps, each measured on its own:
+  - the query reopening segments the open already parsed
+    (`segment_kept`, 22%);
+  - building each footer's Arrow schema (27.5%, overlapping the above).
+
 ## Plan
 
 1. The bench and this entry.
