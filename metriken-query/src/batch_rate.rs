@@ -2586,7 +2586,7 @@ mod tests {
             format!("{:?} {:?}", sink.0, trace)
         }
         let mut rng = Rng(0x1234_5678_9abc_def1);
-        let mut late = 0;
+        let mut skipped = 0;
         for case in 0..60_000 {
             let windowed = rng.below(2) == 0;
             let mut input = samples(&mut rng, true, true, true, windowed);
@@ -2644,13 +2644,18 @@ mod tests {
                 end_early_at,
                 next,
             };
-            if input.first().is_some_and(|f| f.ts > grid.start_ns + step) {
-                late += 1;
+            // Series that settle with points to skip inside the grid.
+            if input.len() >= 2
+                && input
+                    .first()
+                    .is_some_and(|f| points_before(&grid, f.ts) >= 1 && f.ts <= grid.end_ns)
+            {
+                skipped += 1;
             }
             assert_eq!(run(&c, false), run(&c, true), "case {case}");
         }
-        // The cases the change is about are most of them.
-        assert!(late > 30_000, "{late} late starts");
+        // The cases the change is about: about 22,700 of the 60,000.
+        assert!(skipped > 15_000, "{skipped} series skip points");
     }
 
     /// A series with no sample yet emits nothing before its earliest point

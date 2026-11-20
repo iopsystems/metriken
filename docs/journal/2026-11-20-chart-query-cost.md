@@ -106,7 +106,8 @@ samples):
     labels for each insert;
   - `Listing::fold` is 16%, `SegmentColumns::of` 13% (cloning column
     descriptors, 7%; histogram config checks, 3%).
-- Freeing is 27% of self time, over the whole capture.
+- Freeing (`_xzm_free`, `_free`) is 28% of self time, over the whole
+  capture.
 - Dropping the reader at exit is 13% of samples, which is a measure of
   how many allocations the open made.
 - Reading occupant streams is 7%; zstd decompression under 2%.
@@ -126,7 +127,8 @@ each query it resolves; rezolus's viewer resolves every query through
 does not include that cost.
 
 **A `sum` of rates over the task table** (the first task query, which
-opens the table, then 8 warm `sum(irate(task_cpu_usage[5m]))` runs;
+opens the table, then 8 warm `sum(irate(task_cpu_usage[5m])) / 1e9`
+runs;
 21,962 samples):
 
 - `SeriesRate::advance` is 36% of self time and `SeriesRate::edge` 25%,
@@ -284,8 +286,9 @@ rose. It is left for change 3, which measures what holds the memory.
     refutation bar. The walk before the first sample was about half of
     the time, not nearly all of it as predicted.
   - With the bounds check as well, 0.294 s, still above 0.25 s.
-  - Both commits are kept: each is faster on fresh 100 ms and changes no
-    output.
+  - Both commits are kept: each is faster on the two fresh 100 ms queries
+    above, no other query is slower by more than 10%, and neither changes
+    the output.
 - **What is left on 9.6 h,** from a profile of the two commits together
   (34,892 samples: the first task query, then 8 warm `task_sum` runs):
   - `SeriesRate::advance` is 31% of samples, including `edge`, which it
