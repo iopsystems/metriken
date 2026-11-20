@@ -4,7 +4,10 @@
 before any change. Change 1 measured: NO-GO, and its prediction refuted
 (0.414 s against 0.25 s; refutation bar 0.4 s). With a second commit not
 in the criteria (a bounds check), 0.294 s. Output unchanged; both kept
-(see "Change 1: results").
+(see "Change 1: results"). Change 2 measured: NO-GO (1.43 s and 1,468 MB
+against 1.0 s and 1,200 MB on fresh 100 ms; 4.07 s against 2.0 s on
+9.6 h), prediction not refuted on fresh 100 ms, output unchanged, kept
+(see "Change 2: results").
 
 ## Goal
 
@@ -299,6 +302,94 @@ rose. It is left for change 3, which measures what holds the memory.
     of all samples, and lz4 decompression 7%.
   - Computing fewer points would change what the display's bands show,
     so it is not a change of this kind.
+
+## Change 2: results
+
+One commit, `perf(storage): store each label set once when opening a
+segmented table` (`metriken-storage/src/segmented.rs`):
+
+- `IdentityMemo` holds one entry per column of a metric, keyed with
+  foldhash, in place of five SipHash maps each keyed by a copy of the
+  column's labels. The entry holds:
+  - the column's labels;
+  - the sets it presents as (`Arc<[Arc<Labels>]>`);
+  - its registrations;
+  - its counter positions.
+- `SeriesIdentity::order` and `SeriesIdentity::pos` share one
+  `Arc<Labels>` per series. `CounterColumns`' `labels` and `labels_index`
+  share the memo's copy of each column's labels.
+- `counter_streams` copies a series' labels once per query, where it
+  copied them twice.
+- `column_map` is unchanged, although plan step 3 named it: it is
+  returned from `DataSource::column_map` by value, keyed by `Labels`. It
+  is left for plan step 4.
+
+The memo's outer map, keyed by metric name, was moved to foldhash in a
+second build. A profile of the first build showed SipHash in 273 of 4,991
+samples (5.5%), 71 of them in the memo's outer map. The other 202 are
+`column_map` and `SegmentColumns::duplicated`, which still use SipHash.
+Both builds are below. The commit has the second.
+
+Measured as before: three fresh processes per arm, interleaved, against
+the head of change 1 (`93520c1`). Medians:
+
+| | change 1 | labels shared | + foldhash names |
+|---|---|---|---|
+| fresh 100 ms, first `task_cpu_usage{pid="1"}` | 2.128 s | 1.485 s | 1.428 s |
+| fresh 100 ms, RSS after it | 2,273 MB | 1,472 MB | 1,468 MB |
+| fresh 100 ms, first `sum by (op) (irate(cgroup_syscall[5m]))` | 1.427 s | 1.194 s | 1.149 s |
+| fresh 100 ms, warm `sum(irate(task_cpu_usage[5m])) / 1e9` | 0.294 s | 0.212 s | 0.208 s |
+| fresh 100 ms, peak RSS | 2,564 MB | 2,004 MB | 1,927 MB |
+| 9.6 h, first `task_cpu_usage{pid="1"}` | 4.358 s | 3.963 s | 4.069 s |
+| 9.6 h, RSS after it | 2,354 MB | 2,318 MB | 2,333 MB |
+
+- **The ranges do not overlap** between change 1 and either build on any
+  fresh 100 ms row. For example, RSS after the first task query is
+  2,267–2,288 MB against 1,457–1,485 MB.
+- **The foldhash step adds little.** Its time ranges overlap the first
+  build's on every row except warm `task_sum` (0.207–0.210 s against
+  0.210–0.217 s). Its peak RSS is lower (1,886–1,987 MB against
+  2,003–2,007 MB); I don't know why a hasher change moves the peak.
+- **No query is slower than change 1** by more than 10%, first run or
+  warm, on either recording.
+- **Output:** every query on both recordings matches change 1: same text,
+  numbers within the 1e-12 comparison.
+- **Tests:**
+  - `cargo nextest run --all-targets --all-features`: 1,553 passed.
+    `cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt
+    --check` and the doctests are clean.
+  - No test was added. The change moves no output, and the comparison
+    above is the check that it did not.
+- **Against the criterion: NO-GO.**
+  - Fresh 100 ms: 1.43 s and 1,468 MB, against 1.0 s and 1,200 MB.
+  - 9.6 h: 4.07 s against 2.0 s.
+  - The prediction (about 0.9 s and 1,000 MB) is not refuted on fresh
+    100 ms, where both fall by more than 30% (33% and 35%). On 9.6 h the
+    first task query falls by 7% against change 1's head (4.358 s), or
+    0.4% against the criteria's baseline (4.086 s), and RSS does not
+    move.
+- **Where the 9.6 h first query's time goes after the change,** from a
+  profile of the first build (4,991 samples, the first task query alone).
+  There is no profile of change 1 to compare, so this shows where the time
+  is now, not why it did not move. The shares overlap.
+  - Its task table is wide: a column per series in each segment, with
+    each footer's Arrow schema to parse.
+  - Building the Arrow schema from each footer
+    (`parquet_to_arrow_schema_and_fields`, base64 and flatbuffers) is
+    27.5% of samples: 11.9 points in the open and 15.6 inside
+    `segment_kept`.
+  - `SegmentColumns::of` is 30.5%, of which cloning column descriptors
+    is 15% and the histogram config checks 9%.
+  - The query's own reads open the same segments again
+    (`segment_kept`, 22%), parsing their footers a second time.
+  - These are the next candidates for the first query on a wide table.
+    They are footer work, not label copies.
+- **Not done, from the review:** each memo call hashes its key more than
+  once. `column()` looks the name and labels up with `contains_key`
+  before `get_mut`, and `positions` calls `column()` twice. A counter
+  column is hashed about six times per segment, where the old path
+  hashed it about twice. `IdentityMemo` is 10.3% of the profile above.
+  The saving from hashing once is not measured.
 
 ## Not yet measured here
 
