@@ -7,7 +7,9 @@ in the criteria (a bounds check), 0.294 s. Output unchanged; both kept
 (see "Change 1: results"). Change 2 measured: NO-GO (1.43 s and 1,468 MB
 against 1.0 s and 1,200 MB on fresh 100 ms; 4.07 s against 2.0 s on
 9.6 h), prediction not refuted on fresh 100 ms, output unchanged, kept
-(see "Change 2: results").
+(see "Change 2: results"). Change 4, first two steps measured: GO
+(2.897 s against 3.4 s on 9.6 h), output unchanged (see "Change 4:
+results").
 
 ## Goal
 
@@ -176,6 +178,26 @@ host.
 
 **Change 3, memory after the open.** Criteria to be written after changes
 1 and 2, against the RSS they leave.
+
+**Change 4, footer work on a wide table.** Written 2026-11-20, after
+change 2's results and before measuring this change; the owner chose this
+before change 3.
+
+- The first step: `SegmentColumns::of` borrows each segment's column
+  descriptors (`DataSource::columns_desc_ref`), where each of its ten
+  accessor calls cloned all of them (`FileSource::columns_desc` is
+  `self.0.columns().to_vec()`).
+- GO: on 9.6 h, the first `task_cpu_usage{pid="1"}` at most 3.4 s, from
+  4.07 s at change 2's head; no query slower by more than 10%; output
+  unchanged.
+- Prediction: about 3.3 s. In change 2's profile, cloning column
+  descriptors is 15% of samples and the histogram config checks, which
+  also clone them, 9%.
+- Refutation: under a 10% reduction.
+- Later steps, each measured on its own:
+  - the query reopening segments the open already parsed
+    (`segment_kept`, 22%);
+  - building each footer's Arrow schema (27.5%, overlapping the above).
 
 ## Plan
 
@@ -390,6 +412,75 @@ the head of change 1 (`93520c1`). Medians:
   column is hashed about six times per segment, where the old path
   hashed it about twice. `IdentityMemo` is 10.3% of the profile above.
   The saving from hashing once is not measured.
+
+## Change 4: results
+
+Two commits, measured apart, each against the one before:
+
+- `perf(storage): borrow a segment's column descriptors when listing
+  them`. `MultiParquetSource`'s column accessors walk the descriptors
+  through `DataSource::columns_desc_ref`, a new trait method that returns
+  `None` by default; `FileSource`, `LabeledSource` and `LazySource` return
+  them. Before, each accessor took `columns_desc`, a clone of every
+  descriptor, and `SegmentColumns::of` calls ten of them per segment.
+- `perf(storage): look each column up once in the open's identity memo`.
+  `IdentityMemo::column` uses hashbrown's `entry_ref`, one hash per
+  lookup, where it hashed twice; `positions` looks the column up once,
+  where it did three times on a miss. hashbrown 0.17.1 becomes a direct
+  dependency of metriken-storage; arrow already builds that version. The
+  memo step was measured with hashbrown 0.16.1; the committed 0.17.1 build
+  was not benchmarked.
+
+Three fresh processes per arm, interleaved. The descriptor step against
+change 2's head (`2f37139`), then the memo step against the descriptor
+step in a second set. Medians of the first runs:
+
+| | change 2 | descriptors borrowed | | descriptors borrowed | + memo lookup |
+|---|---|---|---|---|---|
+| 9.6 h, `task_cpu_usage{pid="1"}` | 4.377 s | 2.897 s | | 2.815 s | 2.673 s |
+| 9.6 h, `sum by (op) (irate(cgroup_syscall[5m]))` | 0.949 s | 0.694 s | | 0.629 s | 0.603 s |
+| fresh 100 ms, `task_cpu_usage{pid="1"}` | 1.675 s | 1.312 s | | 1.292 s | 1.210 s |
+| fresh 100 ms, `sum by (op) (irate(cgroup_syscall[5m]))` | 1.350 s | 0.999 s | | 0.864 s | 0.780 s |
+
+- **Against the criterion: GO.** The first task query on 9.6 h is
+  2.897 s with the descriptor step alone, under the 3.4 s criterion. The
+  saving, 1.48 s (34%), is about twice the 0.77 s (19%) the prediction
+  implied. With both steps, 2.673 s.
+- **The memo step is small, but its ranges do not overlap** on the 9.6 h
+  task query (2,812–2,883 ms against 2,641–2,678 ms) or the fresh 100 ms
+  one (1,264–1,357 against 1,200–1,250).
+- **The host drifted between sets.** Change 2's head ran 1.675 s on fresh
+  100 ms here, against 1.428 s in change 2's own measurement. On 9.6 h it
+  ran 4.377 s here against 4.07 s; the criterion's 3.4 s was set against
+  4.07 s. Each comparison is within one interleaved set.
+- **No query is slower than its predecessor by more than 10%.** Warm
+  queries do not move, as expected: the open runs once.
+- **Output:** every query on both recordings matches, in both sets.
+- **RSS says nothing here.** After the first fresh 100 ms task query it
+  is about 1,280 MB or about 1,500 MB in runs of the same build. Change
+  2's head gave 1,482, 1,282 and 1,276 MB; the descriptor step gave 1,306,
+  1,511 and 1,500 MB.
+- **Tests:**
+  - `cargo nextest run --all-targets --all-features -p metriken-storage
+    -p metriken-query`: 1,047 passed after each step.
+  - `column_lists_are_the_same_from_borrowed_and_owned_descriptors`, added
+    after review, covers two paths no test reached: a child's injected
+    labels on its histogram columns, and the descriptors copied out of a
+    child that does not lend them. Dropping those labels, or reversing that
+    path, makes it fail.
+
+What is left of the 9.6 h first task query, from a profile after the
+descriptor step (4,136 samples; the shares overlap):
+
+- Building each footer's Arrow schema (`parquet_to_arrow_schema_and_fields`)
+  is 33.7%. About a quarter of it (8.3% of all samples) is flatbuffer
+  verification of `ARROW:schema`. A column's labels come from its Arrow
+  field metadata (`parse_schema`), so the open cannot skip that schema.
+- The query reopening the segments the open parsed (`segment_kept`) is
+  29.8%. The open parses each footer and drops it, and the query fetches
+  and parses it again.
+- `IdentityMemo::column` was 13.1%, which the memo step addresses.
+- SQLite reads of the segment bytes are 11.4%.
 
 ## Not yet measured here
 
