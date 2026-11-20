@@ -78,6 +78,11 @@ fn peak_rss_mb() -> f64 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `cargo nextest` lists every bench binary with `--list`; with
+    // `harness = false` there are no tests, so the listing is empty.
+    if std::env::args().any(|a| a == "--list") {
+        return Ok(());
+    }
     // `cargo bench` passes `--bench`; skip flags.
     let args: Vec<String> = std::env::args()
         .skip(1)
