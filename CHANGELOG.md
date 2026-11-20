@@ -204,6 +204,15 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   every bound an integer), that it applies to `OVERFLOW_BOUND_KEY` too,
   and which readers divide by it.
 
+### metriken-query (unreleased)
+
+- **Changed:** a grid `rate`, `irate` or `increase` over many series is
+  faster. Each series' points start at its first sample instead of being
+  walked from the range's start, and a range that ends at the source's
+  last row no longer looks for rows after it. Results are unchanged.
+  `sum(irate(task_cpu_usage[5m]))` over 161,222 task series at a 100 ms
+  interval: 0.85 s to 0.29 s.
+
 ### metriken-query 0.51.0
 
 - **Added:** `increase(x[r])`: the counter's increase across the window
