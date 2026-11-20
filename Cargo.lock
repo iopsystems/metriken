@@ -512,9 +512,9 @@ dependencies = [
 
 [[package]]
 name = "dendro"
-version = "0.7.1"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7161e14aaeb71d7abea76f62a3e9123755f0fc4990fe3e07563dc5f62048a540"
+checksum = "6bc05e5fc88165514ae8fbfe5ab8c6bff36f42994cb881516c9395b9fcdfe4cd"
 dependencies = [
  "arrow",
  "bytes",

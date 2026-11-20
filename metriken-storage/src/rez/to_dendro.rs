@@ -75,8 +75,9 @@ pub struct Converted {
 /// Convert the v3 `.rez` at `src` into a new dendro archive at `dest`.
 ///
 /// `dest` must not exist. The caller stages it and renames it into place, so
-/// a failure part-way leaves no archive rather than a partial one.
-/// [`to_dendro::convert_path`](crate::to_dendro::convert_path) does that.
+/// a failure part-way leaves no archive rather than a partial one, and
+/// removes the `<dest>-lock` file dendro leaves beside the staged archive.
+/// [`to_dendro::convert_path`](crate::to_dendro::convert_path) does both.
 pub fn convert_v3_to_dendro(src: &Path, dest: &Path) -> Result<Converted, String> {
     let db = RezDb::open(src)?;
     let mut out = ArchiveMut::create(dest)

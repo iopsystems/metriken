@@ -1,25 +1,27 @@
 //! Queries over process groups (S1 to S9 of
 //! `docs/journal/2026-10-19-recording-identity-and-views.md`), through the
 //! entry points a consumer uses: `.dendro` fixtures written with
-//! `ArchiveWriter` (copies made with dendro's `copy_sources_into`, as
-//! hindsight's dumps and rezolus's `combine` make them), opened through
+//! `ArchiveWriter` (copies sharing a uuid made with
+//! `support::copy_keeping_uuids`, as dendro 0.7 and earlier wrote hindsight's
+//! dumps and rezolus's `combine` beside their originals), opened through
 //! `DendroCatalog` → `ArchiveReader::from_catalog` → `flatten`, and queried
 //! as a `MetricsSource`. Each assertion runs on the batched rate path
 //! (`QueryOptions::default()`), the per-series path
 //! (`with_per_series_rates(true)`) and the display path at full resolution.
 #![cfg(feature = "write")]
 
+mod support;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use dendro::archive::{Archive, ArchiveMut};
-use dendro::rewrite::{copy_sources_into, CopySpec};
+use dendro::archive::ArchiveMut;
+use dendro::rewrite::CopySpec;
 use dendro::seal::SealPolicy;
 use metriken_exposition::{Counter, Gauge, Snapshot, SnapshotV2};
 use metriken_query::{DisplayOptions, DisplayResult, MetricsSource, QueryOptions, QueryResult};
 use metriken_storage::labeled::RECORDING_LABEL;
-use metriken_storage::writer::Encoder;
 use metriken_storage::{ArchiveReader, ArchiveWriter, BufferPool, DendroCatalog, WriterConfig};
 
 const MS: u64 = 1_000_000;
@@ -186,11 +188,9 @@ fn write_sealed(path: &Path, specs: &[Spec], max_rows: u64) {
     writer.join().unwrap();
 }
 
-/// Copy every source of `from` into `into`, keeping each uuid; `range`
-/// narrows the copy to rows in it (whole segments, as a hindsight dump).
-fn copy(from: &Path, into: &mut ArchiveMut, range: Option<(u64, u64)>) {
-    let src = Archive::open(from).unwrap();
-    let encoder = Encoder::for_archive(&src).unwrap();
+/// Copy every source of `from` into the archive at `into`, keeping each
+/// uuid; `range` narrows the copy to rows in it (whole segments, as a hindsight dump).
+fn copy(from: &Path, into: &Path, range: Option<(u64, u64)>) {
     let spec = match range {
         Some((start, end)) => CopySpec {
             start: start as i64,
@@ -199,15 +199,14 @@ fn copy(from: &Path, into: &mut ArchiveMut, range: Option<(u64, u64)>) {
         },
         None => CopySpec::everything(),
     };
-    into.transaction(|tx| copy_sources_into(&src, tx, &spec, &encoder))
-        .unwrap();
+    support::copy_keeping_uuids(from, into, &spec);
 }
 
 /// An archive at `into` holding a copy of each of `from` (with `range`).
 fn combine(into: &Path, from: &[(&Path, Option<(u64, u64)>)]) {
-    let mut out = ArchiveMut::create(into).unwrap();
+    drop(ArchiveMut::create(into).unwrap());
     for (path, range) in from {
-        copy(path, &mut out, *range);
+        copy(path, into, *range);
     }
 }
 

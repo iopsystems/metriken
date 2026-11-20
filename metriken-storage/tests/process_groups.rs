@@ -2,21 +2,23 @@
 //! `DendroCatalog` → `ArchiveReader::from_catalog` → `flatten`. The fixtures
 //! are the spec's (`docs/journal/2026-10-19-recording-identity-and-views.md`,
 //! case 3, case 4's bridges, case 6 and Q39), written with `ArchiveWriter`;
-//! copies sharing a uuid are made with dendro's `copy_sources_into`, as
-//! hindsight's dumps and rezolus's `combine` make them.
+//! copies sharing a uuid are made with `support::copy_keeping_uuids`, as
+//! dendro 0.7 and earlier wrote hindsight's dumps and rezolus's `combine`
+//! beside their originals; dendro 0.8 refuses a second source with one uuid.
 #![cfg(feature = "write")]
+
+mod support;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use dendro::archive::{Archive, ArchiveMut};
-use dendro::rewrite::{copy_sources_into, CopySpec};
+use dendro::archive::ArchiveMut;
+use dendro::rewrite::CopySpec;
 use dendro::seal::SealPolicy;
 use metriken_exposition::{Counter, Snapshot, SnapshotV2};
 use metriken_storage::catalog::{SegmentMeta, Source, Span, WalRow};
 use metriken_storage::process::{Notice, ProcessGroups};
-use metriken_storage::writer::Encoder;
 use metriken_storage::{
     ArchiveReader, ArchiveWriter, BufferPool, Catalog, DendroCatalog, WriterConfig,
 };
@@ -127,11 +129,9 @@ fn write(path: &Path, specs: &[Spec], max_rows: usize) {
     writer.join().unwrap();
 }
 
-/// Copy every source of `from` into `into`, keeping each uuid; `range`
-/// narrows the copy to rows in it (whole segments, as a hindsight dump).
-fn copy(from: &Path, into: &mut ArchiveMut, range: Option<(u64, u64)>) {
-    let src = Archive::open(from).unwrap();
-    let encoder = Encoder::for_archive(&src).unwrap();
+/// Copy every source of `from` into the archive at `into`, keeping each
+/// uuid; `range` narrows the copy to rows in it (whole segments, as a hindsight dump).
+fn copy(from: &Path, into: &Path, range: Option<(u64, u64)>) {
     let spec = match range {
         Some((start, end)) => CopySpec {
             start: start as i64,
@@ -140,8 +140,7 @@ fn copy(from: &Path, into: &mut ArchiveMut, range: Option<(u64, u64)>) {
         },
         None => CopySpec::everything(),
     };
-    into.transaction(|tx| copy_sources_into(&src, tx, &spec, &encoder))
-        .unwrap();
+    support::copy_keeping_uuids(from, into, &spec);
 }
 
 /// The archive at `path` as one reader over all its sources.
@@ -216,10 +215,9 @@ fn two_disjoint_dumps_of_one_buffer_are_one_process() {
         6,
     );
     let combined = dir.path().join("combined.dendro");
-    let mut out = ArchiveMut::create(&combined).unwrap();
-    copy(&buffer, &mut out, Some((at(10, 0), at(10, 5))));
-    copy(&buffer, &mut out, Some((at(10, 20), at(10, 25))));
-    drop(out);
+    drop(ArchiveMut::create(&combined).unwrap());
+    copy(&buffer, &combined, Some((at(10, 0), at(10, 5))));
+    copy(&buffer, &combined, Some((at(10, 20), at(10, 25))));
 
     let reader = open(&combined);
     let sources = reader.sources();
@@ -302,19 +300,16 @@ fn copies_of_one_buffer_with_a_record_are_one_process() {
     );
 
     let combined = dir.path().join("combined.dendro");
-    let mut out = ArchiveMut::create(&combined).unwrap();
-    copy(&buffer, &mut out, Some((at(10, 0), at(10, 5))));
-    copy(&buffer, &mut out, Some((at(10, 20), at(10, 25))));
-    copy(&buffer, &mut out, None);
-    drop(out);
+    drop(ArchiveMut::create(&combined).unwrap());
+    copy(&buffer, &combined, Some((at(10, 0), at(10, 5))));
+    copy(&buffer, &combined, Some((at(10, 20), at(10, 25))));
+    copy(&buffer, &combined, None);
     let g = open(&combined).process_groups().clone();
     assert_eq!(g.uuid_groups.len(), 1);
     assert_eq!(groups(&g), vec![vec![0, 1, 2]]);
     assert!(g.bridges.is_empty());
 
-    let mut out = ArchiveMut::open(&combined).unwrap();
-    copy(&record, &mut out, None);
-    drop(out);
+    copy(&record, &combined, None);
     let g = open(&combined).process_groups().clone();
     assert_eq!(g.uuid_groups.len(), 2);
     assert!(g.bridges.is_empty());
@@ -632,9 +627,8 @@ fn copies_in_two_archives_are_one_process() {
         20,
     );
     let copied = dir.path().join("copied.dendro");
-    let mut out = ArchiveMut::create(&copied).unwrap();
-    copy(&original, &mut out, None);
-    drop(out);
+    drop(ArchiveMut::create(&copied).unwrap());
+    copy(&original, &copied, None);
 
     let readers: Vec<ArchiveReader> = [&original, &copied].iter().map(|p| open(p)).collect();
     let reader = ArchiveReader::flatten(readers, None);

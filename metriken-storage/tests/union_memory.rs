@@ -8,17 +8,18 @@
 //! read held at once.
 #![cfg(feature = "write")]
 
+mod support;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use dendro::archive::{Archive, ArchiveMut};
-use dendro::rewrite::{copy_sources_into, CopySpec};
+use dendro::archive::ArchiveMut;
+use dendro::rewrite::CopySpec;
 use dendro::seal::SealPolicy;
 use metriken_exposition::{Counter, Snapshot, SnapshotV2};
 use metriken_query::fixtures::{take_union_held_peak, take_union_rows_held_peak};
 use metriken_query::{DisplayOptions, DisplayResult, MetricsSource, QueryOptions, QueryResult};
-use metriken_storage::writer::Encoder;
 use metriken_storage::{ArchiveReader, ArchiveWriter, BufferPool, DendroCatalog, WriterConfig};
 
 const MS: u64 = 1_000_000;
@@ -150,10 +151,8 @@ fn write_restart(path: &Path, offset: u64) {
 /// with a row in `range`, as a hindsight dump): one uuid, so one process
 /// group of two members.
 fn combine(into: &Path, from: &[(&Path, Option<(u64, u64)>)]) {
-    let mut out = ArchiveMut::create(into).unwrap();
+    drop(ArchiveMut::create(into).unwrap());
     for (path, range) in from {
-        let src = Archive::open(path).unwrap();
-        let encoder = Encoder::for_archive(&src).unwrap();
         let spec = match range {
             Some((start, end)) => CopySpec {
                 start: *start as i64,
@@ -162,8 +161,7 @@ fn combine(into: &Path, from: &[(&Path, Option<(u64, u64)>)]) {
             },
             None => CopySpec::everything(),
         };
-        out.transaction(|tx| copy_sources_into(&src, tx, &spec, &encoder))
-            .unwrap();
+        support::copy_keeping_uuids(path, into, &spec);
     }
 }
 
