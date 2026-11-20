@@ -209,9 +209,10 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
 - **Changed:** a grid `rate`, `irate` or `increase` over many series is
   faster. Each series' points start at its first sample instead of being
   walked from the range's start, and a range that ends at the source's
-  last row no longer looks for rows after it. Results are unchanged.
-  `sum(irate(task_cpu_usage[5m]))` over 161,222 task series at a 100 ms
-  interval: 0.85 s to 0.29 s.
+  last row no longer hashes every series' labels to look up rows after
+  it. Results are unchanged. `sum(irate(task_cpu_usage[5m])) / 1e9` over
+  161,222 task series at a 100 ms interval, warm: from 0.78–0.85 s to
+  0.29 s.
 
 ### metriken-query 0.51.0
 
