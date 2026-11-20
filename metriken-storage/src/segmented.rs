@@ -2444,6 +2444,114 @@ mod internal_tests {
         segment_histogram_labeled(name, grouping_power, max_value_power, &[], rows)
     }
 
+    /// A child that holds its column descriptors only as an owned copy
+    /// (`columns_desc`, no `columns_desc_ref`), as a source other than a
+    /// parquet file may. It answers no reads.
+    struct OwnedDescs(Vec<crate::parquet::ColDesc>);
+
+    impl DataSource for OwnedDescs {
+        fn counters(&self, _: &str, _: &Labels, _: u64, _: u64) -> Option<Counters> {
+            None
+        }
+        fn gauges(&self, _: &str, _: &Labels, _: u64, _: u64) -> Option<Gauges> {
+            None
+        }
+        fn histogram_stream(&self, _: &str, _: &Labels, _: u64, _: u64) -> Option<HistogramStream> {
+            None
+        }
+        fn interval(&self) -> f64 {
+            1.0
+        }
+        fn time_range(&self) -> Option<(u64, u64)> {
+            None
+        }
+        fn counter_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn gauge_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn histogram_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn counter_labels(&self, _: &str) -> Vec<BTreeMap<String, String>> {
+            Vec::new()
+        }
+        fn gauge_labels(&self, _: &str) -> Vec<BTreeMap<String, String>> {
+            Vec::new()
+        }
+        fn histogram_labels(&self, _: &str) -> Vec<BTreeMap<String, String>> {
+            Vec::new()
+        }
+        fn column_map(&self) -> HashMap<String, HashMap<Labels, String>> {
+            HashMap::new()
+        }
+        fn columns_desc(&self) -> Vec<crate::parquet::ColDesc> {
+            self.0.clone()
+        }
+    }
+
+    /// A segment's column lists carry each child's injected labels and keep
+    /// schema order, the same whether the child lends its descriptors
+    /// (`columns_desc_ref`) or only copies them out (`columns_desc`).
+    #[test]
+    fn column_lists_are_the_same_from_borrowed_and_owned_descriptors() {
+        let n = ::histogram::Config::new(2, 8).unwrap().total_buckets();
+        let open = |name: &str| {
+            let bytes = segment_histogram_labeled(
+                name,
+                2,
+                8,
+                &[("k", "x")],
+                &[(1_000_000_000, vec![0; n])],
+            );
+            let seg =
+                MultiParquetSource::open_bytes_with_pool(bytes, BufferPool::new(1 << 20)).unwrap();
+            Arc::clone(&seg.files[0].0)
+        };
+        let (first, second) = (open("h1"), open("h2"));
+        let extra = Labels::from([("job", "b")]);
+        let borrowed = MultiParquetSource {
+            files: vec![
+                (Arc::clone(&first), extra.clone()),
+                (Arc::clone(&second), extra.clone()),
+            ],
+        };
+        let mut descs = first.columns_desc();
+        descs.extend(second.columns_desc());
+        let owned = MultiParquetSource {
+            files: vec![(Arc::new(OwnedDescs(descs)) as Arc<dyn DataSource>, extra)],
+        };
+        assert!(first.columns_desc_ref().is_some());
+        let labels = Labels::from([("job", "b"), ("k", "x")]);
+        let columns = vec![
+            ("h1".to_string(), labels.clone()),
+            ("h2".to_string(), labels),
+        ];
+        let configs = BTreeMap::from([("h1".to_string(), (2, 8)), ("h2".to_string(), (2, 8))]);
+        let variants = BTreeMap::from([
+            ("h1".to_string(), vec![(2, 8)]),
+            ("h2".to_string(), vec![(2, 8)]),
+        ]);
+        for (how, source) in [("borrowed", &borrowed), ("owned", &owned)] {
+            assert_eq!(
+                source.histogram_columns_of(HistKind::Counting),
+                columns,
+                "{how}"
+            );
+            assert_eq!(
+                source.histogram_configs_of(HistKind::Counting),
+                configs,
+                "{how}"
+            );
+            assert_eq!(
+                source.histogram_config_variants_of(HistKind::Counting),
+                variants,
+                "{how}"
+            );
+        }
+    }
+
     /// Direct unit test of the windows policy in [`merge_counter`] /
     /// [`merge_gauge`] — the merge step the O(1)-indexed splice path in
     /// [`SegmentedSource::counters`]/`::gauges` uses for a repeat identity.
