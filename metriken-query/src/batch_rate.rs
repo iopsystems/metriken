@@ -753,6 +753,15 @@ impl SeriesRate {
             self.probe = Vec::new();
             return;
         }
+        // A point before the first sample has no right edge (`edge` holds
+        // no value outside the samples), so it emits nothing: start at the
+        // first point at or after that sample.
+        let first = self.probe[0].ts;
+        let skipped = points_before(grid, first) as u64;
+        self.cursor_ns = self.cursor_ns.max(
+            grid.start_ns
+                .saturating_add(skipped.saturating_mul(grid.step_ns)),
+        );
         for s in std::mem::take(&mut self.probe) {
             self.ingest(s);
             self.advance(false, grid, series, sink);
