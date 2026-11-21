@@ -1367,7 +1367,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-exposition"
-version = "0.27.1"
+version = "0.28.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -1403,7 +1403,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-query"
-version = "0.51.0"
+version = "0.52.0"
 dependencies = [
  "arrow",
  "bytes",
@@ -1426,7 +1426,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-recorder"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1456,7 +1456,7 @@ dependencies = [
 
 [[package]]
 name = "metriken-storage"
-version = "0.13.2"
+version = "0.14.0"
 dependencies = [
  "arrow",
  "bytes",
