@@ -34,6 +34,10 @@ rmp-serde = "1.3"
 tempfile.workspace = true
 sysinfo = "0.32"
 
+[target.'cfg(unix)'.dev-dependencies]
+# `getrusage`, for the peak resident memory `benches/archive_query.rs` prints.
+libc = "0.2"
+
 [features]
 default = ["lz4", "ingest", "archive"]
 # `MetricsSource` for `metriken-storage`'s `ArchiveReader`, and
@@ -47,6 +51,11 @@ fixtures = ["dep:tempfile"]  # exposes the fixtures module publicly
 name = "gen-augmented"
 path = "src/bin/gen_augmented.rs"
 required-features = ["fixtures"]
+
+[[bench]]
+name = "archive_query"
+harness = false
+required-features = ["archive"]
 
 [[bench]]
 name = "memory"

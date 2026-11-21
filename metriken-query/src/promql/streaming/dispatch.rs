@@ -280,11 +280,9 @@ fn next_samples(
     want: &std::collections::HashSet<&crate::labels::Labels>,
 ) -> std::collections::HashMap<crate::labels::Labels, crate::types::CounterSample> {
     let mut found = std::collections::HashMap::new();
-    let after = after_ns.max(lo.saturating_sub(1));
-    if after == u64::MAX {
+    let Some((after, until)) = next_bounds(source, (lo, hi), after_ns) else {
         return found;
-    }
-    let until = source.time_range().map_or(0, |(_, last)| last.min(hi));
+    };
     let mut from = after + 1;
     let mut width = ((source.counter_interval(name) * 1e9) as u64)
         .max(1)
@@ -310,6 +308,15 @@ fn next_samples(
     found
 }
 
+/// The bounds [`next_samples`] reads between: rows after the first and at
+/// or before the second. `None` when no row can be there, which is the case
+/// for a range that ends at or after the source's last row.
+fn next_bounds(source: &dyn DataSource, (lo, hi): (u64, u64), after_ns: u64) -> Option<(u64, u64)> {
+    let after = after_ns.max(lo.saturating_sub(1));
+    let until = source.time_range().map_or(0, |(_, last)| last.min(hi));
+    (after < until).then_some((after, until))
+}
+
 /// [`next_samples`] for a scan's series, in its order, as `grid_rates`
 /// takes them.
 fn next_for_scan(
@@ -320,6 +327,11 @@ fn next_for_scan(
     span: (u64, u64),
     after_ns: u64,
 ) -> Vec<Option<crate::batch_rate::Sample>> {
+    // Without this, a range that ends at the source's last row still hashes
+    // every series' labels twice to find nothing.
+    if next_bounds(source, span, after_ns).is_none() {
+        return vec![None; scan.series.len()];
+    }
     let want = scan.series.iter().map(|s| &s.labels).collect();
     let mut next = next_samples(source, name, filter, span, after_ns, &want);
     scan.series
