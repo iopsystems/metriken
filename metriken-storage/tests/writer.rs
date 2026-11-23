@@ -404,26 +404,55 @@ fn a_complete_long_table_with_a_live_tail_lists_through_its_reader() {
     assert_eq!(built, vec!["threads/tasks".to_string()]);
 }
 
-/// A complete recording with a damaged segment lists its table from the
-/// names indexes, and lists it the same after a query fails to build the
-/// table's reader.
+/// Overwrite the bytes of the last segment of `memory/meminfo` in the
+/// archive at `path`, leaving its index; with `open_frame` false, also drop
+/// the index's third frame (the segment's open parts), so an open has to
+/// read the segment.
+fn damage_last_meminfo_segment(path: &Path, open_frame: bool) {
+    const LAST: &str = "stream = 'memory/meminfo' \
+         AND seq = (SELECT max(seq) FROM segments WHERE stream = 'memory/meminfo')";
+    let db = rusqlite::Connection::open(path).unwrap();
+    let changed = db
+        .execute(
+            &format!("UPDATE segments SET bytes = x'00010203' WHERE {LAST}"),
+            [],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    if open_frame {
+        return;
+    }
+    let index: Vec<u8> = db
+        .query_row(
+            &format!("SELECT bytes FROM segment_indexes WHERE {LAST}"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    // A 4-byte prefix, then the names frame and the columns frame.
+    let names = zstd::zstd_safe::find_frame_compressed_size(&index[4..]).unwrap();
+    let columns = zstd::zstd_safe::find_frame_compressed_size(&index[4 + names..]).unwrap();
+    assert!(
+        4 + names + columns < index.len(),
+        "the index has an open frame"
+    );
+    db.execute(
+        &format!("UPDATE segment_indexes SET bytes = ?1 WHERE {LAST}"),
+        [&index[..4 + names + columns]],
+    )
+    .unwrap();
+}
+
+/// A complete recording with a damaged segment whose index holds no open
+/// parts lists its table from the names indexes, and lists it the same after
+/// a query fails to build the table's reader.
 #[cfg(feature = "rez")]
 #[test]
 fn a_damaged_segment_lists_the_same_before_and_after_a_query() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("wide.dendro");
     record(&path, false, true, None);
-    {
-        let db = rusqlite::Connection::open(&path).unwrap();
-        let changed = db
-            .execute(
-                "UPDATE segments SET bytes = x'00010203' WHERE stream = 'memory/meminfo' \
-                 AND seq = (SELECT max(seq) FROM segments WHERE stream = 'memory/meminfo')",
-                [],
-            )
-            .unwrap();
-        assert_eq!(changed, 1);
-    }
+    damage_last_meminfo_segment(&path, false);
     let reader = open(&path);
     let before = listings(&reader);
     assert!(before.iter().any(|(_, n, _)| n == "mem_free"));
@@ -435,6 +464,107 @@ fn a_damaged_segment_lists_the_same_before_and_after_a_query() {
         .count();
     assert_eq!(failed, 1, "the damaged table's reader fails to build");
     assert_eq!(listings(&reader), before);
+}
+
+/// A damaged segment whose index holds its open parts does not stop its
+/// table opening: the open reads the index, not the segment, and a query
+/// over the table returns, the damaged segment's rows missing from it.
+#[cfg(feature = "rez")]
+#[test]
+fn a_damaged_segment_with_an_open_frame_still_opens_its_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wide.dendro");
+    record(&path, false, true, None);
+    damage_last_meminfo_segment(&path, true);
+    let reader = open(&path);
+    let before = listings(&reader);
+    let tables = reader.owners_of(&["mem_free".to_string()]);
+    assert_eq!(tables.len(), 1);
+    assert!(
+        tables[0].reader().is_some(),
+        "the table opens from its indexes"
+    );
+    let (start, end) = reader.time_range().unwrap();
+    let result = reader.query_range("mem_free", start, end, 1.0);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(listings(&reader), before);
+}
+
+/// The archive at `path` as one written before indexes held open parts:
+/// every names index with its third frame dropped. Returns how many indexes
+/// it changed.
+fn drop_open_frames(path: &Path) -> usize {
+    let db = rusqlite::Connection::open(path).unwrap();
+    let rows: Vec<(i64, String, i64, Vec<u8>)> = db
+        .prepare("SELECT source_id, stream, seq, bytes FROM segment_indexes")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let mut changed = 0;
+    for (source, stream, seq, index) in rows {
+        let Some(names) = zstd::zstd_safe::find_frame_compressed_size(&index[4..]).ok() else {
+            continue;
+        };
+        let Some(columns) = zstd::zstd_safe::find_frame_compressed_size(&index[4 + names..]).ok()
+        else {
+            continue;
+        };
+        if 4 + names + columns == index.len() {
+            continue;
+        }
+        db.execute(
+            "UPDATE segment_indexes SET bytes = ?4 WHERE source_id = ?1 AND stream = ?2 AND seq = ?3",
+            rusqlite::params![source, stream, seq, &index[..4 + names + columns]],
+        )
+        .unwrap();
+        changed += 1;
+    }
+    changed
+}
+
+/// A re-index gives an archive written before indexes held open parts the
+/// current indexes, in place, and a second re-index finds them current. The
+/// tables list and read the same before and after.
+#[cfg(feature = "rez")]
+#[test]
+fn a_reindex_restores_the_open_parts_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wide.dendro");
+    record(&path, false, true, None);
+    let want = listings(&open(&path));
+    let reader = open(&path);
+    let (start, end) = reader.time_range().unwrap();
+    // Each series' labels, sorted, and its points.
+    let read = |r: &ArchiveReader| match r.query_range("mem_free", start, end, 1.0).unwrap() {
+        QueryResult::Matrix { result, .. } => result
+            .into_iter()
+            .map(|m| (m.metric.into_iter().collect::<BTreeMap<_, _>>(), m.values))
+            .collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    let want_read = read(&reader);
+    drop(reader);
+
+    let stripped = drop_open_frames(&path);
+    assert!(stripped > 0);
+    let first = metriken_storage::reindex::reindex(&path).unwrap();
+    assert_eq!(first.replaced, stripped as u64, "{first:?}");
+    assert_eq!(
+        drop_open_frames(&path),
+        stripped,
+        "every index held open parts again"
+    );
+    let again = metriken_storage::reindex::reindex(&path).unwrap();
+    assert_eq!(again.replaced, stripped as u64);
+    let third = metriken_storage::reindex::reindex(&path).unwrap();
+    assert_eq!(third.replaced, 0, "{third:?}");
+    assert_eq!(third.current, first.current + first.replaced, "{third:?}");
+
+    let reader = open(&path);
+    assert_eq!(listings(&reader), want);
+    assert_eq!(read(&reader), want_read);
 }
 
 /// Two sources recorded with the same labels, finalized.

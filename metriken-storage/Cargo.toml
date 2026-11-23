@@ -16,7 +16,7 @@ exclude = ["tests/"]
 [dependencies]
 arrow.workspace = true
 bytes = "1"
-dendro = { version = "0.7.1", default-features = false, features = ["archive"], optional = true }
+dendro = { version = "0.7.2", default-features = false, features = ["archive"], optional = true }
 foldhash = "0.2.0"
 # `entry_ref`: a lookup by borrowed key that copies the key only on insert.
 hashbrown = { version = "0.17.1", default-features = false }
@@ -48,7 +48,7 @@ serde_json.workspace = true
 tempfile.workspace = true
 metriken = { path = "../metriken" }
 metriken-exposition = { path = "../metriken-exposition" }
-dendro = { version = "0.7.1" }
+dendro = { version = "0.7.2" }
 
 [features]
 default = ["lz4", "archive"]
@@ -80,3 +80,7 @@ lz4 = ["parquet/lz4"]
 
 [package.metadata.docs.rs]
 all-features = true
+
+[[example]]
+name = "reindex"
+required-features = ["write"]
