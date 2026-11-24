@@ -18,6 +18,8 @@ Requires dendro 0.8.1.
 
 ### metriken-storage (unreleased)
 
+Requires dendro 0.8.2.
+
 - **Changed:** opening a segmented table stores each series' label set
   once, shared by the indexes built at open, where it was copied into
   each. The first query on a table of 161,222 task series takes 1.43 s
@@ -36,7 +38,10 @@ Requires dendro 0.8.1.
   takes from the segment's footer, and the open reads that instead of
   fetching the segment. On the 9.6 h recording, copied into a current
   archive and re-indexed, the first query on its wide task table takes
-  1.72 s where it took 3.09 s. A segment written by an earlier version is
+  1.72 s where the build before took 3.09 s on the same copy. Opening the
+  archive takes about 0.02 s and 11 MB more, for every reader, older ones
+  included, since the third frame is read with the index. A segment
+  written by an earlier version is
   fetched and parsed as before. A table whose segment is damaged but whose
   index is intact now opens, and a query over it skips that segment with a
   warning; before, the table did not open.
@@ -44,11 +49,12 @@ Requires dendro 0.8.1.
   names indexes in place, through dendro's `replace_segment_index`, without
   re-encoding its segments. It refuses an archive before schema 5, where
   reading an index reads its segment; copy such an archive into a current
-  one first. Requires dendro 0.8.2.
+  one first.
 - **Added:** `SegmentStore::caller_indexes`, each segment's stored index,
   for an open to read parts from. Empty by default.
 - **Changed:** `SegmentedSource::file_metadata` no longer reports
   `ARROW:schema`.
+- **Added:** `ColumnPosition` implements `Serialize` and `Deserialize`.
 
 ### metriken-storage 0.14.0
 

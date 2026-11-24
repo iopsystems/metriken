@@ -531,7 +531,8 @@ descriptor step (4,136 samples; the shares overlap):
 
 Built on branch `perf/open-from-index`, first against a local backport of
 dendro's `replace_segment_index` to 0.7.1, then against dendro 0.8.2 (dendro
-#95), released 2026-11-24, once metriken moved to dendro 0.8. The
+#95), released 2026-11-23 (2026-11-24 UTC), once metriken moved to dendro
+0.8. The
 measurements below were taken on the 0.7.1 build; the code that differs
 between the two is dendro's, not this change's.
 
@@ -545,7 +546,15 @@ As built, departures from the plan above:
     unreadable and fetch each segment to list a table.
 - **The writer and the footer path build the parts with one function**,
   `SegmentOpen::of`, and `OpenState::fold` folds the parts
-  (`fold_parts`). The two paths cannot drift apart.
+  (`fold_parts`). Within one build the two paths fold the same parts. An
+  index written by another build holds that build's parts, so a change to
+  what `SegmentOpen::of` computes needs a new open-frame version
+  (`OPEN_VERSION`, added after review: the open reads only the version it
+  knows, and a re-index leaves an index whose open frame is of another
+  version, does not decode, or is followed by more bytes).
+- **The open decides per segment, not per table** as the plan said: a
+  segment whose index holds the parts is folded from them, and any other
+  is fetched.
 - **The stored form groups a long segment's per-occupant entries.** A run
   of counter references that differ only in occupant is stored once with
   its occupant ids, and so are the column map entries. The read rebuilds
@@ -556,7 +565,21 @@ As built, departures from the plan above:
   drops it too, so `SegmentedSource::file_metadata` no longer reports it.
 - **The listing does not keep the third frame.** It keeps each segment's
   columns frame for the reader's life; holding the open frame there too
-  was about 100 MB on the 9.6 h recording.
+  was about 13 MB on the 9.6 h recording (70 MB after open for a reader
+  that keeps it, 57 MB for one that does not).
+- **The listing dedups on the names and columns frames** (`listing_key`),
+  added after review. It decoded each distinct whole index once, and the
+  open frame holds each segment's span, so every index became distinct:
+  on the 9.6 h recording, 358 distinct indexes became 5,874. Keyed on the
+  first two frames, segments with the same names and columns decode once
+  again.
+- **The query checks a stored column position against the segment's
+  columns** (`FileSource::counter_column`, `batch_columns`), added after
+  review: a position from an index that does not describe its segment
+  read past the segment's columns and panicked in parquet. It now warns
+  and reads nothing. A position that is in range but belongs to another
+  segment's layout would still read the wrong column; nothing in dendro
+  replaces a segment's bytes and keeps its index.
 - **`reindex` refuses an archive before schema 5.**
   - On schema 4 a segment's index is a column after its bytes.
   - Re-indexing the 9.6 h recording (schema 4) in place took RSS after
@@ -602,8 +625,14 @@ reading the same copies with two-frame indexes. Medians of the first runs:
     `task_sum` on fresh 100 ms has a median 16% higher, though its ranges
     overlap (0.262–0.301 s against 0.253–0.344 s); in the set before, it
     was 8% higher.
-  - Archive open is not a query in the criteria, and is 0.09 s and 16 MB
-    worse on 9.6 h.
+  - Archive open is not a query in the criteria. In this set it was
+    0.09 s and 16 MB worse on 9.6 h. After the listing's dedup fix, on a
+    fresh copy re-indexed by the final build, three processes each:
+    0.044–0.053 s and 52 MB after open, against 0.025–0.027 s and 41 MB;
+    the first task query alone was 1.24–1.34 s against 2.33–2.52 s.
+- **The largest open frame,** the question left open before building: the
+  9.6 h task table's largest index is 62 KB compressed, 1.6 MB
+  decompressed.
 - **Tests:**
   - every archive the writer builds now has three-frame indexes, so the
     suite reads through the index path;
