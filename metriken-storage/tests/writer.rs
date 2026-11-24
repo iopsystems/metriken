@@ -408,6 +408,7 @@ fn a_complete_long_table_with_a_live_tail_lists_through_its_reader() {
 /// archive at `path`, leaving its index; with `open_frame` false, also drop
 /// the index's third frame (the segment's open parts), so an open has to
 /// read the segment.
+#[cfg(feature = "rez")]
 fn damage_last_meminfo_segment(path: &Path, open_frame: bool) {
     const LAST: &str = "stream = 'memory/meminfo' \
          AND seq = (SELECT max(seq) FROM segments WHERE stream = 'memory/meminfo')";
@@ -499,6 +500,7 @@ fn a_damaged_segment_with_an_open_frame_still_opens_its_table() {
 /// The archive at `path` as one written before indexes held open parts:
 /// every names index with its third frame dropped. Returns how many indexes
 /// it changed.
+#[cfg(feature = "rez")]
 fn drop_open_frames(path: &Path) -> usize {
     let db = rusqlite::Connection::open(path).unwrap();
     let rows: Vec<(i64, String, i64, Vec<u8>)> = db
