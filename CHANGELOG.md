@@ -16,6 +16,15 @@ Requires dendro 0.8.1.
   0.8 with it. The stream is still replication protocol version 1, which
   dendro 0.8 reads.
 
+### metriken-storage (unreleased)
+
+- **Changed:** opening a segmented table stores each series' label set
+  once, shared by the indexes built at open, where it was copied into
+  each. The first query on a table of 161,222 task series takes 1.43 s
+  where it took 2.13 s, and leaves 1.47 GB resident where it left 2.27 GB.
+  On a 9.6 h recording with a wide task table, it takes 4.07 s where it
+  took 4.36 s, with the same resident memory.
+
 ### metriken-storage 0.14.0
 
 Requires dendro 0.8.1 and metriken-exposition 0.28.0.
@@ -277,6 +286,16 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   writes (a fixed scale for a time unit, else the power of 10 that makes
   every bound an integer), that it applies to `OVERFLOW_BOUND_KEY` too,
   and which readers divide by it.
+
+### metriken-query (unreleased)
+
+- **Changed:** a grid `rate`, `irate` or `increase` over many series is
+  faster. Each series' points start at its first sample instead of being
+  walked from the range's start, and a range that ends at the source's
+  last row no longer hashes every series' labels to look up rows after
+  it. Results are unchanged. `sum(irate(task_cpu_usage[5m])) / 1e9` over
+  161,222 task series at a 100 ms interval, warm: from 0.78–0.85 s to
+  0.29 s.
 
 ### metriken-query 0.51.0
 
