@@ -26,11 +26,16 @@ Requires dendro 0.8.3.
 
 - **Changed:** a dendro source copied under a fresh uuid because its
   archive already held the source (dendro's `copy_sources_into_as_copies`)
-  is read as a copy of that source: `Catalog::sources_with_uuids` gives
-  dendro's `SourceRow::identity`, its origin, for its uuid. Process groups
-  and label overlays then take it as they take two copies under one uuid:
-  two snapshots or dumps of one buffer copied into one archive are one
-  process, gaps and overlap included.
+  is grouped as a copy of that source: process groups take
+  `SourceInfo::identity` (dendro's `SourceRow::identity`, the copied uuid),
+  so two snapshots or dumps of one buffer copied into one archive are one
+  process, gaps and overlap included, as two copies under one uuid were.
+  `SourceInfo::uuid` stays the source's own uuid, so a `Scope` or source
+  selector naming it reads that source alone; a `SourceSelector::Uuid` in a
+  label overlay selects a source by its uuid or its identity.
+- **Added:** `Catalog::source_identities` (defaulting to each source's
+  uuid), `SourceInfo::identity` and `SourceInfo::with_identity`, and
+  `LabelOverlay::apply_with_identity`.
 
 ### metriken-exposition 0.28.0
 

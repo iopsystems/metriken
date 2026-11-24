@@ -1120,15 +1120,16 @@ impl MetricsSource for ArchiveReader {
         leads.sort_unstable();
         leads.dedup();
         for lead in leads {
-            let uuid = &sources[lead].uuid;
+            let uuid = &sources[lead].identity;
             let group = tables
                 .iter()
                 .find(|(p, _)| *p == lead)
                 .and_then(|(_, t)| self.read_group_of(t));
             let mut out: Vec<u64> = Vec::new();
             for (p, t) in &tables {
-                let copy =
-                    uuid.is_some() && sources[*p].uuid == *uuid && self.read_group_of(t) == group;
+                let copy = uuid.is_some()
+                    && sources[*p].identity == *uuid
+                    && self.read_group_of(t) == group;
                 if *p != lead && !copy {
                     continue;
                 }

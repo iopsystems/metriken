@@ -2063,7 +2063,13 @@ impl ArchiveReader {
         let db = shared.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
 
-        for (recording, (rec, uuid)) in db.sources_with_uuids()?.into_iter().enumerate() {
+        let identities = db.source_identities()?;
+        for (recording, ((rec, uuid), identity)) in db
+            .sources_with_uuids()?
+            .into_iter()
+            .zip(identities)
+            .enumerate()
+        {
             if let Some(wrote) = rec.metadata.get(dendro::keys::ENCODER) {
                 if !crate::encoder::READABLE_ENCODERS.contains(&wrote.as_str()) {
                     return Err(format!(
@@ -2257,7 +2263,8 @@ impl ArchiveReader {
                 uuid,
                 tables_span(&tables),
                 &rec.metadata,
-            );
+            )
+            .with_identity(identity);
             out.push((
                 rec.labels.clone(),
                 Self {

@@ -30,7 +30,9 @@ use crate::labels::Labels;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SourceSelector {
-    /// The source with this uuid, and its copies, which keep it.
+    /// The source with this uuid, and its copies: those that keep it, and
+    /// those kept under a fresh uuid with it as their identity
+    /// ([`Catalog::source_identities`](crate::catalog::Catalog::source_identities)).
     Uuid(String),
     /// The sources whose labels, as the archive stores them, `Labels::matches`
     /// this filter: one matcher per label, each value as [`MatchOp::encode`]
@@ -100,11 +102,24 @@ impl LabelOverlay {
         labels: &BTreeMap<String, String>,
         uuid: Option<&str>,
     ) -> BTreeMap<String, String> {
+        self.apply_with_identity(labels, uuid, uuid)
+    }
+
+    /// [`apply`](Self::apply) for a source whose identity
+    /// ([`Catalog::source_identities`](crate::catalog::Catalog::source_identities))
+    /// may differ from its uuid: a [`SourceSelector::Uuid`] selects it by
+    /// either.
+    pub fn apply_with_identity(
+        &self,
+        labels: &BTreeMap<String, String>,
+        uuid: Option<&str>,
+        identity: Option<&str>,
+    ) -> BTreeMap<String, String> {
         let stored = Labels::from(labels.clone());
         let mut out = labels.clone();
         for entry in &self.entries {
             let selected = match &entry.selector {
-                SourceSelector::Uuid(u) => uuid == Some(u.as_str()),
+                SourceSelector::Uuid(u) => uuid == Some(u.as_str()) || identity == Some(u.as_str()),
                 SourceSelector::Matching(filter) => stored.matches(filter),
             };
             if !selected {
@@ -145,15 +160,25 @@ impl Catalog for OverlaidCatalog {
     }
 
     fn sources_with_uuids(&self) -> Result<Vec<(Source, Option<String>)>, String> {
+        let identities = self.inner.source_identities()?;
         Ok(self
             .inner
             .sources_with_uuids()?
             .into_iter()
-            .map(|(mut source, uuid)| {
-                source.labels = self.overlay.apply(&source.labels, uuid.as_deref());
+            .zip(identities)
+            .map(|((mut source, uuid), identity)| {
+                source.labels = self.overlay.apply_with_identity(
+                    &source.labels,
+                    uuid.as_deref(),
+                    identity.as_deref(),
+                );
                 (source, uuid)
             })
             .collect())
+    }
+
+    fn source_identities(&self) -> Result<Vec<Option<String>>, String> {
+        self.inner.source_identities()
     }
 
     fn tables(&self, source_id: i64) -> Result<Vec<String>, String> {

@@ -235,8 +235,8 @@ fn two_disjoint_dumps_of_one_buffer_are_one_process() {
 /// Two dumps of one buffer copied into one archive as dendro now writes
 /// them: the second under a fresh uuid, with the buffer's as its origin
 /// (dendro's `copy_sources_into_as_copies`). The reader takes the origin as the
-/// source's uuid, so they join as one copy of the buffer, as two copies
-/// under one uuid did.
+/// source's identity, so they join as one copy of the buffer, as two
+/// copies under one uuid did.
 #[test]
 fn two_dumps_of_one_buffer_under_fresh_uuids_are_one_process() {
     let dir = tempfile::tempdir().unwrap();
@@ -273,7 +273,8 @@ fn two_dumps_of_one_buffer_under_fresh_uuids_are_one_process() {
     let reader = open(&combined);
     let sources = reader.sources();
     assert_eq!(sources.len(), 2);
-    assert_eq!(sources[0].uuid, sources[1].uuid);
+    assert_ne!(sources[0].uuid, sources[1].uuid);
+    assert_eq!(sources[1].identity, sources[0].uuid);
     let g = reader.process_groups();
     assert_eq!(groups(g), vec![vec![0, 1]]);
     assert_eq!(g.uuid_groups.len(), 1);
