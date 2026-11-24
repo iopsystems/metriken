@@ -44,7 +44,8 @@ Requires dendro 0.8.2.
   in about 0.02 s and 11 MB more; a reader before it, which decodes every
   segment's index and keeps the third frame, about 0.05–0.09 s and 29 MB
   more.
-  Each segment's index is larger: on a fresh 100 ms recording, the
+  A segment's index gains a third frame and is larger: on a fresh 100 ms
+  recording, the
   `syscall_counts_cgroup` table's indexes are 29.9% of its segment bytes,
   against 24.8% before. A segment written by an earlier version is
   fetched and parsed as before. A table whose segment is damaged but whose
