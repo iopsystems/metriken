@@ -455,6 +455,7 @@ pub(crate) fn listing_key(index: &[u8]) -> &[u8] {
 /// Whether `index` holds an open frame this crate does not know: of a later
 /// version, one that does not decode, or followed by more bytes. A re-index
 /// leaves such an index as it is, and replaces one of an earlier version.
+#[cfg(any(feature = "write", test))]
 pub(crate) fn has_unknown_open_frame(index: &[u8]) -> bool {
     let Some(Stored::Names(_, Some(frame))) = read(Some(index)) else {
         return false;
