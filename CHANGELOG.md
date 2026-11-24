@@ -16,7 +16,7 @@ Requires dendro 0.8.1.
   0.8 with it. The stream is still replication protocol version 1, which
   dendro 0.8 reads.
 
-### metriken-storage (unreleased)
+### metriken-storage 0.14.1
 
 Requires dendro 0.8.2.
 
@@ -38,13 +38,17 @@ Requires dendro 0.8.2.
   takes from the segment's footer, and the open reads that instead of
   fetching the segment. On the 9.6 h recording, copied into a current
   archive and re-indexed, the first query on its wide task table takes
-  1.72 s where the build before took 3.09 s on a copy of the same segments
-  with the earlier indexes. A reader of this version opens such an archive
+  1.31 s by median (1.30–2.14 s over five runs) where the build before
+  took 2.45–2.81 s on a copy of the same segments with the earlier
+  indexes. A reader of this version opens such an archive
   in about 0.02 s and 11 MB more; a reader before it, which decodes every
   segment's index and keeps the third frame, about 0.05–0.09 s and 29 MB
   more.
-  A segment written by an earlier version is fetched and parsed as
-  before. A table whose segment is damaged but whose
+  A segment's index gains a third frame and is larger: on a fresh 100 ms
+  recording, the
+  `syscall_counts_cgroup` table's indexes are 29.9% of its segment bytes,
+  against 24.8% before. A segment written by an earlier version is
+  fetched and parsed as before. A table whose segment is damaged but whose
   index is intact now opens, and a query over it skips that segment with a
   warning; before, the table did not open.
 - **Added:** `reindex::reindex` (feature `write`) rewrites an archive's
@@ -90,7 +94,7 @@ Requires dendro 0.8.1 and metriken-exposition 0.28.0.
 - **Added:** `SourceRecorder::rows_behind`, the count of rows not staged
   for that reason.
 
-### metriken-query (unreleased)
+### metriken-query 0.52.1
 
 - **Changed:** a grid `rate`, `irate` or `increase` over many series is
   faster. Each series' points start at its first sample instead of being
@@ -319,16 +323,6 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   writes (a fixed scale for a time unit, else the power of 10 that makes
   every bound an integer), that it applies to `OVERFLOW_BOUND_KEY` too,
   and which readers divide by it.
-
-### metriken-query (unreleased)
-
-- **Changed:** a grid `rate`, `irate` or `increase` over many series is
-  faster. Each series' points start at its first sample instead of being
-  walked from the range's start, and a range that ends at the source's
-  last row no longer hashes every series' labels to look up rows after
-  it. Results are unchanged. `sum(irate(task_cpu_usage[5m])) / 1e9` over
-  161,222 task series at a 100 ms interval, warm: from 0.78–0.85 s to
-  0.29 s.
 
 ### metriken-query 0.51.0
 
