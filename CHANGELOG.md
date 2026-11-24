@@ -16,7 +16,7 @@ Requires dendro 0.8.1.
   0.8 with it. The stream is still replication protocol version 1, which
   dendro 0.8 reads.
 
-### metriken-storage (unreleased)
+### metriken-storage 0.14.1
 
 Requires dendro 0.8.2.
 
@@ -38,8 +38,9 @@ Requires dendro 0.8.2.
   takes from the segment's footer, and the open reads that instead of
   fetching the segment. On the 9.6 h recording, copied into a current
   archive and re-indexed, the first query on its wide task table takes
-  1.72 s where the build before took 3.09 s on a copy of the same segments
-  with the earlier indexes. A reader of this version opens such an archive
+  1.31 s by median (1.30–2.14 s over five runs) where the build before
+  took 2.45–2.81 s on a copy of the same segments with the earlier
+  indexes. A reader of this version opens such an archive
   in about 0.02 s and 11 MB more; a reader before it, which decodes every
   segment's index and keeps the third frame, about 0.05–0.09 s and 29 MB
   more.
