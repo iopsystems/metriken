@@ -353,6 +353,8 @@ impl ArchiveWriter {
             samplers: HashMap::new(),
             accounts: HashMap::new(),
             opened: HashMap::new(),
+            newest: HashMap::new(),
+            behind: 0,
         })
     }
 
@@ -852,6 +854,19 @@ pub struct SourceRecorder {
     /// row that carries the group's schema or the cells' metadata. Absent
     /// when the open segment is empty.
     opened: HashMap<String, i64>,
+    /// Per stream, the timestamp of the newest row staged.
+    newest: HashMap<String, i64>,
+    /// Rows not staged because their timestamp was at or below their
+    /// stream's newest ([`rows_behind`](Self::rows_behind)).
+    behind: u64,
+}
+
+/// Whether a row of `stream` at `ts` is at or below the newest staged for
+/// it. dendro drops such a row; it is skipped before it is staged, because
+/// the row that states a stream's schema or metadata is the first after a
+/// change, and a dropped one would leave the rows after it without one.
+fn at_or_below(newest: &HashMap<String, i64>, stream: &str, ts: u64) -> bool {
+    newest.get(stream).is_some_and(|&n| ts as i64 <= n)
 }
 
 impl SourceRecorder {
@@ -859,9 +874,28 @@ impl SourceRecorder {
         self.writer.source_id()
     }
 
+    /// The rows not staged because their timestamp was at or below the
+    /// newest row staged for their stream, as when a source's clock steps
+    /// back. The first is logged as a warning; later ones are only counted.
+    pub fn rows_behind(&self) -> u64 {
+        self.behind
+    }
+
+    /// Count a row skipped by [`at_or_below`].
+    fn skip_behind(behind: &mut u64, source_id: i64, stream: &str, ts: u64) {
+        if *behind == 0 {
+            tracing::warn!(
+                "source {source_id}, stream {stream}: a row at {ts} is at or below the newest \
+                 row recorded for it; rows that do not advance their stream are not recorded"
+            );
+        }
+        *behind += 1;
+    }
+
     /// Account one staged row of `stream` to its open segment.
     fn add_row(&mut self, stream: &str, bytes: usize, ts: u64) {
         self.account(stream).add_row(bytes, ts as i64);
+        self.newest.insert(stream.to_string(), ts as i64);
         if !self.opened.contains_key(stream) {
             self.opened.insert(stream.to_string(), ts as i64);
         }
@@ -1063,6 +1097,10 @@ impl SourceRecorder {
         if state.last_key == Some(key) {
             return Ok(());
         }
+        if at_or_below(&self.newest, name, ts) {
+            Self::skip_behind(&mut self.behind, self.writer.source_id(), name, ts);
+            return Ok(());
+        }
         let wire = match &state.wire {
             Some((hash, wire)) if *hash == row.schema_hash => Arc::clone(wire),
             _ => {
@@ -1246,6 +1284,10 @@ impl SourceRecorder {
             if state.last_key.is_some_and(|last| key <= last) {
                 continue;
             }
+            if at_or_below(&self.newest, &sampler, ts) {
+                Self::skip_behind(&mut self.behind, self.writer.source_id(), &sampler, ts);
+                continue;
+            }
             state.last_key = Some(key);
             let cells: Vec<WalCell> = entries
                 .iter()
@@ -1333,6 +1375,10 @@ impl SourceRecorder {
         // once, and a row skipped as a repeat would otherwise lose it.
         let layout = state.layout(g, long_groups);
         if state.last_key == Some(key) {
+            return Ok(());
+        }
+        if at_or_below(&self.newest, &g.name, ts) {
+            Self::skip_behind(&mut self.behind, self.writer.source_id(), &g.name, ts);
             return Ok(());
         }
         let Some(layout) = layout else {
@@ -1609,11 +1655,10 @@ impl SourceRecorder {
     /// find its occupant's labels.
     ///
     /// A stream whose open segment started before the cutoff is sealed
-    /// first. Retention deletes unsealed rows by timestamp, and the first
-    /// row of an open segment is the one carrying the group's schema or the
-    /// cells' metadata: deleting it would leave the segment's later rows
-    /// with nothing to decode against, and they would be dropped when it
-    /// sealed. Sealed, the rows stay together in a segment that retention
+    /// first. Retention keeps a stream's unsealed rows whatever their
+    /// timestamp, so an open segment that started before the cutoff would
+    /// hold rows older than it until the stream next sealed. Sealed, the
+    /// rows stay together in a segment that retention
     /// keeps until its last row is older than the cutoff. A retention
     /// window shorter than the seal policy's `max_age` therefore also
     /// bounds segment age, and up to about twice the window is kept: a

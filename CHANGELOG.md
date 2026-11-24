@@ -7,6 +7,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken-exposition 0.28.0
+
+Requires dendro 0.8.1.
+
+- **Breaking:** takes dendro 0.8 (was 0.7). `FrameProducer::opening`
+  returns `dendro::Result`, so a caller that also depends on dendro moves to
+  0.8 with it. The stream is still replication protocol version 1, which
+  dendro 0.8 reads.
+
+### metriken-storage (unreleased)
+
+- **Changed:** opening a segmented table stores each series' label set
+  once, shared by the indexes built at open, where it was copied into
+  each. The first query on a table of 161,222 task series takes 1.43 s
+  where it took 2.13 s, and leaves 1.47 GB resident where it left 2.27 GB.
+  On a 9.6 h recording with a wide task table, it takes 4.07 s where it
+  took 4.36 s, with the same resident memory.
+- **Changed:** opening a segmented table no longer copies every column
+  descriptor of each segment for each list it builds from them, and looks
+  each column up in its index once. On the 9.6 h recording's wide task
+  table, the first query takes about a third less time: 2.90 s where the
+  build before took 4.38 s in the same session, and the single lookup
+  takes off a further 5% (2.82 s to 2.67 s).
+- **Added:** `DataSource::columns_desc_ref`, the column descriptors
+  borrowed, for a source that holds them. `None` by default.
+
+### metriken-storage 0.14.0
+
+Requires dendro 0.8.1 and metriken-exposition 0.28.0.
+
+- **Breaking:** takes dendro 0.8 (was 0.7). `DendroCatalog` and
+  `Encoder::for_archive` carry dendro types, so a caller that also depends
+  on dendro moves to 0.8 with it. Archives written through dendro 0.8 hold
+  at most one source per uuid: a `copy_sources_into` of a source the
+  destination already holds, such as an archive and its own copy or two
+  dumps of one buffer, is refused as `Error::DuplicateSource`. An archive
+  an earlier dendro wrote with such copies still reads, its copies as one
+  read group. Every writing handle leaves an `<archive>-lock` file beside
+  the archive; see dendro 0.8.0's notes.
+- **Changed:** `to_dendro::convert_path` and the other conversions that
+  write at a staging path remove the staging archive's `-lock` file with
+  it, so the output they publish has none beside it. `MsgpackToArchive`,
+  which writes at the output, removes the `-lock` file with the archive
+  after a failure and leaves it after a success.
+  `rez::to_dendro::convert_v3_to_dendro` writes at `dest` and leaves
+  `<dest>-lock` beside it; a caller that stages and renames removes the
+  staging path's. An output in a directory that does not exist is reported
+  as a failure to lock `<output>-lock`.
+- **Changed:** `SourceRecorder` does not stage a row whose timestamp is at
+  or below the newest row it staged for that stream, as when a source's
+  clock steps back, and logs the first as a warning naming the source.
+  dendro 0.8 drops such a row, and when it was the first of a new schema
+  the rows after it were left without one and lost at the next seal; the
+  next row staged states the schema. `MsgpackToArchive`'s count of snapshots includes those whose rows
+  were not staged.
+- **Added:** `SourceRecorder::rows_behind`, the count of rows not staged
+  for that reason.
+
+### metriken-query (unreleased)
+
+- **Changed:** a grid `rate`, `irate` or `increase` over many series is
+  faster. Each series' points start at its first sample instead of being
+  walked from the range's start, and a range that ends at the source's
+  last row no longer hashes every series' labels to look up rows after
+  it. Results are unchanged. `sum(irate(task_cpu_usage[5m])) / 1e9` over
+  161,222 task series at a 100 ms interval, warm: from 0.78–0.85 s to
+  0.29 s.
+
+### metriken-query 0.52.0
+
+Requires metriken-storage 0.14.0.
+
+- **Breaking:** takes metriken-storage 0.14 (was 0.13), whose types this
+  crate re-exports (`Labels`).
+
+### metriken-recorder 0.16.0
+
+Requires dendro 0.8.1, metriken-exposition 0.28.0 and metriken-storage
+0.14.0.
+
+- **Breaking:** takes dendro 0.8 (was 0.7), whose `WalRow` and `Frame` this
+  crate re-exports, and metriken-storage 0.14. Through dendro 0.8 a
+  recording's archive has an `<archive>-lock` file beside it, left in place
+  when the recorder exits, and a second writer on the archive is refused as
+  `Error::InUse`. A retention pass keeps live rows older than the cutoff
+  until their stream seals; see dendro 0.8.0's notes. Through
+  metriken-storage 0.14, a row at or below its stream's newest row, as from
+  a producer whose clock stepped back, is not recorded.
+- **Changed:** a recording discarded because nothing was recorded removes
+  its `-lock` file with the archive.
+
 ### metriken-charts 0.1.5
 
 Additive (0.1.5): a spec without `format.unit` formats as before, apart
@@ -113,23 +204,6 @@ Requires metriken-storage 0.13.0 (`prometheus_units`, below).
   would have been stored under one name are stored under their own names,
   as every series is. A `# HELP` text is kept under the exporter's name
   only.
-
-### metriken-storage (unreleased)
-
-- **Changed:** opening a segmented table stores each series' label set
-  once, shared by the indexes built at open, where it was copied into
-  each. The first query on a table of 161,222 task series takes 1.43 s
-  where it took 2.13 s, and leaves 1.47 GB resident where it left 2.27 GB.
-  On a 9.6 h recording with a wide task table, it takes 4.07 s where it
-  took 4.36 s, with the same resident memory.
-- **Changed:** opening a segmented table no longer copies every column
-  descriptor of each segment for each list it builds from them, and looks
-  each column up in its index once. On the 9.6 h recording's wide task
-  table, the first query takes about a third less time: 2.90 s where the
-  build before took 4.38 s in the same session, and the single lookup
-  takes off a further 5% (2.82 s to 2.67 s).
-- **Added:** `DataSource::columns_desc_ref`, the column descriptors
-  borrowed, for a source that holds them. `None` by default.
 
 ### metriken-storage 0.13.2
 

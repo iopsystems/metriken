@@ -291,14 +291,12 @@ impl Encoder {
         // so leaving it live would not let a later seal decode it, and a
         // skipped row in the middle of the run, reported, is a hole dendro
         // refuses as an encoder contract violation, which stops the writer.
-        // The writer states the schema on every change of hash and seals
-        // a stream before retention can cut its open segment's first row,
-        // (dendro retries a deferred seal before it evicts and leaves out a
-        // stream it still cannot seal), so this needs a tail whose anchor
-        // was lost some other way: one a 0.2.2 writer left after retention
-        // cut into it, or a deferred seal whose retry before an eviction
-        // failed with an error that is not retryable, after which dendro
-        // evicts the stream's live rows.
+        // The writer states the schema on every change of hash, does not
+        // stage a row dendro would drop as out of order, and dendro keeps a
+        // stream's live rows through retention, so this needs a tail whose
+        // anchor was lost some other way: one a 0.2.2 writer left after
+        // retention cut into it, or a tick dendro dropped after its retries
+        // failed.
         // The names index, so a reader opening the archive learns the
         // segment's metric names from the catalog, with no footer fetched.
         Ok(tail.map(|t| Segment {

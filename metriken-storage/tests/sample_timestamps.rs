@@ -10,6 +10,8 @@
 //! whose answers include the list.
 #![cfg(feature = "write")]
 
+mod support;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
@@ -258,12 +260,10 @@ fn catalog_source(catalog: &DendroCatalog) -> i64 {
     sources[0].id
 }
 
-/// Copy every source of `from` into `into`, keeping each uuid.
-fn copy(from: &Path, into: &mut ArchiveMut) {
-    let src = Archive::open(from).unwrap();
-    let encoder = Encoder::for_archive(&src).unwrap();
-    into.transaction(|tx| copy_sources_into(&src, tx, &CopySpec::everything(), &encoder))
-        .unwrap();
+/// Copy every source of `from` into the archive at `into`, keeping each
+/// uuid.
+fn copy(from: &Path, into: &Path) {
+    support::copy_keeping_uuids(from, into, &CopySpec::everything());
 }
 
 /// A source and its copy are one read group, holding the same instants:
@@ -281,11 +281,8 @@ fn a_read_group_of_copies_lists_each_instant_once() {
     assert_eq!(alone, seconds(0..=10));
 
     let both = dir.path().join("with-copy.dendro");
-    {
-        let mut out = ArchiveMut::create(&both).unwrap();
-        copy(&a, &mut out);
-        copy(&a, &mut out);
-    }
+    copy(&a, &both);
+    copy(&a, &both);
     let reader = joined(&both);
     assert_eq!(reader.sources().len(), 2);
     assert_eq!(reader.read_groups().len(), 1, "one read group");
@@ -429,8 +426,8 @@ fn a_copy_holding_more_tables_contributes_its_instants() {
         };
         out.transaction(|tx| copy_sources_into(&src, tx, &spec, &encoder))
             .unwrap();
-        copy(&a, &mut out);
     }
+    copy(&a, &both);
     let reader = joined(&both);
     assert_eq!(reader.read_groups().len(), 1);
     let got = reader.sample_timestamps();
