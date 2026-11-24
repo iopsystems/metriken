@@ -1220,6 +1220,11 @@ impl SegmentedSource {
             .filter(|_| reusable)
             .and_then(|p| p.sealed_prefix(&keys, relabeled));
 
+        // A segment whose index holds its parts is folded from them, without
+        // fetching it. Taken whether or not they are used, so a store whose
+        // state is reused whole does not keep them.
+        #[cfg(feature = "archive")]
+        let indexes = store.caller_indexes();
         let (state, sealed) = match &reused {
             // Every segment is one the previous reader read: its state is
             // this reader's, unchanged.
@@ -1236,10 +1241,6 @@ impl SegmentedSource {
                     _ => None,
                 };
                 let mut memo = IdentityMemo::default();
-                // A segment whose index holds its parts is folded from them,
-                // without fetching it.
-                #[cfg(feature = "archive")]
-                let indexes = store.caller_indexes();
                 for idx in start..store.len() {
                     if reusable && idx == keys.len() && !keys.is_empty() && sealed.is_none() {
                         sealed = Some(Arc::new(state.clone()));

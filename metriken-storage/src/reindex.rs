@@ -70,7 +70,11 @@ pub fn reindex(path: &Path) -> Result<Reindexed, Box<dyn Error>> {
                 report.segments += 1;
                 let old = stored.remove(seq).flatten();
                 let ours = match crate::names::read(old.as_deref()) {
-                    Some(Stored::Names(..) | Stored::Fingerprint(_)) => true,
+                    // Not one a later version wrote.
+                    Some(Stored::Names(..)) => !old
+                        .as_deref()
+                        .is_some_and(crate::names::has_unknown_open_frame),
+                    Some(Stored::Fingerprint(_)) => true,
                     // No index: the writer gives one to a table's segments.
                     None if old.is_none() => !occupants,
                     _ => false,

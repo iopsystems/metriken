@@ -486,7 +486,13 @@ fn a_damaged_segment_with_an_open_frame_still_opens_its_table() {
     );
     let (start, end) = reader.time_range().unwrap();
     let result = reader.query_range("mem_free", start, end, 1.0);
-    assert!(result.is_ok(), "{result:?}");
+    match result {
+        Ok(QueryResult::Matrix { result, .. }) => assert!(
+            result.iter().any(|s| !s.values.is_empty()),
+            "the undamaged segments' rows are read: {result:?}"
+        ),
+        other => panic!("{other:?}"),
+    }
     assert_eq!(listings(&reader), before);
 }
 

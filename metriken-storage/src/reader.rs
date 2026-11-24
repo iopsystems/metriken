@@ -316,14 +316,14 @@ fn table_probes(
         let mut added: HashSet<&[u8]> = HashSet::new();
         for (i, (seq, _)) in sealed.iter().enumerate() {
             let raw = stored.get(seq).map(Vec::as_slice);
-            if raw.is_some_and(|raw| added.contains(raw)) {
+            if raw.is_some_and(|raw| added.contains(crate::names::listing_key(raw))) {
                 continue;
             }
             let fetch = match crate::names::read(raw) {
                 Some(Stored::Names(names, columns)) => match indexed_intervals(&names) {
                     Some(intervals) => {
                         known.names.add(&names);
-                        added.extend(raw);
+                        added.extend(raw.map(crate::names::listing_key));
                         if i == 0 {
                             known.first = Some(intervals);
                         }
@@ -358,7 +358,7 @@ fn table_probes(
                     }
                     None => known.listed = None,
                 }
-            } else if !raw.is_some_and(|raw| added.contains(raw)) {
+            } else if !raw.is_some_and(|raw| added.contains(crate::names::listing_key(raw))) {
                 // Neither indexed nor read: its columns are not known.
                 known.listed = None;
             }
@@ -523,9 +523,10 @@ fn segment_timestamps(bytes: Vec<u8>) -> Result<Vec<u64>, Box<dyn std::error::Er
 ///
 /// Built when the table is first queried: the sealed segments' sequence
 /// numbers from the catalog, and the live WAL tail materialized once as the
-/// newest segment. The tail is the one thing held in memory — it is at most
-/// a segment's worth of rows, and it is the part of the table SQLite cannot
-/// hand back as parquet. Sealed segments are read on demand by their listed
+/// newest segment. The tail is held in memory — it is at most a segment's
+/// worth of rows, and it is the part of the table SQLite cannot hand back as
+/// parquet — and so are the sealed segments' indexes, until the open takes
+/// them. Sealed segments are read on demand by their listed
 /// catalog entry; one that retention removed, or whose number now names
 /// another segment, reads as gone and is skipped.
 struct DbSegmentStore {
