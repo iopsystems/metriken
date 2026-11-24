@@ -48,6 +48,16 @@ Requires dendro 0.8.1 and metriken-exposition 0.28.0.
 - **Added:** `SourceRecorder::rows_behind`, the count of rows not staged
   for that reason.
 
+### metriken-query (unreleased)
+
+- **Changed:** a grid `rate`, `irate` or `increase` over many series is
+  faster. Each series' points start at its first sample instead of being
+  walked from the range's start, and a range that ends at the source's
+  last row no longer hashes every series' labels to look up rows after
+  it. Results are unchanged. `sum(irate(task_cpu_usage[5m])) / 1e9` over
+  161,222 task series at a 100 ms interval, warm: from 0.78–0.85 s to
+  0.29 s.
+
 ### metriken-query 0.52.0
 
 Requires metriken-storage 0.14.0.
