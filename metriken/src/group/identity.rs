@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::{
-    CounterGroup, CounterHistogramGroup, GaugeGroup, ShardedCounterGroup,
-    ShardedCounterHistogramGroup,
+    CounterGroup, CounterHistogramGroup, GaugeGroup, RwLockCounterHistogramGroup,
+    ShardedCounterGroup, ShardedCounterHistogramGroup,
 };
 use crate::{WindowedCounterGroup, WindowedGaugeGroup};
 
@@ -57,6 +57,7 @@ slot_metadata!(
     CounterGroup,
     GaugeGroup,
     CounterHistogramGroup,
+    RwLockCounterHistogramGroup,
     ShardedCounterGroup,
     ShardedCounterHistogramGroup,
     WindowedCounterGroup,

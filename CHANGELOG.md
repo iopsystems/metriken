@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### metriken (unreleased)
+
+- **Added:** `RwLockCounterHistogramGroup`, a counting histogram group whose
+  entries are written as whole bucket arrays: `update_from(idx, &buckets)`
+  replaces one entry under the group's lock, as
+  `RwLockCounterHistogram::update_from` does for a single histogram, and
+  `clear(idx)` leaves an entry unwritten. An unwritten entry loads as `None`,
+  so an exposition lists only the entries written since they were created or
+  cleared. It implements `HistogramGroupMetric` and `SlotMetadata`, and
+  metriken-exposition sends it as `CounterHistogramGroup` is sent. A use is
+  a per-device histogram summed from a BPF map, which `CounterHistogramGroup`
+  (incremented one value at a time) cannot hold.
+
 ### metriken-exposition 0.28.0
 
 Requires dendro 0.8.1.
