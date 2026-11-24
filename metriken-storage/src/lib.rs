@@ -92,6 +92,8 @@ pub mod prometheus_units;
 #[cfg(feature = "archive")]
 pub mod reader;
 pub mod recordings;
+#[cfg(feature = "write")]
+pub mod reindex;
 #[cfg(feature = "rez")]
 pub mod rez;
 pub mod scan;

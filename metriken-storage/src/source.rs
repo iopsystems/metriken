@@ -22,7 +22,7 @@ pub struct CounterColumnRef {
 /// purpose — a reader keeps one per column per segment, which on a wide
 /// table is hundreds of thousands — so it carries positions, whether the
 /// column can hold a value, and nothing that names the column.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ColumnPosition {
     pub col_idx: u32,
     pub begin_col: Option<u32>,

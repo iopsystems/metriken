@@ -199,6 +199,51 @@ before change 3.
     (`segment_kept`, 22%);
   - building each footer's Arrow schema (27.5%, overlapping the above).
 
+**Change 5, opening a table from its segments' indexes.** (Results:
+"Change 5: results".) Written
+2026-11-20, after change 4's results and before any code. The owner chose
+this over keeping parsed footers in the pool (faster, but up to about
+1.6 GB more resident on the 9.6 h task table by the pool's own estimate),
+and chose an in-place re-index for existing archives over a copy.
+
+- **What:** the names index gains a version (`MNI4`) with a third frame
+  holding what `OpenState::fold` takes from a parsed footer:
+  - the counter column refs (`ColumnPosition` per column, one per occupant
+    per metric in a long segment);
+  - the column map;
+  - units per metric, duplicated series and file metadata;
+  - the segment's time span and interval;
+  - the histogram config check, run when the segment is sealed.
+
+  When every segment of a table has that frame, the open folds the frames
+  and fetches no segment. Otherwise it takes today's path. A query still
+  fetches and parses the footer of each segment it reads.
+- **Existing archives:** a re-index rewrites each segment's index in place
+  through a new dendro call, `ArchiveMut::replace_segment_index`, without
+  rewriting the segment. metriken and rezolus are on dendro 0.7.1, so that
+  call is backported to a dendro 0.7.2. (Superseded before release:
+  metriken moved to dendro 0.8.1 in #435, and the call shipped in dendro
+  0.8.2 only, from dendro #95. The owner chose the 0.8 line alone.)
+- **GO, measured on the 9.6 h recording after a re-index:**
+  - the first `task_cpu_usage{pid="1"}` at most 1.8 s, from 2.67 s at
+    change 4's head;
+  - no query slower by more than 10% on either recording;
+  - output unchanged;
+  - each table's indexes at most 25% of its segments' bytes;
+  - the re-index of the 9.6 h archive under 60 s.
+- **Prediction:** about 1.6 s. In change 4's profile:
+  - fetching segment bytes from SQLite is 11.4%;
+  - opening each segment's footer for the open is 17.5%;
+  - `SegmentColumns::of` and `column_map` are 11.5%.
+
+  An index row is smaller than a segment, so most of those samples go.
+  The query's own parse (`segment_kept`, 29.8%) stays.
+- **Refutation:** under a 20% reduction, which would mean the open's footer
+  work is not where the time is.
+- **Unknown before building:** how large the third frame is for a long
+  table with 161,222 occupants, whose refs are one per occupant per
+  metric.
+
 ## Plan
 
 1. The bench and this entry.
@@ -481,6 +526,144 @@ descriptor step (4,136 samples; the shares overlap):
   and parses it again.
 - `IdentityMemo::column` was 13.1%, which the memo step addresses.
 - SQLite reads of the segment bytes are 11.4%.
+
+## Change 5: results
+
+Built on branch `perf/open-from-index`, first against a local backport of
+dendro's `replace_segment_index` to 0.7.1, then against dendro 0.8.2 (dendro
+#95), released 2026-11-23 (2026-11-24 UTC), once metriken moved to dendro
+0.8. The
+measurements below were taken on the 0.7.1 build; the code that differs
+between the two is dendro's, not this change's.
+
+As built, departures from the plan above:
+
+- **The prefix stays `MNI3`; the open parts are a third zstd frame.**
+  - A reader that does not know the third frame decompresses it with the
+    second and parses the `SegmentColumns` at the front;
+    `rmp_serde::from_slice` ignores the bytes after it.
+  - A new prefix would have made those readers treat every new index as
+    unreadable and fetch each segment to list a table.
+- **The writer and the footer path build the parts with one function**,
+  `SegmentOpen::of`, and `OpenState::fold` folds the parts
+  (`fold_parts`). Within one build the two paths fold the same parts. An
+  index written by another build holds that build's parts, so a change to
+  what `SegmentOpen::of` computes needs a new open-frame version
+  (`OPEN_VERSION`, added after review: the open reads only the version it
+  knows, reading the version from the frame's first bytes before
+  decompressing the rest, and a re-index leaves an index whose open frame
+  is of a later version, does not decode, or is followed by more bytes, and
+  replaces one of an earlier version).
+- **The open decides per segment, not per table** as the plan said: a
+  segment whose index holds the parts is folded from them, and any other
+  is fetched.
+- **The stored form groups a long segment's per-occupant entries.** A run
+  of counter references that differ only in occupant is stored once with
+  its occupant ids, and so are the column map entries. The read rebuilds
+  them exactly, in order (`open_parts_read_back_exactly`).
+- **`ARROW:schema` is left out of the parts' file metadata.** It was about
+  80% of a wide segment's open parts (2.8 KB of 3.6 KB on drivehealth), and
+  nothing reads it through `DataSource::file_metadata`. The footer path
+  drops it too, so `SegmentedSource::file_metadata` no longer reports it.
+- **The listing does not keep the third frame.** It keeps each segment's
+  columns frame for the reader's life; holding the open frame there too
+  was about 13 MB on the 9.6 h recording (70 MB after open for a reader
+  that keeps it, 57 MB for one that does not).
+- **The listing dedups on the names and columns frames** (`listing_key`),
+  added after review. It decoded each distinct whole index once, and the
+  open frame holds each segment's span, so every index became distinct:
+  on the 9.6 h recording, 358 distinct indexes became 5,874. Keyed on the
+  first two frames, segments with the same names and columns decode once
+  again.
+- **The query checks a stored column position against the segment's
+  columns** (`FileSource::counter_column`, `batch_columns`), added after
+  review: a position from an index that does not describe its segment
+  read past the segment's columns and panicked in parquet. It now warns
+  and reads nothing. A position that is in range but belongs to another
+  segment's layout would still read the wrong column; nothing in dendro
+  replaces a segment's bytes and keeps its index.
+- **`reindex` refuses an archive before schema 5.**
+  - On schema 4 a segment's index is a column after its bytes.
+  - Re-indexing the 9.6 h recording (schema 4) in place took RSS after
+    open from 46 MB to about 440 MB, and open from 0.03 s to 0.3 s: every
+    open read through every segment's bytes to read the indexes.
+  - A schema 4 archive is copied into a current one first (rezolus's
+    `recording snapshot`).
+
+What I first reported as a cost of the listing at open (about 400 MB) was
+that schema 4 effect. On a schema 5 copy with two-frame indexes, RSS after
+open is 41 MB, as without indexes.
+
+**Measured** on schema 5 copies (the fresh 100 ms recording as recorded,
+and a `recording snapshot` of the 9.6 h one), each re-indexed. Three fresh
+processes per arm, interleaved, against change 4's head (`fe5967b`)
+reading the same copies with two-frame indexes. Medians of the first runs:
+
+| | change 4 | change 5 |
+|---|---|---|
+| 9.6 h, `task_cpu_usage{pid="1"}` | 3.086 s (3.073–3.100) | 1.717 s (1.698–1.768) |
+| 9.6 h, `sum by (op) (irate(cgroup_syscall[5m]))` | 0.670 s | 0.448 s |
+| fresh 100 ms, `task_cpu_usage{pid="1"}` | 1.503 s | 1.189 s |
+| fresh 100 ms, `sum by (op) (irate(cgroup_syscall[5m]))` | 0.911 s | 0.768 s |
+| 9.6 h, archive open | 0.33 s, 41 MB after | 0.42 s, 57 MB after |
+| fresh 100 ms, archive open | 0.10 s, 18 MB after | 0.11 s, 20 MB after |
+
+- **Output:** every query on both recordings matches.
+- **Index size**, as a share of segment bytes:
+  - 9.6 h: 1.4% overall, every table under 20%;
+  - fresh 100 ms: 4.8% overall.
+  - Two fresh 100 ms tables are over 25%:
+    - `syscall_counts_cgroup` at 29.9%, against 24.8% with today's two
+      frames;
+    - `memory_slabinfo_sweep` at 30.4%, three segments of 5 KB each.
+- **Re-index:** 1.4 s (fresh 100 ms, 704 segments) and 5.8 s (9.6 h,
+  5,874 segments).
+- **Against the criteria:**
+  - time: met (1.717 s against 1.8 s; predicted 1.6 s);
+  - output: met;
+  - re-index time: met;
+  - index size: not met on two tables;
+  - no query slower by more than 10%: not cleanly met. The first
+    `task_sum` on fresh 100 ms has a median 16% higher, though its ranges
+    overlap (0.262–0.301 s against 0.253–0.344 s); in the set before, it
+    was 8% higher.
+  - Archive open is not a query in the criteria. In this set it was
+    0.09 s and 16 MB worse on 9.6 h.
+- **After review's fixes,** five fresh processes per arm, interleaved, the
+  first task query alone (`task_cpu_usage{pid="1"}`), on 9.6 h. Raw runs
+  in sets r12 and r13 (not in the tree):
+
+  | reader | indexes | archive open | RSS after open | first task query |
+  |---|---|---|---|---|
+  | change 4 | two frames | 0.026–0.028 s | 41 MB | 2.45–2.81 s |
+  | change 4 | three frames | 0.074–0.121 s | 70 MB | 2.41–3.38 s |
+  | change 5 | three frames | 0.045–0.055 s | 52 MB | 1.30–2.14 s (median 1.31 s) |
+
+  - A reader before this change opens an archive with the new indexes in
+    about 0.05 s and 29 MB more: it decodes every segment's index, and
+    keeps the third frame in its listing.
+  - An open frame of a version this build does not read costs about 5%
+    on the first query, against reading two-frame indexes: median 2.56 s
+    against 2.44 s (2.51–3.45 s, one run at 3.45 s, against 2.39–2.51 s;
+    r13). I believe most of it is reading the larger index rows; this is
+    not profiled.
+  - With the version read first but the columns frame decoded before it,
+    the cost was 0.30 s by median (2.81 s against 2.51 s, r12).
+- **The largest open frame,** the question left open before building: the
+  9.6 h task table's largest index is 62 KB compressed, 1.6 MB
+  decompressed.
+- **Tests:**
+  - every archive the writer builds now has three-frame indexes, so the
+    suite reads through the index path;
+  - with the index path disabled, the new damaged-segment test fails;
+  - with empty parts, 96 tests fail.
+  - New tests:
+    - `open_parts_read_back_exactly`;
+    - `a_reindex_restores_the_open_parts_in_place`;
+    - `a_damaged_segment_with_an_open_frame_still_opens_its_table`.
+- **A behaviour change:** a table whose segment is damaged but whose index
+  is intact now opens, and a query over it skips that segment with a
+  logged warning. Before, the table failed to open.
 
 ## Not yet measured here
 

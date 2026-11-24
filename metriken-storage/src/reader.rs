@@ -316,19 +316,26 @@ fn table_probes(
         let mut added: HashSet<&[u8]> = HashSet::new();
         for (i, (seq, _)) in sealed.iter().enumerate() {
             let raw = stored.get(seq).map(Vec::as_slice);
-            if raw.is_some_and(|raw| added.contains(raw)) {
+            if raw.is_some_and(|raw| added.contains(crate::names::listing_key(raw))) {
                 continue;
             }
             let fetch = match crate::names::read(raw) {
                 Some(Stored::Names(names, columns)) => match indexed_intervals(&names) {
                     Some(intervals) => {
                         known.names.add(&names);
-                        added.extend(raw);
+                        added.extend(raw.map(crate::names::listing_key));
                         if i == 0 {
                             known.first = Some(intervals);
                         }
                         match (columns, known.listed.as_mut()) {
-                            (Some(columns), Some(listed)) => listed.push(Listed::Frame(columns)),
+                            // The open parts are read by the table's open, not by a
+                            // listing, which keeps its frames for the reader's life.
+                            (Some(columns), Some(listed)) => {
+                                listed.push(Listed::Frame(crate::names::Frame {
+                                    open: None,
+                                    ..columns
+                                }))
+                            }
                             _ => known.listed = None,
                         }
                         false
@@ -351,7 +358,7 @@ fn table_probes(
                     }
                     None => known.listed = None,
                 }
-            } else if !raw.is_some_and(|raw| added.contains(raw)) {
+            } else if !raw.is_some_and(|raw| added.contains(crate::names::listing_key(raw))) {
                 // Neither indexed nor read: its columns are not known.
                 known.listed = None;
             }
@@ -516,9 +523,10 @@ fn segment_timestamps(bytes: Vec<u8>) -> Result<Vec<u64>, Box<dyn std::error::Er
 ///
 /// Built when the table is first queried: the sealed segments' sequence
 /// numbers from the catalog, and the live WAL tail materialized once as the
-/// newest segment. The tail is the one thing held in memory — it is at most
-/// a segment's worth of rows, and it is the part of the table SQLite cannot
-/// hand back as parquet. Sealed segments are read on demand by their listed
+/// newest segment. The tail is held in memory — it is at most a segment's
+/// worth of rows, and it is the part of the table SQLite cannot hand back as
+/// parquet — and so are the sealed segments' indexes, until the open takes
+/// them. Sealed segments are read on demand by their listed
 /// catalog entry; one that retention removed, or whose number now names
 /// another segment, reads as gone and is skipped.
 struct DbSegmentStore {
@@ -532,6 +540,10 @@ struct DbSegmentStore {
     /// Each sealed segment's [`segment_key`], in `seqs` order.
     keys: Vec<u64>,
     tail: Option<bytes::Bytes>,
+    /// Each sealed segment's caller index, in `seqs` order, read in the
+    /// snapshot that listed the segments, until the open takes them
+    /// ([`SegmentStore::caller_indexes`](crate::SegmentStore::caller_indexes)).
+    indexes: std::sync::Mutex<Vec<Option<Arc<[u8]>>>>,
 }
 
 /// An id for a sealed segment: its sequence number with its row count and
@@ -596,7 +608,7 @@ impl DbSegmentStore {
         // WAL read would leave its rows in neither. The tail is encoded after
         // the snapshot ends, so a checkpoint of a live archive is held back
         // only while the reads run.
-        let (listed, rows, long) = db
+        let (listed, rows, long, indexes) = db
             .with(|db| {
                 in_snapshot(db, || {
                     let listed = db.segment_meta(recording_id, sampler)?;
@@ -604,10 +616,20 @@ impl DbSegmentStore {
                         .tables(recording_id)?
                         .contains(&crate::occupants::stream_of(sampler));
                     let rows = db.live_wal(recording_id, sampler)?;
-                    Ok::<_, String>((listed, rows, long))
+                    let indexes = db.segment_indexes(recording_id, sampler)?;
+                    Ok::<_, String>((listed, rows, long, indexes))
                 })
             })
             .map_err(|e| e.to_string())?;
+        // By sequence number, in the listing's order.
+        let mut by_seq: HashMap<u64, Vec<u8>> = indexes
+            .into_iter()
+            .filter_map(|(seq, index)| Some((seq, index?)))
+            .collect();
+        let indexes = listed
+            .iter()
+            .map(|(seq, _)| by_seq.remove(seq).map(Arc::from))
+            .collect();
         let tail = live_tail(sampler, &rows, long)
             .map_err(|e| e.to_string())?
             .map(|t| bytes::Bytes::from(t.bytes));
@@ -624,6 +646,7 @@ impl DbSegmentStore {
             metas,
             keys,
             tail,
+            indexes: std::sync::Mutex::new(indexes),
         })
     }
 }
@@ -636,6 +659,11 @@ impl crate::SegmentStore for DbSegmentStore {
     /// A sealed segment's [`segment_key`]; the live tail has none.
     fn key(&self, idx: usize) -> Option<u64> {
         self.keys.get(idx).copied()
+    }
+
+    /// The sealed segments' indexes, once: later calls return empty.
+    fn caller_indexes(&self) -> Vec<Option<Arc<[u8]>>> {
+        std::mem::take(&mut *self.indexes.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     fn bytes(&self, idx: usize) -> crate::SegmentBytes {

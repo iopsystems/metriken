@@ -1182,6 +1182,22 @@ impl DataSource for FileSource {
         end_ns: u64,
         selective: bool,
     ) -> Option<crate::ColumnChunk> {
+        // A position from a segment's names index, not its footer, can name
+        // a column the segment does not have; reading it would panic.
+        let fields = self.0.meta.schema().fields().len() as u32;
+        if [Some(at.col_idx), at.begin_col, at.width_col]
+            .into_iter()
+            .flatten()
+            .any(|c| c >= fields)
+        {
+            tracing::warn!(
+                source_id = self.0.id,
+                col_idx = at.col_idx,
+                fields,
+                "a counter column position past the segment's columns; is its index stale?"
+            );
+            return None;
+        }
         match read_counter_column(&self.0, at, start_ns, end_ns, selective) {
             Ok(c) => Some(c),
             Err(e) => {
@@ -1197,6 +1213,15 @@ impl DataSource for FileSource {
     }
 
     fn batch_columns(&self, cols: &[usize], start_ns: u64, end_ns: u64) -> Option<BatchColumns> {
+        let fields = self.0.meta.schema().fields().len();
+        if cols.iter().any(|c| *c >= fields) {
+            tracing::warn!(
+                source_id = self.0.id,
+                fields,
+                "a batch read of a column past the segment's columns; is its index stale?"
+            );
+            return None;
+        }
         match read_batch_columns(&self.0, cols, start_ns, end_ns) {
             Ok(b) => Some(b),
             Err(e) => {

@@ -58,6 +58,17 @@ pub trait SegmentStore: Send + Sync {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Each segment's caller index as the container stores it, by position,
+    /// for an open to read a segment's parts from without fetching it. A
+    /// position past the end, or `None`, has no index, and that segment is
+    /// fetched. Empty by default.
+    ///
+    /// A store may hand its indexes over once, so as not to hold them for
+    /// the reader's life: a second call can return empty.
+    fn caller_indexes(&self) -> Vec<Option<Arc<[u8]>>> {
+        Vec::new()
+    }
 }
 
 /// What [`SegmentStore::bytes`] returns: the segment, `None` if it is gone,
@@ -350,6 +361,98 @@ impl SegmentColumns {
     }
 }
 
+/// One metric's columns by label set: what [`SegmentOpen::column_map`]
+/// holds per metric.
+pub(crate) type MetricColumns = Vec<(BTreeMap<String, String>, String)>;
+
+/// What [`OpenState`] takes from one segment's footer besides its
+/// [`SegmentColumns`]: the third frame of its names index (`crate::names`),
+/// so a table can be opened without fetching its segments. Built from the
+/// parsed footer by [`SegmentOpen::of`] on both paths, the writer's and a
+/// reader's that has no index, so the two fold the same parts.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct SegmentOpen {
+    /// Each counter column, located ([`MultiParquetSource::counter_column_refs`]).
+    pub counter_refs: Vec<(String, BTreeMap<String, String>, crate::ColumnPosition)>,
+    /// Each metric's columns by label set ([`DataSource::column_map`]),
+    /// sorted.
+    pub column_map: Vec<(String, MetricColumns)>,
+    /// Each metric's units ([`DataSource::metric_units`]).
+    pub units: Vec<(String, Vec<Option<String>>)>,
+    /// The `(name, labels)` of [`SegmentColumns::duplicated`] whose columns
+    /// the footer's statistics show holding values in one row
+    /// ([`DataSource::duplicated_series`]).
+    pub duplicated: Vec<(String, BTreeMap<String, String>)>,
+    /// [`DataSource::file_metadata`], without `ARROW:schema`.
+    pub file_metadata: BTreeMap<String, String>,
+    /// [`DataSource::time_range`].
+    pub span: Option<(u64, u64)>,
+    /// [`DataSource::interval`].
+    pub interval: f64,
+}
+
+impl SegmentOpen {
+    /// The parts of `seg`, whose columns are `columns`.
+    pub(crate) fn of(seg: &MultiParquetSource, columns: &SegmentColumns) -> Self {
+        let names: std::collections::BTreeSet<&String> = [
+            &columns.counters,
+            &columns.gauges,
+            &columns.histograms,
+            &columns.gauge_histograms,
+            &columns.float_counters,
+            &columns.float_gauges,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|(name, _)| name)
+        .collect();
+        let mut duplicated = Vec::new();
+        for (name, labels) in columns.duplicated() {
+            if seg.duplicated_series(&name).contains(&labels.inner) {
+                duplicated.push((name, labels.inner));
+            }
+        }
+        Self {
+            counter_refs: seg
+                .counter_column_refs()
+                .into_iter()
+                .map(|c| (c.name, c.labels.inner, c.position))
+                .collect(),
+            // Sorted, so one segment always gives the same index bytes: the
+            // map's own order varies between runs.
+            column_map: {
+                let mut map: Vec<(String, MetricColumns)> = seg
+                    .column_map()
+                    .into_iter()
+                    .map(|(metric, cols)| {
+                        let mut cols: Vec<_> =
+                            cols.into_iter().map(|(l, c)| (l.inner, c)).collect();
+                        cols.sort();
+                        (metric, cols)
+                    })
+                    .collect();
+                map.sort();
+                map
+            },
+            units: names
+                .into_iter()
+                .map(|name| (name.clone(), seg.metric_units(name)))
+                .collect(),
+            duplicated,
+            // `ARROW:schema` is the whole schema, base64: most of a wide
+            // segment's parts, and read by nothing that asks the source.
+            file_metadata: seg
+                .file_metadata()
+                .into_iter()
+                .filter(|(key, _)| key != "ARROW:schema")
+                .collect(),
+            span: seg.time_range(),
+            interval: seg.interval(),
+        }
+    }
+}
+
 /// `(metric, labels)` columns, each `Labels` stored as its map.
 mod columns_serde {
     use std::collections::BTreeMap;
@@ -560,35 +663,36 @@ impl OpenState {
         relabel: Option<&Arc<dyn ColumnRelabel>>,
         memo: &mut IdentityMemo,
     ) -> Result<(), Box<dyn Error>> {
-        let mut unresolved = false;
         let columns = SegmentColumns::of(seg).map_err(|e| format!("segment {idx}: {e}"))?;
+        let open = SegmentOpen::of(seg, &columns);
+        self.fold_parts(idx, &columns, open, relabel, memo);
+        Ok(())
+    }
+
+    /// Fold segment `idx`'s parts into the state: from its parsed footer
+    /// ([`fold`](Self::fold)), or from its names index without fetching it.
+    fn fold_parts(
+        &mut self,
+        idx: usize,
+        columns: &SegmentColumns,
+        open: SegmentOpen,
+        relabel: Option<&Arc<dyn ColumnRelabel>>,
+        memo: &mut IdentityMemo,
+    ) {
+        let mut unresolved = false;
         self.listing
-            .fold(idx, &columns, relabel, memo, &mut unresolved);
-        let names: std::collections::BTreeSet<&String> = [
-            &columns.counters,
-            &columns.gauges,
-            &columns.histograms,
-            &columns.gauge_histograms,
-            &columns.float_counters,
-            &columns.float_gauges,
-        ]
-        .into_iter()
-        .flatten()
-        .map(|(name, _)| name)
-        .collect();
-        for name in names {
-            let held = self.units.entry(name.clone()).or_default();
-            let merged = crate::source::merge_units([std::mem::take(held), seg.metric_units(name)]);
+            .fold(idx, columns, relabel, memo, &mut unresolved);
+        for (name, units) in open.units {
+            let held = self.units.entry(name).or_default();
+            let merged = crate::source::merge_units([std::mem::take(held), units]);
             *held = merged;
         }
         // A label set two columns carry is a duplicate where the segment's
         // statistics show the columns hold values in one row; a series
         // whose bound or value type changed mid-segment is two columns
         // that do not (see `ParquetSource::duplicated`).
-        for (name, labels) in columns.duplicated() {
-            if !seg.duplicated_series(&name).contains(&labels.inner) {
-                continue;
-            }
+        for (name, labels) in open.duplicated {
+            let labels = Labels::from(labels);
             let sets = memo.presents(relabel, &name, &labels, &mut unresolved);
             let held = self.duplicated.entry(name).or_default();
             held.extend(sets.iter().map(|l| l.inner.clone()));
@@ -599,21 +703,22 @@ impl OpenState {
         // column, located once here so a stream can read it back
         // without a schema scan. A relabelled column feeds every series
         // it can present as.
-        for col in seg.counter_column_refs() {
+        for (name, labels, position) in open.counter_refs {
+            let labels = Labels::from(labels);
             let positions = memo.positions(
                 relabel,
                 &self.listing.counter_identity,
-                &col.name,
-                &col.labels,
+                &name,
+                &labels,
                 &mut unresolved,
             );
-            let table = self.counter_columns.entry(col.name.clone()).or_default();
+            let table = self.counter_columns.entry(name.clone()).or_default();
             // The column's own labels, interned: one copy per distinct
             // set rather than one per segment it appears in.
-            let column_labels = match table.labels_index.get(&col.labels) {
+            let column_labels = match table.labels_index.get(&labels) {
                 Some(i) => *i,
                 None => {
-                    let own = memo.own(&col.name, &col.labels);
+                    let own = memo.own(&name, &labels);
                     table.labels.push(Arc::clone(&own));
                     table.labels_index.insert(own, table.labels.len() - 1);
                     table.labels.len() - 1
@@ -626,11 +731,11 @@ impl OpenState {
                 table.by_series[*pos].push(Location {
                     segment: idx as u32,
                     column_labels,
-                    position: col.position,
+                    position,
                 });
             }
         }
-        for (metric, cols) in seg.column_map() {
+        for (metric, cols) in open.column_map {
             // Mirror the run tagging `histogram_stream` and
             // `histogram_labels` apply. `QueryEngine::columns` requires
             // every filter key to be PRESENT on the label set, so without
@@ -654,6 +759,7 @@ impl OpenState {
                 .or_else(|| self.listing.gauge_histogram_runs.segment_run(&metric, idx));
             let entry = self.column_map.entry(metric.clone()).or_default();
             for (labels, col) in cols {
+                let labels = Labels::from(labels);
                 let sets = memo.presents(relabel, &metric, &labels, &mut unresolved);
                 // Without a run tag a column's entries are the same in
                 // every segment, and the first one stays.
@@ -670,15 +776,14 @@ impl OpenState {
             }
         }
         // Last segment wins on collision.
-        self.file_metadata.extend(seg.file_metadata());
+        self.file_metadata.extend(open.file_metadata);
         self.catalog.push(SegmentCatalog {
-            span: seg.time_range(),
-            interval: seg.interval(),
+            span: open.span,
+            interval: open.interval,
             present: true,
         });
         self.opened += 1;
         self.unresolved |= unresolved;
-        Ok(())
     }
 }
 
@@ -1115,6 +1220,11 @@ impl SegmentedSource {
             .filter(|_| reusable)
             .and_then(|p| p.sealed_prefix(&keys, relabeled));
 
+        // A segment whose index holds its parts is folded from them, without
+        // fetching it. Taken whether or not they are used, so a store whose
+        // state is reused whole does not keep them.
+        #[cfg(feature = "archive")]
+        let indexes = store.caller_indexes();
         let (state, sealed) = match &reused {
             // Every segment is one the previous reader read: its state is
             // this reader's, unchanged.
@@ -1134,6 +1244,15 @@ impl SegmentedSource {
                 for idx in start..store.len() {
                     if reusable && idx == keys.len() && !keys.is_empty() && sealed.is_none() {
                         sealed = Some(Arc::new(state.clone()));
+                    }
+                    #[cfg(feature = "archive")]
+                    if let Some((columns, open)) = indexes
+                        .get(idx)
+                        .and_then(Option::as_deref)
+                        .and_then(crate::names::parts)
+                    {
+                        state.fold_parts(idx, &columns, open, relabel.as_ref(), &mut memo);
+                        continue;
                     }
                     let Some(bytes) = store.bytes(idx).map_err(|e| e.to_string())? else {
                         // Gone between the store's construction and now. The
