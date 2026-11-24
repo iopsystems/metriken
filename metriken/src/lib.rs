@@ -97,7 +97,9 @@ pub use crate::family::{CounterFamily, CounterMember, GaugeFamily, GaugeMember};
 pub use crate::gauge::Gauge;
 #[allow(deprecated)]
 pub use crate::group::HistogramGroup;
-pub use crate::group::{CounterGroup, CounterHistogramGroup, GaugeGroup};
+pub use crate::group::{
+    CounterGroup, CounterHistogramGroup, GaugeGroup, RwLockCounterHistogramGroup,
+};
 pub use crate::histogram::{AtomicCounterHistogram, GaugeHistogram, RwLockCounterHistogram};
 #[allow(deprecated)]
 pub use crate::histogram::{AtomicHistogram, RwLockHistogram};

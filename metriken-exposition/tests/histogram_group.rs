@@ -21,6 +21,10 @@ static LATENCY: metriken::CounterHistogramGroup = metriken::CounterHistogramGrou
 static LONG_LATENCY: metriken::CounterHistogramGroup =
     metriken::CounterHistogramGroup::new(4, 4, 10);
 
+#[metric(name = "hg_bucket_latency", metadata = { acq_group = "buckets" })]
+static BUCKET_LATENCY: metriken::RwLockCounterHistogramGroup =
+    metriken::RwLockCounterHistogramGroup::new(4, 4, 10);
+
 /// Indices 0 and 2 carry metadata and hold values; index 1 holds values and
 /// no metadata, so neither path makes it a member; index 3 is empty.
 fn record(group: &metriken::CounterHistogramGroup) {
@@ -129,4 +133,57 @@ fn a_histogram_group_is_sent_long() {
             LONG_LATENCY.load(idx).unwrap().as_slice()
         );
     }
+}
+
+/// A `RwLockCounterHistogramGroup` is sent long like a `CounterHistogramGroup`:
+/// each written entry with metadata is an occupant carrying the buckets it was
+/// given. An entry with metadata that was never written, or was cleared, is
+/// not an occupant.
+#[test]
+fn a_bucket_array_histogram_group_is_sent_long() {
+    let total = BUCKET_LATENCY.config().total_buckets();
+    let buckets = |at: usize, n: u64| {
+        let mut b = vec![0u64; total];
+        b[at] = n;
+        b
+    };
+    for (idx, device) in [(0, "nvme0n1"), (1, "nvme1n1"), (2, "sda")] {
+        BUCKET_LATENCY.set_metadata(
+            idx,
+            HashMap::from([("device".to_string(), device.to_string())]),
+        );
+    }
+    BUCKET_LATENCY.update_from(0, &buckets(3, 5)).unwrap();
+    BUCKET_LATENCY.update_from(2, &buckets(7, 2)).unwrap();
+
+    let mut builder = GroupBuilder::new(DefaultRouter::new("hg"));
+    let occupants = |builder: &mut GroupBuilder<DefaultRouter>| -> Vec<(String, Vec<u64>)> {
+        let groups = builder.build_stream(Vec::new());
+        let Some(StreamGroup::Long(group)) = groups.iter().find(|g| g.name() == "hg/buckets")
+        else {
+            panic!("the histogram group is long: {groups:?}")
+        };
+        group
+            .occupants
+            .iter()
+            .map(|o| {
+                (
+                    o.labels["device"].clone(),
+                    o.histograms[0].as_ref().unwrap().as_slice().to_vec(),
+                )
+            })
+            .collect()
+    };
+    let got = occupants(&mut builder);
+    assert_eq!(
+        got,
+        vec![
+            ("nvme0n1".to_string(), buckets(3, 5)),
+            ("sda".to_string(), buckets(7, 2)),
+        ]
+    );
+
+    BUCKET_LATENCY.clear(2);
+    let got = occupants(&mut builder);
+    assert_eq!(got, vec![("nvme0n1".to_string(), buckets(3, 5))]);
 }
