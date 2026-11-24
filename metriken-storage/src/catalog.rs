@@ -71,8 +71,11 @@ pub trait Catalog: Send {
 
     /// Every source, in id order, each with its uuid: the id a dendro copy
     /// keeps, so two sources that carry one uuid are copies of one source.
-    /// The default is [`sources`](Self::sources) with no uuid, for a
-    /// container that keeps none.
+    /// For a dendro copy kept under a fresh uuid because its archive already
+    /// held the source, this is the uuid it copies (dendro's
+    /// `SourceRow::identity`), so it too reads as a copy of that source. The
+    /// default is [`sources`](Self::sources) with no uuid, for a container
+    /// that keeps none.
     fn sources_with_uuids(&self) -> Result<Vec<(Source, Option<String>)>, String> {
         Ok(self.sources()?.into_iter().map(|s| (s, None)).collect())
     }
@@ -253,6 +256,7 @@ impl Catalog for DendroCatalog {
             .map_err(err)?
             .into_iter()
             .map(|s| {
+                let identity = s.identity().map(str::to_string);
                 Ok((
                     Source {
                         id: s.id,
@@ -261,7 +265,7 @@ impl Catalog for DendroCatalog {
                         clock_anchor_wall_ns: ts(s.meta.clock_anchor_wall_ns)?,
                         complete: s.complete,
                     },
-                    s.uuid,
+                    identity,
                 ))
             })
             .collect()

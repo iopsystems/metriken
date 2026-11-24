@@ -232,6 +232,58 @@ fn two_disjoint_dumps_of_one_buffer_are_one_process() {
     assert!(g.bridges.is_empty() && g.notices.is_empty());
 }
 
+/// Two dumps of one buffer copied into one archive as dendro now writes
+/// them: the second under a fresh uuid, with the buffer's as its origin
+/// (dendro's `copy_sources_into_as_copies`). The reader takes the origin as the
+/// source's uuid, so they join as one copy of the buffer, as two copies
+/// under one uuid did.
+#[test]
+fn two_dumps_of_one_buffer_under_fresh_uuids_are_one_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let buffer = dir.path().join("buffer.dendro");
+    write(
+        &buffer,
+        &[spec(
+            &[],
+            &[("e", at(10, 0))],
+            rows(at(10, 0), at(10, 30), 10 * S),
+        )],
+        6,
+    );
+    let combined = dir.path().join("combined.dendro");
+    let src = dendro::archive::Archive::open(&buffer).unwrap();
+    let encoder = metriken_storage::Encoder::for_archive(&src).unwrap();
+    let mut out = ArchiveMut::create(&combined).unwrap();
+    for (start, end) in [(at(10, 0), at(10, 5)), (at(10, 20), at(10, 25))] {
+        let spec = CopySpec {
+            start: start as i64,
+            end: end as i64,
+            ..CopySpec::everything()
+        };
+        out.transaction(|tx| {
+            dendro::rewrite::copy_sources_into_as_copies(&src, tx, &spec, &encoder)
+        })
+        .unwrap();
+    }
+    let rows = out.read_sources().unwrap();
+    assert_ne!(rows[0].uuid, rows[1].uuid, "an archive holds a source once");
+    assert_eq!(rows[1].origin, rows[0].uuid);
+    drop(out);
+
+    let reader = open(&combined);
+    let sources = reader.sources();
+    assert_eq!(sources.len(), 2);
+    assert_eq!(sources[0].uuid, sources[1].uuid);
+    let g = reader.process_groups();
+    assert_eq!(groups(g), vec![vec![0, 1]]);
+    assert_eq!(g.uuid_groups.len(), 1);
+    assert!(
+        g.groups[0].joins.is_empty(),
+        "joined by identity, not by epoch"
+    );
+    assert!(g.bridges.is_empty() && g.notices.is_empty());
+}
+
 /// Case 3: two recorders of one agent at once, at 1 s and 100 ms.
 #[test]
 fn two_recorders_at_different_intervals_are_one_process() {
