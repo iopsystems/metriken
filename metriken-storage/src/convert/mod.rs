@@ -82,7 +82,9 @@ impl MsgpackToArchive {
 
     /// Convert the msgpack recording at `input` into a new archive at
     /// `output`, which must not exist. Returns the number of snapshots
-    /// written.
+    /// read, including any whose rows were at or below their streams'
+    /// newest and were not written (the first such row is logged as a
+    /// warning).
     pub fn convert_file_path(
         self,
         input: impl AsRef<Path>,
@@ -116,8 +118,8 @@ impl MsgpackToArchive {
     /// snapshot that does not decode, or a write that fails, ends the
     /// conversion with an error naming the snapshot's position, and the
     /// files the conversion created are removed: the archive and any of its
-    /// `-wal`, `-shm` and `-journal` sidecars that did not exist when it was
-    /// created. A file that was there before is left alone.
+    /// `-wal`, `-shm`, `-journal` and `-lock` sidecars that did not exist
+    /// when it was created. A file that was there before is left alone.
     pub fn convert_reader(self, reader: impl Read, output: impl AsRef<Path>) -> Result<u64, Error> {
         let output = output.as_ref();
         let mut created = Vec::new();
@@ -154,7 +156,7 @@ impl MsgpackToArchive {
         let ts = |s: &Snapshot| -> Result<u64, Error> {
             Ok(s.systemtime().duration_since(UNIX_EPOCH)?.as_nanos() as u64)
         };
-        let sidecars: Vec<std::path::PathBuf> = ["-wal", "-shm", "-journal"]
+        let sidecars: Vec<std::path::PathBuf> = ["-wal", "-shm", "-journal", "-lock"]
             .iter()
             .map(|suffix| {
                 let mut path = output.as_os_str().to_owned();
