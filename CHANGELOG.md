@@ -41,7 +41,8 @@ Requires dendro 0.8.2.
   1.72 s where the build before took 3.09 s on a copy of the same segments
   with the earlier indexes. A reader of this version opens such an archive
   in about 0.02 s and 11 MB more; a reader before it, which decodes every
-  segment's index and keeps the third frame, about 0.05 s and 29 MB more.
+  segment's index and keeps the third frame, about 0.05–0.09 s and 29 MB
+  more.
   A segment written by an earlier version is fetched and parsed as
   before. A table whose segment is damaged but whose
   index is intact now opens, and a query over it skips that segment with a

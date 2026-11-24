@@ -643,11 +643,12 @@ reading the same copies with two-frame indexes. Medians of the first runs:
     about 0.05 s and 29 MB more: it decodes every segment's index, and
     keeps the third frame in its listing.
   - An open frame of a version this build does not read costs about 5%
-    on the first query, against reading two-frame indexes: 2.51–2.64 s
-    against 2.39–2.51 s (r13). Most of it is reading the larger index
-    rows.
-  - Before the version was read from the frame's first bytes, that cost
-    was about 0.45 s; a whole frame was decompressed and parsed first.
+    on the first query, against reading two-frame indexes: median 2.56 s
+    against 2.44 s (2.51–3.45 s, one run at 3.45 s, against 2.39–2.51 s;
+    r13). I believe most of it is reading the larger index rows; this is
+    not profiled.
+  - With the version read first but the columns frame decoded before it,
+    the cost was 0.30 s by median (2.81 s against 2.51 s, r12).
 - **The largest open frame,** the question left open before building: the
   9.6 h task table's largest index is 62 KB compressed, 1.6 MB
   decompressed.

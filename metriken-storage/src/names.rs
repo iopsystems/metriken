@@ -379,6 +379,8 @@ struct StoredOpen {
     /// [`OPEN_VERSION`] when written. A reader uses only the version it
     /// knows: a field added or changed later, under the same names index
     /// prefix, would otherwise be read as if it meant what it means here.
+    /// Must stay the first field, named `version`: `open_version` reads it
+    /// by position.
     version: u32,
     counter_refs: Vec<StoredRef>,
     column_map: Vec<(String, Vec<StoredColumn>)>,
