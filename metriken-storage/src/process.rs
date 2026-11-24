@@ -295,7 +295,7 @@ pub struct Bridge {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Notice {
-    /// Copies of one source (one uuid) whose `host` labels differ.
+    /// Copies of one source (one identity) whose `host` labels differ.
     HostsDiffer {
         uuid_group: usize,
         hosts: Vec<String>,
@@ -1513,6 +1513,36 @@ mod tests {
                 (vec![0, 2], labels(&[("arm", "x"), ("host", "a")])),
                 (vec![1], labels(&[("arm", "y"), ("host", "a")])),
                 (vec![3], labels(&[("host", "a")])),
+            ]
+        );
+    }
+
+    /// A copy kept under a fresh uuid, with its origin as its identity and
+    /// without `arm`, takes its origin's value and goes with it, as a copy
+    /// under the origin's uuid does.
+    #[test]
+    fn a_fresh_uuid_copy_takes_its_origins_label() {
+        let s = vec![
+            source(
+                &[("host", "a"), ("arm", "x")],
+                Some("u1"),
+                Some((0, 10)),
+                Some("e"),
+            ),
+            source(
+                &[("host", "a"), ("arm", "y")],
+                Some("u2"),
+                Some((5, 20)),
+                Some("e"),
+            ),
+            source(&[("host", "a")], Some("f1"), Some((0, 10)), Some("e"))
+                .with_identity(Some("u1".to_string())),
+        ];
+        assert_eq!(
+            read(&s),
+            vec![
+                (vec![0, 2], labels(&[("arm", "x"), ("host", "a")])),
+                (vec![1], labels(&[("arm", "y"), ("host", "a")])),
             ]
         );
     }

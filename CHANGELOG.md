@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a per-device histogram summed from a BPF map, which `CounterHistogramGroup`
   (incremented one value at a time) cannot hold.
 
+### metriken-query (unreleased)
+
+- **Changed:** `ArchiveReader::sample_timestamps` lists the rows of a copy
+  kept under a fresh uuid as rows of its origin (metriken-storage's
+  `SourceInfo::identity`), as it lists a copy under the origin's uuid.
+
 ### metriken-storage (unreleased)
 
 Requires dendro 0.8.3.

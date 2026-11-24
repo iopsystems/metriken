@@ -70,7 +70,9 @@ pub trait Catalog: Send {
     fn sources(&self) -> Result<Vec<Source>, String>;
 
     /// Every source, in id order, each with its uuid: the id a dendro copy
-    /// keeps, so two sources that carry one uuid are copies of one source.
+    /// keeps unless it is kept under a fresh uuid
+    /// ([`source_identities`](Self::source_identities)), so two sources that
+    /// carry one uuid are copies of one source.
     /// The default is [`sources`](Self::sources) with no uuid, for a
     /// container that keeps none.
     fn sources_with_uuids(&self) -> Result<Vec<(Source, Option<String>)>, String> {

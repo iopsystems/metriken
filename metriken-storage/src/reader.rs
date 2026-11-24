@@ -2693,8 +2693,8 @@ impl ArchiveReader {
         &self.sources
     }
 
-    /// The sources grouped by producer process: copies (one uuid) taken as
-    /// one, bridges set aside, and the rest joined where they share a
+    /// The sources grouped by producer process: copies (one identity,
+    /// `SourceInfo::identity`) taken as one, bridges set aside, and the rest joined where they share a
     /// producer epoch and overlap in it by a row of each (see
     /// [`crate::process`]). Worked out on first use and kept. Which rows a
     /// source holds is read from the catalog entries listed at open, and a
