@@ -556,13 +556,13 @@ impl MultiParquetSource {
         kind: HistKind,
     ) -> std::collections::BTreeMap<String, (u8, u8)> {
         let mut out = std::collections::BTreeMap::new();
-        for (pf, _) in &self.files {
-            for col in pf.columns_desc() {
-                if let Some(config) = col.kind.histogram(kind) {
-                    out.entry(col.name).or_insert(config);
+        self.for_each_column(|col, _| {
+            if let Some(config) = col.kind.histogram(kind) {
+                if !out.contains_key(&col.name) {
+                    out.insert(col.name.clone(), config);
                 }
             }
-        }
+        });
         out
     }
 
@@ -589,16 +589,17 @@ impl MultiParquetSource {
     ) -> std::collections::BTreeMap<String, Vec<(u8, u8)>> {
         let mut out: std::collections::BTreeMap<String, Vec<(u8, u8)>> =
             std::collections::BTreeMap::new();
-        for (pf, _) in &self.files {
-            for col in pf.columns_desc() {
-                if let Some(cfg) = col.kind.histogram(kind) {
-                    let list = out.entry(col.name).or_default();
-                    if !list.contains(&cfg) {
-                        list.push(cfg);
-                    }
+        self.for_each_column(|col, _| {
+            if let Some(cfg) = col.kind.histogram(kind) {
+                if !out.contains_key(&col.name) {
+                    out.insert(col.name.clone(), Vec::new());
+                }
+                let list = out.get_mut(&col.name).expect("inserted above");
+                if !list.contains(&cfg) {
+                    list.push(cfg);
                 }
             }
-        }
+        });
         out
     }
 
@@ -636,16 +637,27 @@ impl MultiParquetSource {
     /// schema order, with each child's injected labels.
     fn columns_where(&self, want: impl Fn(&ColKind) -> bool) -> Vec<(String, Labels)> {
         let mut out = Vec::new();
+        self.for_each_column(|col, extra| {
+            if want(&col.kind) {
+                let mut labels = col.labels.clone();
+                labeled::add_labels(&mut labels, extra);
+                out.push((col.name.clone(), labels));
+            }
+        });
+        out
+    }
+
+    /// Call `f` with each child's column descriptors, in schema order, and
+    /// the labels injected into that child's series. Borrowed where the
+    /// child holds them ([`DataSource::columns_desc_ref`]), so only what `f`
+    /// keeps is copied.
+    fn for_each_column(&self, mut f: impl FnMut(&ColDesc, &Labels)) {
         for (pf, extra) in &self.files {
-            for col in pf.columns_desc() {
-                if want(&col.kind) {
-                    let mut labels = col.labels;
-                    labeled::add_labels(&mut labels, extra);
-                    out.push((col.name, labels));
-                }
+            match pf.columns_desc_ref() {
+                Some(cols) => cols.iter().for_each(|c| f(c, extra)),
+                None => pf.columns_desc().iter().for_each(|c| f(c, extra)),
             }
         }
-        out
     }
 
     /// The names of the metrics held in integer counter or gauge columns
@@ -654,18 +666,16 @@ impl MultiParquetSource {
     #[cfg_attr(not(feature = "archive"), allow(dead_code))]
     pub(crate) fn scalar_names(&self, counter: bool, float: bool) -> Vec<String> {
         let mut names = std::collections::BTreeSet::new();
-        for (pf, _) in &self.files {
-            for col in pf.columns_desc() {
-                let kind = if counter {
-                    col.kind.is_counter()
-                } else {
-                    col.kind.is_gauge()
-                };
-                if kind && col.kind.is_float() == float {
-                    names.insert(col.name);
-                }
+        self.for_each_column(|col, _| {
+            let kind = if counter {
+                col.kind.is_counter()
+            } else {
+                col.kind.is_gauge()
+            };
+            if kind && col.kind.is_float() == float && !names.contains(&col.name) {
+                names.insert(col.name.clone());
             }
-        }
+        });
         names.into_iter().collect()
     }
 
@@ -678,15 +688,13 @@ impl MultiParquetSource {
     /// `kind`.
     pub(crate) fn histogram_columns_of(&self, kind: HistKind) -> Vec<(String, Labels)> {
         let mut out = Vec::new();
-        for (pf, extra) in &self.files {
-            for col in pf.columns_desc() {
-                if col.kind.histogram(kind).is_some() {
-                    let mut labels = col.labels;
-                    labeled::add_labels(&mut labels, extra);
-                    out.push((col.name, labels));
-                }
+        self.for_each_column(|col, extra| {
+            if col.kind.histogram(kind).is_some() {
+                let mut labels = col.labels.clone();
+                labeled::add_labels(&mut labels, extra);
+                out.push((col.name.clone(), labels));
             }
-        }
+        });
         out
     }
 
@@ -1138,6 +1146,10 @@ impl DataSource for FileSource {
 
     fn columns_desc(&self) -> Vec<ColDesc> {
         self.0.columns().to_vec()
+    }
+
+    fn columns_desc_ref(&self) -> Option<&[ColDesc]> {
+        Some(self.0.columns())
     }
 
     fn counter_column_refs(&self) -> Vec<crate::CounterColumnRef> {

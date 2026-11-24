@@ -320,6 +320,10 @@ impl DataSource for LazySource {
         self.loaded().map(|s| s.columns_desc()).unwrap_or_default()
     }
 
+    fn columns_desc_ref(&self) -> Option<&[ColDesc]> {
+        self.loaded().and_then(|s| s.columns_desc_ref())
+    }
+
     fn series_count(&self) -> usize {
         self.catalog
             .series_count

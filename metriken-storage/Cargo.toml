@@ -18,6 +18,8 @@ arrow.workspace = true
 bytes = "1"
 dendro = { version = "0.8.1", default-features = false, features = ["archive"], optional = true }
 foldhash = "0.2.0"
+# `entry_ref`: a lookup by borrowed key that copies the key only on insert.
+hashbrown = { version = "0.17.1", default-features = false }
 lru = "0.18.5"
 regex = "1.12"
 metriken-exposition = { version = "0.28.0", path = "../metriken-exposition", default-features = false, features = ["stream"], optional = true }

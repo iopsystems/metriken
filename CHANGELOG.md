@@ -24,6 +24,14 @@ Requires dendro 0.8.1.
   where it took 2.13 s, and leaves 1.47 GB resident where it left 2.27 GB.
   On a 9.6 h recording with a wide task table, it takes 4.07 s where it
   took 4.36 s, with the same resident memory.
+- **Changed:** opening a segmented table no longer copies every column
+  descriptor of each segment for each list it builds from them, and looks
+  each column up in its index once. On the 9.6 h recording's wide task
+  table, the first query takes about a third less time: 2.90 s where the
+  build before took 4.38 s in the same session, and the single lookup
+  takes off a further 5% (2.82 s to 2.67 s).
+- **Added:** `DataSource::columns_desc_ref`, the column descriptors
+  borrowed, for a source that holds them. `None` by default.
 
 ### metriken-storage 0.14.0
 

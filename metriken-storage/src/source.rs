@@ -327,6 +327,13 @@ pub trait DataSource: Send + Sync {
     fn columns_desc(&self) -> Vec<crate::parquet::ColDesc> {
         Vec::new()
     }
+    /// [`columns_desc`](Self::columns_desc) borrowed, for a source that
+    /// holds its descriptors: `None` when it does not, and the caller then
+    /// takes the owned copy. When `Some`, the same descriptors, in the same
+    /// order, as `columns_desc`.
+    fn columns_desc_ref(&self) -> Option<&[crate::parquet::ColDesc]> {
+        None
+    }
     /// Columns in the source's schema, for sizing what an open reader holds.
     /// Zero for a source without one.
     fn column_count(&self) -> usize {

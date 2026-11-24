@@ -151,7 +151,11 @@ impl SegmentStore for InMemorySegments {
 #[derive(Default)]
 struct IdentityMemo {
     /// metric -> column labels -> what is known about the column.
-    columns: HashMap<String, HashMap<Arc<Labels>, ColumnMemo, LabelsHash>, LabelsHash>,
+    columns: hashbrown::HashMap<
+        String,
+        hashbrown::HashMap<Arc<Labels>, ColumnMemo, LabelsHash>,
+        LabelsHash,
+    >,
 }
 
 /// What [`IdentityMemo`] holds for one column of one metric.
@@ -180,24 +184,24 @@ enum Kind {
 
 impl IdentityMemo {
     /// The entry for a column of `name` with `labels`, made on first use.
+    /// One hash of each key; the labels are copied only when the entry is
+    /// made.
     fn column(&mut self, name: &str, labels: &Labels) -> &mut ColumnMemo {
-        if !self.columns.contains_key(name) {
-            self.columns.insert(name.to_string(), HashMap::default());
+        match self.columns.entry_ref(name).or_default().entry_ref(labels) {
+            hashbrown::hash_map::EntryRef::Occupied(e) => e.into_mut(),
+            hashbrown::hash_map::EntryRef::Vacant(e) => {
+                let own = Arc::new(labels.clone());
+                e.insert_with_key(
+                    Arc::clone(&own),
+                    ColumnMemo {
+                        own,
+                        sets: None,
+                        registered: [false; 3],
+                        positions: None,
+                    },
+                )
+            }
         }
-        let metric = self.columns.get_mut(name).expect("inserted above");
-        if !metric.contains_key(labels) {
-            let own = Arc::new(labels.clone());
-            metric.insert(
-                Arc::clone(&own),
-                ColumnMemo {
-                    own,
-                    sets: None,
-                    registered: [false; 3],
-                    positions: None,
-                },
-            );
-        }
-        metric.get_mut(labels).expect("inserted above")
     }
 
     /// The column's own labels, shared.
@@ -215,10 +219,20 @@ impl IdentityMemo {
         labels: &Labels,
         unresolved: &mut bool,
     ) -> Arc<[Arc<Labels>]> {
-        let column = self.column(name, labels);
+        Self::sets_of(self.column(name, labels), relabel, name, unresolved)
+    }
+
+    /// [`presents`](Self::presents) for a column already looked up.
+    fn sets_of(
+        column: &mut ColumnMemo,
+        relabel: Option<&Arc<dyn ColumnRelabel>>,
+        name: &str,
+        unresolved: &mut bool,
+    ) -> Arc<[Arc<Labels>]> {
         if let Some(sets) = &column.sets {
             return Arc::clone(sets);
         }
+        let labels: &Labels = &column.own;
         let sets: Arc<[Arc<Labels>]> = match relabel.and_then(|r| r.identities(name, labels)) {
             Some(sets) => sets.into_iter().map(Arc::new).collect(),
             None => {
@@ -249,12 +263,13 @@ impl IdentityMemo {
         labels: &Labels,
         unresolved: &mut bool,
     ) -> Positions {
-        if let Some(p) = &self.column(name, labels).positions {
+        let column = self.column(name, labels);
+        if let Some(p) = &column.positions {
             return Arc::clone(p);
         }
-        let sets = self.presents(relabel, name, labels, unresolved);
+        let sets = Self::sets_of(column, relabel, name, unresolved);
         let p: Positions = sets.iter().map(|l| identity.position(name, l)).collect();
-        self.column(name, labels).positions = Some(Arc::clone(&p));
+        column.positions = Some(Arc::clone(&p));
         p
     }
 }
@@ -2427,6 +2442,114 @@ mod internal_tests {
         rows: &[(u64, Vec<u64>)],
     ) -> Vec<u8> {
         segment_histogram_labeled(name, grouping_power, max_value_power, &[], rows)
+    }
+
+    /// A child that holds its column descriptors only as an owned copy
+    /// (`columns_desc`, no `columns_desc_ref`), as a source other than a
+    /// parquet file may. It answers no reads.
+    struct OwnedDescs(Vec<crate::parquet::ColDesc>);
+
+    impl DataSource for OwnedDescs {
+        fn counters(&self, _: &str, _: &Labels, _: u64, _: u64) -> Option<Counters> {
+            None
+        }
+        fn gauges(&self, _: &str, _: &Labels, _: u64, _: u64) -> Option<Gauges> {
+            None
+        }
+        fn histogram_stream(&self, _: &str, _: &Labels, _: u64, _: u64) -> Option<HistogramStream> {
+            None
+        }
+        fn interval(&self) -> f64 {
+            1.0
+        }
+        fn time_range(&self) -> Option<(u64, u64)> {
+            None
+        }
+        fn counter_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn gauge_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn histogram_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn counter_labels(&self, _: &str) -> Vec<BTreeMap<String, String>> {
+            Vec::new()
+        }
+        fn gauge_labels(&self, _: &str) -> Vec<BTreeMap<String, String>> {
+            Vec::new()
+        }
+        fn histogram_labels(&self, _: &str) -> Vec<BTreeMap<String, String>> {
+            Vec::new()
+        }
+        fn column_map(&self) -> HashMap<String, HashMap<Labels, String>> {
+            HashMap::new()
+        }
+        fn columns_desc(&self) -> Vec<crate::parquet::ColDesc> {
+            self.0.clone()
+        }
+    }
+
+    /// A segment's column lists carry each child's injected labels and keep
+    /// schema order, the same whether the child lends its descriptors
+    /// (`columns_desc_ref`) or only copies them out (`columns_desc`).
+    #[test]
+    fn column_lists_are_the_same_from_borrowed_and_owned_descriptors() {
+        let n = ::histogram::Config::new(2, 8).unwrap().total_buckets();
+        let open = |name: &str| {
+            let bytes = segment_histogram_labeled(
+                name,
+                2,
+                8,
+                &[("k", "x")],
+                &[(1_000_000_000, vec![0; n])],
+            );
+            let seg =
+                MultiParquetSource::open_bytes_with_pool(bytes, BufferPool::new(1 << 20)).unwrap();
+            Arc::clone(&seg.files[0].0)
+        };
+        let (first, second) = (open("h1"), open("h2"));
+        let extra = Labels::from([("job", "b")]);
+        let borrowed = MultiParquetSource {
+            files: vec![
+                (Arc::clone(&first), extra.clone()),
+                (Arc::clone(&second), extra.clone()),
+            ],
+        };
+        let mut descs = first.columns_desc();
+        descs.extend(second.columns_desc());
+        let owned = MultiParquetSource {
+            files: vec![(Arc::new(OwnedDescs(descs)) as Arc<dyn DataSource>, extra)],
+        };
+        assert!(first.columns_desc_ref().is_some());
+        let labels = Labels::from([("job", "b"), ("k", "x")]);
+        let columns = vec![
+            ("h1".to_string(), labels.clone()),
+            ("h2".to_string(), labels),
+        ];
+        let configs = BTreeMap::from([("h1".to_string(), (2, 8)), ("h2".to_string(), (2, 8))]);
+        let variants = BTreeMap::from([
+            ("h1".to_string(), vec![(2, 8)]),
+            ("h2".to_string(), vec![(2, 8)]),
+        ]);
+        for (how, source) in [("borrowed", &borrowed), ("owned", &owned)] {
+            assert_eq!(
+                source.histogram_columns_of(HistKind::Counting),
+                columns,
+                "{how}"
+            );
+            assert_eq!(
+                source.histogram_configs_of(HistKind::Counting),
+                configs,
+                "{how}"
+            );
+            assert_eq!(
+                source.histogram_config_variants_of(HistKind::Counting),
+                variants,
+                "{how}"
+            );
+        }
     }
 
     /// Direct unit test of the windows policy in [`merge_counter`] /
