@@ -741,6 +741,9 @@ fn copies_under_fresh_uuids_group_by_identity_and_scope_by_uuid() {
         !second.is_empty() && second.iter().all(|&t| t >= 20),
         "{second:?}"
     );
+    // The recording's instants are both dumps' rows (10 each), not the
+    // first's alone.
+    assert_eq!(reader.sample_timestamps().len(), 20);
 
     drop((reader, opened));
     let mut db = ArchiveMut::open(&path).unwrap();
@@ -763,5 +766,25 @@ fn copies_under_fresh_uuids_group_by_identity_and_scope_by_uuid() {
     assert!(
         !points.is_empty() && points.iter().all(|&t| t <= 10),
         "{points:?}"
+    );
+
+    // An overlay naming the baseline's uuid relabels the baseline alone.
+    let overlay = metriken_storage::overlay::LabelOverlay::new(vec![
+        metriken_storage::overlay::OverlayEntry {
+            selector: metriken_storage::overlay::SourceSelector::Uuid(baseline),
+            labels: map(&[("arm", "control")]),
+        },
+    ])
+    .unwrap();
+    let overlaid =
+        ArchiveReader::open_read_groups_overlaid(&path, pool(), Some(std::sync::Arc::new(overlay)))
+            .unwrap();
+    let arms: Vec<Option<String>> = overlaid
+        .iter()
+        .map(|(l, _)| l.get("arm").cloned())
+        .collect();
+    assert_eq!(
+        arms,
+        [Some("control".to_string()), Some("experiment".to_string())]
     );
 }

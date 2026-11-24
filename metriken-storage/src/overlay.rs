@@ -11,8 +11,9 @@
 //! its sources carry ([`crate::process::read_groups`]), so removing a key
 //! from some sources of a group leaves it on the group. To remove a key from
 //! a read group, remove it from every source of the group: selecting by
-//! uuid covers one source and its copies, and a process group can hold
-//! several uuids. The readers' labels, `ArchiveReader::sources` included,
+//! uuid covers one source and its copies that keep its uuid, and a process
+//! group can hold several uuids (a copy kept under a fresh uuid has its
+//! own). The readers' labels, `ArchiveReader::sources` included,
 //! are the overlaid ones, so a caller writing to the archive
 //! (`layers::append`) must read a source's labels from the archive, not
 //! from a reader, or the write records the overlay as an outside change.
@@ -30,9 +31,9 @@ use crate::labels::Labels;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SourceSelector {
-    /// The source with this uuid, and its copies: those that keep it, and
-    /// those kept under a fresh uuid with it as their identity
-    /// ([`Catalog::source_identities`](crate::catalog::Catalog::source_identities)).
+    /// The source with this uuid, and its copies that keep it. A copy kept
+    /// under a fresh uuid (dendro's `copy_sources_into_as_copies`) is named
+    /// by its own uuid, as a metriken-query `Scope` names it.
     Uuid(String),
     /// The sources whose labels, as the archive stores them, `Labels::matches`
     /// this filter: one matcher per label, each value as [`MatchOp::encode`]
@@ -102,24 +103,11 @@ impl LabelOverlay {
         labels: &BTreeMap<String, String>,
         uuid: Option<&str>,
     ) -> BTreeMap<String, String> {
-        self.apply_with_identity(labels, uuid, uuid)
-    }
-
-    /// [`apply`](Self::apply) for a source whose identity
-    /// ([`Catalog::source_identities`](crate::catalog::Catalog::source_identities))
-    /// may differ from its uuid: a [`SourceSelector::Uuid`] selects it by
-    /// either.
-    pub fn apply_with_identity(
-        &self,
-        labels: &BTreeMap<String, String>,
-        uuid: Option<&str>,
-        identity: Option<&str>,
-    ) -> BTreeMap<String, String> {
         let stored = Labels::from(labels.clone());
         let mut out = labels.clone();
         for entry in &self.entries {
             let selected = match &entry.selector {
-                SourceSelector::Uuid(u) => uuid == Some(u.as_str()) || identity == Some(u.as_str()),
+                SourceSelector::Uuid(u) => uuid == Some(u.as_str()),
                 SourceSelector::Matching(filter) => stored.matches(filter),
             };
             if !selected {
@@ -160,18 +148,12 @@ impl Catalog for OverlaidCatalog {
     }
 
     fn sources_with_uuids(&self) -> Result<Vec<(Source, Option<String>)>, String> {
-        let identities = self.inner.source_identities()?;
         Ok(self
             .inner
             .sources_with_uuids()?
             .into_iter()
-            .zip(identities)
-            .map(|((mut source, uuid), identity)| {
-                source.labels = self.overlay.apply_with_identity(
-                    &source.labels,
-                    uuid.as_deref(),
-                    identity.as_deref(),
-                );
+            .map(|(mut source, uuid)| {
+                source.labels = self.overlay.apply(&source.labels, uuid.as_deref());
                 (source, uuid)
             })
             .collect())

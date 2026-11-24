@@ -122,7 +122,16 @@ fn gen(seed: u64, n: usize, domain: u64) -> Case {
             }
             metadata.insert(PRODUCER_EPOCHS.to_string(), format!("[{}]", list.join(",")));
         }
-        sources.push(SourceInfo::new(labels, i, uuid, span, &metadata));
+        // Some sources are copies kept under a fresh uuid, with the drawn one
+        // as their identity (dendro's `copy_sources_into_as_copies`).
+        let info = match uuid {
+            Some(identity) if r.chance(30) => {
+                SourceInfo::new(labels, i, Some(format!("f{i}")), span, &metadata)
+                    .with_identity(Some(identity))
+            }
+            uuid => SourceInfo::new(labels, i, uuid, span, &metadata),
+        };
+        sources.push(info);
         rows.push(rs);
         unreadable.push(un);
     }
@@ -161,14 +170,14 @@ fn brute(c: &Case) -> Brute {
     let mut uu: Vec<Option<String>> = Vec::new();
     for (p, src) in s.iter().enumerate() {
         match src
-            .uuid
+            .identity
             .as_ref()
             .and_then(|u| uu.iter().position(|x| x.as_ref() == Some(u)))
         {
             Some(i) => ug[i].push(p),
             None => {
                 ug.push(vec![p]);
-                uu.push(src.uuid.clone());
+                uu.push(src.identity.clone());
             }
         }
     }

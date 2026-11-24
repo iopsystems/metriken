@@ -30,12 +30,10 @@ Requires dendro 0.8.3.
   `SourceInfo::identity` (dendro's `SourceRow::identity`, the copied uuid),
   so two snapshots or dumps of one buffer copied into one archive are one
   process, gaps and overlap included, as two copies under one uuid were.
-  `SourceInfo::uuid` stays the source's own uuid, so a `Scope` or source
-  selector naming it reads that source alone; a `SourceSelector::Uuid` in a
-  label overlay selects a source by its uuid or its identity.
+  `SourceInfo::uuid` stays the source's own uuid, so a `Scope` or an
+  overlay's `SourceSelector::Uuid` naming it selects that source alone.
 - **Added:** `Catalog::source_identities` (defaulting to each source's
-  uuid), `SourceInfo::identity` and `SourceInfo::with_identity`, and
-  `LabelOverlay::apply_with_identity`.
+  uuid), `SourceInfo::identity` and `SourceInfo::with_identity`.
 
 ### metriken-exposition 0.28.0
 

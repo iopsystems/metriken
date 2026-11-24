@@ -1,7 +1,8 @@
 //! A query's scope: the sources it reads (journal D1).
 //!
 //! A scope names sources of an archive, by uuid (which a source's copies
-//! keep) or by position among the reader's `ArchiveReader::sources`, each
+//! keep, except a copy kept under a fresh uuid, which has its own) or by
+//! position among the reader's `ArchiveReader::sources`, each
 //! optionally with a span of time. A query given one reads only the named sources'
 //! tables, and only their rows within each span; within a process group it
 //! unions only the named sources (S1). The caller resolves what it presents
@@ -13,7 +14,8 @@
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SourceRef {
-    /// Every source with this uuid: a source and its copies.
+    /// Every source with this uuid: a source and its copies that keep its
+    /// uuid. A copy kept under a fresh uuid is named by its own uuid.
     Uuid(String),
     /// The source at this position among `sources()` of the reader the
     /// query is sent to. A reader from `flatten_read_groups` numbers only

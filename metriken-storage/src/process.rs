@@ -236,8 +236,10 @@ pub(crate) fn listed_epochs(s: &str) -> Option<Vec<(String, u64)>> {
     Some(entries.into_iter().map(|e| (e.epoch, e.from_ts)).collect())
 }
 
-/// Sources sharing a uuid (copies of one source), or one source without a
-/// uuid or whose uuid no other source carries.
+/// Sources sharing an identity ([`SourceInfo::identity`]: copies of one
+/// source), or one source without one or whose identity no other source
+/// carries. Its `uuid` is that identity, which for copies of a copy can be a
+/// uuid no source in the archive has.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct UuidGroup {
