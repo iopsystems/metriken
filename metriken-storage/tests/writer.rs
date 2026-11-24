@@ -2859,3 +2859,96 @@ fn sealed_through_tick_4(path: &Path) -> (u64, u64) {
         catalog.live_wal_span(id, "s").unwrap().rows,
     )
 }
+
+/// One wide group `cpu/usage` at tick `t`: the gauge `cpu_usage`, and with
+/// `extra` the gauge `cpu_extra` too (another schema). `schema` sends the
+/// schema, as a producer does on its first row of one.
+fn usage(t: u64, extra: bool, schema: bool) -> Snapshot {
+    let ts = BASE + t * S;
+    let desc = |m: &str| MetricDesc {
+        name: m.to_string(),
+        metadata: [("metric", m), ("sampler", "cpu")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    };
+    let mut gauges = vec![desc("cpu_usage")];
+    if extra {
+        gauges.push(desc("cpu_extra"));
+    }
+    let values = gauges.iter().map(|_| Some(t as i64)).collect();
+    let s = GroupSchema {
+        counters: Vec::new(),
+        gauges,
+        histograms: Vec::new(),
+        gauge_histograms: Vec::new(),
+        float_counters: Vec::new(),
+        float_gauges: Vec::new(),
+    };
+    Snapshot::V3(SnapshotV3 {
+        systemtime: SystemTime::UNIX_EPOCH + Duration::from_nanos(ts),
+        duration: Duration::from_millis(1),
+        metadata: HashMap::new(),
+        groups: vec![GroupSnapshot {
+            name: "cpu/usage".to_string(),
+            schema_hash: s.hash(),
+            schema: schema.then(|| Arc::new(s)),
+            window: Some(metriken::Window::new(ts - S / 2, ts)),
+            counters: Vec::new(),
+            gauges: values,
+            histograms: Vec::new(),
+            gauge_histograms: Vec::new(),
+            float_counters: Vec::new(),
+            float_gauges: Vec::new(),
+        }],
+    })
+}
+
+/// A row at or below its stream's newest is not recorded, and the rows after
+/// it state their schema again. The row at tick 2 arrives after tick 3 and is
+/// the first of a new schema: were it recorded as its schema's anchor and
+/// then dropped by dendro, which keeps a stream's timestamps rising, the rows
+/// at 5 and 6 would be left without a schema and lost at the seal.
+#[test]
+fn a_row_behind_its_stream_is_skipped_and_the_next_states_its_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("behind.dendro");
+    let mut writer = ArchiveWriter::create(&path, WriterConfig::default()).unwrap();
+    let mut source = writer
+        .add_source(
+            BTreeMap::from([("source".to_string(), "x".to_string())]),
+            BTreeMap::new(),
+            BASE,
+        )
+        .unwrap();
+    for (t, extra, schema) in [
+        (0, false, true),
+        (1, false, false),
+        (3, false, false),
+        (2, true, true),
+        (5, true, false),
+        (6, true, false),
+    ] {
+        let ts = BASE + t * S;
+        let staged = source.stage(&usage(t, extra, schema), ts, 0).unwrap();
+        writer.commit(vec![staged]).unwrap();
+    }
+    let behind = source.rows_behind();
+    source.finalize((BASE + 6 * S, 0)).unwrap();
+    writer.join().unwrap();
+
+    let reader = open(&path);
+    let ticks = |metric: &str| -> Vec<u64> {
+        reader
+            .owners_of(&[metric.to_string()])
+            .iter()
+            .flat_map(|o| o.row_timestamps().to_vec())
+            .map(|ts| (ts - BASE) / S)
+            .collect()
+    };
+    // Each metric is found in the group's table, which holds every row
+    // recorded.
+    assert_eq!(ticks("cpu_usage"), [0, 1, 3, 5, 6]);
+    assert_eq!(ticks("cpu_extra"), [0, 1, 3, 5, 6]);
+    assert_eq!(behind, 1, "the row at tick 2");
+}

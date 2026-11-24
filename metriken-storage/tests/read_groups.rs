@@ -4,21 +4,23 @@
 //! spans, different epochs, a source and its copy, a snapshot beside its
 //! original), the group's metadata (`process::merge_metadata`), its labels,
 //! and its position. Fixtures are written with `ArchiveWriter`, copies
-//! sharing a uuid with dendro's `copy_sources_into`. The legacy containers
+//! sharing a uuid with `support::copy_keeping_uuids`, as dendro 0.7 and
+//! earlier wrote them. The legacy containers
 //! (a parquet file and the committed `.rez` fixtures under `tests/fixtures`)
 //! are refused.
 #![cfg(feature = "write")]
+
+mod support;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use dendro::archive::{Archive, ArchiveMut};
-use dendro::rewrite::{copy_sources_into, CopySpec};
+use dendro::archive::ArchiveMut;
+use dendro::rewrite::CopySpec;
 use metriken_exposition::{Counter, Snapshot, SnapshotV2};
 use metriken_query::MetricsSource;
 use metriken_storage::process::EVENTS;
-use metriken_storage::writer::Encoder;
 use metriken_storage::{
     ArchiveReader, ArchiveWriter, BufferPool, DendroCatalog, LabeledRecordings, WriterConfig,
 };
@@ -90,11 +92,9 @@ fn write(path: &Path, specs: &[Spec]) {
     writer.join().unwrap();
 }
 
-/// Copy every source of `from` into `into`, keeping each uuid; `range`
-/// narrows the copy to the segments holding rows in it (a snapshot).
-fn copy(from: &Path, into: &mut ArchiveMut, range: Option<(u64, u64)>) {
-    let src = Archive::open(from).unwrap();
-    let encoder = Encoder::for_archive(&src).unwrap();
+/// Copy every source of `from` into the archive at `into`, keeping each
+/// uuid; `range` narrows the copy to the segments holding rows in it (a snapshot).
+fn copy(from: &Path, into: &Path, range: Option<(u64, u64)>) {
     let spec = match range {
         Some((start, end)) => CopySpec {
             start: start as i64,
@@ -103,16 +103,15 @@ fn copy(from: &Path, into: &mut ArchiveMut, range: Option<(u64, u64)>) {
         },
         None => CopySpec::everything(),
     };
-    into.transaction(|tx| copy_sources_into(&src, tx, &spec, &encoder))
-        .unwrap();
+    support::copy_keeping_uuids(from, into, &spec);
 }
 
 /// A new archive at `out` holding copies of every source of each of
 /// `inputs`, in order, as `recording combine` assembles one.
 fn combine(inputs: &[(&Path, Option<(u64, u64)>)], out: &Path) {
-    let mut archive = ArchiveMut::create(out).unwrap();
+    drop(ArchiveMut::create(out).unwrap());
     for (input, range) in inputs {
-        copy(input, &mut archive, *range);
+        copy(input, out, *range);
     }
 }
 

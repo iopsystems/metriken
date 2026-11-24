@@ -2446,7 +2446,7 @@ fn label_collision(
 
 fn remove_files(path: &Path) {
     let _ = std::fs::remove_file(path);
-    for suffix in ["-wal", "-shm", "-journal"] {
+    for suffix in ["-wal", "-shm", "-journal", "-lock"] {
         let mut sidecar = path.as_os_str().to_owned();
         sidecar.push(suffix);
         let _ = std::fs::remove_file(PathBuf::from(sidecar));
