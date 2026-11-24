@@ -32,6 +32,23 @@ Requires dendro 0.8.1.
   takes off a further 5% (2.82 s to 2.67 s).
 - **Added:** `DataSource::columns_desc_ref`, the column descriptors
   borrowed, for a source that holds them. `None` by default.
+- **Changed:** a sealed segment's names index holds what opening its table
+  takes from the segment's footer, and the open reads that instead of
+  fetching the segment. On the 9.6 h recording, copied into a current
+  archive and re-indexed, the first query on its wide task table takes
+  1.72 s where it took 3.09 s. A segment written by an earlier version is
+  fetched and parsed as before. A table whose segment is damaged but whose
+  index is intact now opens, and a query over it skips that segment with a
+  warning; before, the table did not open.
+- **Added:** `reindex::reindex` (feature `write`) rewrites an archive's
+  names indexes in place, through dendro's `replace_segment_index`, without
+  re-encoding its segments. It refuses an archive before schema 5, where
+  reading an index reads its segment; copy such an archive into a current
+  one first. Requires dendro 0.8.2.
+- **Added:** `SegmentStore::caller_indexes`, each segment's stored index,
+  for an open to read parts from. Empty by default.
+- **Changed:** `SegmentedSource::file_metadata` no longer reports
+  `ARROW:schema`.
 
 ### metriken-storage 0.14.0
 

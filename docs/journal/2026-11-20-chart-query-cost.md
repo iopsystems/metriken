@@ -221,7 +221,9 @@ and chose an in-place re-index for existing archives over a copy.
 - **Existing archives:** a re-index rewrites each segment's index in place
   through a new dendro call, `ArchiveMut::replace_segment_index`, without
   rewriting the segment. metriken and rezolus are on dendro 0.7.1, so that
-  call is backported to a dendro 0.7.2.
+  call is backported to a dendro 0.7.2. (Superseded before release:
+  metriken moved to dendro 0.8.1 in #435, and the call shipped in dendro
+  0.8.2 only, from dendro #95. The owner chose the 0.8 line alone.)
 - **GO, measured on the 9.6 h recording after a re-index:**
   - the first `task_cpu_usage{pid="1"}` at most 1.8 s, from 2.67 s at
     change 4's head;
@@ -527,9 +529,11 @@ descriptor step (4,136 samples; the shares overlap):
 
 ## Change 5: results
 
-Built on branch `perf/open-from-index` against a local backport of dendro's
-`replace_segment_index` to 0.7.1 (dendro #95 on main). Not merged: it needs a
-dendro 0.7.2 release.
+Built on branch `perf/open-from-index`, first against a local backport of
+dendro's `replace_segment_index` to 0.7.1, then against dendro 0.8.2 (dendro
+#95), released 2026-11-24, once metriken moved to dendro 0.8. The
+measurements below were taken on the 0.7.1 build; the code that differs
+between the two is dendro's, not this change's.
 
 As built, departures from the plan above:
 
