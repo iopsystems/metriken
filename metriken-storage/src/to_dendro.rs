@@ -420,9 +420,16 @@ pub(crate) fn refuse_existing(output: &Path) -> Result<(), String> {
     }
 }
 
-/// Remove the archive at `output` and its sidecars.
+/// Remove the archive at `output`, its sidecars, and the `-lock` file a
+/// dendro writing handle leaves beside it. [`refuse_existing`] does not
+/// refuse a `-lock` file, which holds no data.
 pub(crate) fn remove_archive(output: &Path) {
-    for path in archive_paths(output) {
+    let mut lock = output.as_os_str().to_owned();
+    lock.push("-lock");
+    for path in archive_paths(output)
+        .into_iter()
+        .chain([PathBuf::from(lock)])
+    {
         let _ = std::fs::remove_file(path);
     }
 }

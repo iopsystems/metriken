@@ -12,6 +12,8 @@
 //! Its own test binary, so the registry holds only these metrics.
 #![cfg(feature = "write")]
 
+mod support;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -676,22 +678,14 @@ fn an_archive_answers_with_the_state() {
 /// alone rather than twice it.
 #[test]
 fn a_source_and_its_copy_count_once() {
-    use dendro::archive::{Archive, ArchiveMut};
-    use dendro::rewrite::{copy_sources_into, CopySpec};
-    use metriken_storage::writer::Encoder;
+    use dendro::rewrite::CopySpec;
 
     let dir = tempfile::tempdir().unwrap();
     let a = dir.path().join("a.dendro");
     record(&a, true);
     let both = dir.path().join("both.dendro");
-    {
-        let mut out = ArchiveMut::create(&both).unwrap();
-        for _ in 0..2 {
-            let src = Archive::open(&a).unwrap();
-            let encoder = Encoder::for_archive(&src).unwrap();
-            out.transaction(|tx| copy_sources_into(&src, tx, &CopySpec::everything(), &encoder))
-                .unwrap();
-        }
+    for _ in 0..2 {
+        support::copy_keeping_uuids(&a, &both, &CopySpec::everything());
     }
     let union = open_flat(&both);
     assert_eq!(union.sources().len(), 2);

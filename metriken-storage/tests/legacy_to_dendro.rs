@@ -1560,7 +1560,9 @@ fn convert_path_chooses_by_content() {
     // staging path beside it.
     let missing = dir.path().join("no-such-dir").join("out.dendro");
     let err = convert_path(&v3, &missing).unwrap_err().to_string();
-    let named = format!("failed to create {}", missing.display());
+    // dendro takes its lock on `<archive>-lock` before it creates the
+    // archive, so the error names that file beside the output.
+    let named = format!("{}-lock", missing.display());
     assert!(
         err.matches(&named).count() == 1 && !err.contains(".partial"),
         "{err}"
