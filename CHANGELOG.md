@@ -38,11 +38,12 @@ Requires dendro 0.8.2.
   takes from the segment's footer, and the open reads that instead of
   fetching the segment. On the 9.6 h recording, copied into a current
   archive and re-indexed, the first query on its wide task table takes
-  1.72 s where the build before took 3.09 s on the same copy. Opening the
-  archive takes about 0.02 s and 11 MB more, for every reader, older ones
-  included, since the third frame is read with the index. A segment
-  written by an earlier version is
-  fetched and parsed as before. A table whose segment is damaged but whose
+  1.72 s where the build before took 3.09 s on a copy of the same segments
+  with the earlier indexes. A reader of this version opens such an archive
+  in about 0.02 s and 11 MB more; a reader before it, which decodes every
+  segment's index and keeps the third frame, about 0.05 s and 29 MB more.
+  A segment written by an earlier version is fetched and parsed as
+  before. A table whose segment is damaged but whose
   index is intact now opens, and a query over it skips that segment with a
   warning; before, the table did not open.
 - **Added:** `reindex::reindex` (feature `write`) rewrites an archive's

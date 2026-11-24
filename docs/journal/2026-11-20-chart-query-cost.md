@@ -550,8 +550,10 @@ As built, departures from the plan above:
   index written by another build holds that build's parts, so a change to
   what `SegmentOpen::of` computes needs a new open-frame version
   (`OPEN_VERSION`, added after review: the open reads only the version it
-  knows, and a re-index leaves an index whose open frame is of another
-  version, does not decode, or is followed by more bytes).
+  knows, reading the version from the frame's first bytes before
+  decompressing the rest, and a re-index leaves an index whose open frame
+  is of a later version, does not decode, or is followed by more bytes, and
+  replaces one of an earlier version).
 - **The open decides per segment, not per table** as the plan said: a
   segment whose index holds the parts is folded from them, and any other
   is fetched.
@@ -626,10 +628,26 @@ reading the same copies with two-frame indexes. Medians of the first runs:
     overlap (0.262–0.301 s against 0.253–0.344 s); in the set before, it
     was 8% higher.
   - Archive open is not a query in the criteria. In this set it was
-    0.09 s and 16 MB worse on 9.6 h. After the listing's dedup fix, on a
-    fresh copy re-indexed by the final build, three processes each:
-    0.044–0.053 s and 52 MB after open, against 0.025–0.027 s and 41 MB;
-    the first task query alone was 1.24–1.34 s against 2.33–2.52 s.
+    0.09 s and 16 MB worse on 9.6 h.
+- **After review's fixes,** five fresh processes per arm, interleaved, the
+  first task query alone (`task_cpu_usage{pid="1"}`), on 9.6 h. Raw runs
+  in sets r12 and r13 (not in the tree):
+
+  | reader | indexes | archive open | RSS after open | first task query |
+  |---|---|---|---|---|
+  | change 4 | two frames | 0.026–0.028 s | 41 MB | 2.45–2.81 s |
+  | change 4 | three frames | 0.074–0.121 s | 70 MB | 2.41–3.38 s |
+  | change 5 | three frames | 0.045–0.055 s | 52 MB | 1.30–2.14 s (median 1.31 s) |
+
+  - A reader before this change opens an archive with the new indexes in
+    about 0.05 s and 29 MB more: it decodes every segment's index, and
+    keeps the third frame in its listing.
+  - An open frame of a version this build does not read costs about 5%
+    on the first query, against reading two-frame indexes: 2.51–2.64 s
+    against 2.39–2.51 s (r13). Most of it is reading the larger index
+    rows.
+  - Before the version was read from the frame's first bytes, that cost
+    was about 0.45 s; a whole frame was decompressed and parsed first.
 - **The largest open frame,** the question left open before building: the
   9.6 h task table's largest index is 62 KB compressed, 1.6 MB
   decompressed.
