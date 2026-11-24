@@ -309,7 +309,10 @@ pub(crate) fn parts(index: &[u8]) -> Option<(SegmentColumns, SegmentOpen)> {
     let Some(Stored::Names(_, Some(frame))) = read(Some(index)) else {
         return None;
     };
-    Some((columns(&frame)?, open_parts(&frame)?))
+    // The open parts first: a frame of another version is turned down
+    // before the columns are decoded for nothing.
+    let open = open_parts(&frame)?;
+    Some((columns(&frame)?, open))
 }
 
 /// The open parts of a [`Stored::Names`] frame, decoded, or `None` when it
@@ -317,8 +320,51 @@ pub(crate) fn parts(index: &[u8]) -> Option<(SegmentColumns, SegmentOpen)> {
 /// [`MAX_OPEN_DECODED`].
 pub(crate) fn open_parts(frame: &Frame) -> Option<SegmentOpen> {
     let open = frame.open.as_ref()?;
+    // The version first, from the frame's first bytes: a frame of another
+    // version is neither decompressed nor parsed whole.
+    if open_version(open)? != OPEN_VERSION {
+        return None;
+    }
     let stored: StoredOpen = rmp_serde::from_slice(&decode(open, MAX_OPEN_DECODED)?).ok()?;
-    (stored.version == OPEN_VERSION).then(|| stored.into())
+    Some(stored.into())
+}
+
+/// The version of a compressed open frame, read from its first decompressed
+/// bytes: [`StoredOpen`] is written as a map whose first entry is
+/// `version`. `None` when the frame does not start that way (written without
+/// a version, or not by this crate).
+fn open_version(open: &[u8]) -> Option<u32> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    zstd::stream::Decoder::new(open)
+        .ok()?
+        .take(32)
+        .read_to_end(&mut head)
+        .ok()?;
+    let mut at = match *head.first()? {
+        0x80..=0x8f => 1,
+        0xde => 3,
+        0xdf => 5,
+        _ => return None,
+    };
+    let key = b"version";
+    if *head.get(at)? != 0xa0 | key.len() as u8 || head.get(at + 1..at + 1 + key.len())? != key {
+        return None;
+    }
+    at += 1 + key.len();
+    let value = |n: usize| -> Option<u64> {
+        let bytes = head.get(at + 1..at + 1 + n)?;
+        Some(bytes.iter().fold(0u64, |v, b| v << 8 | u64::from(*b)))
+    };
+    let version = match *head.get(at)? {
+        b @ 0x00..=0x7f => u64::from(b),
+        0xcc => value(1)?,
+        0xcd => value(2)?,
+        0xce => value(4)?,
+        0xcf => value(8)?,
+        _ => return None,
+    };
+    u32::try_from(version).ok()
 }
 
 type Labels = BTreeMap<String, String>;
@@ -385,14 +431,6 @@ fn with_occupant(base: &Labels, id: u64) -> Labels {
 /// a new one.
 const OPEN_VERSION: u32 = 1;
 
-/// Just the version of an open frame, to tell whether this crate wrote
-/// it without decoding the rest.
-#[derive(Deserialize)]
-struct OpenVersion {
-    #[serde(default)]
-    version: u32,
-}
-
 /// The bytes of a stored names index that a listing reads: its prefix, names
 /// frame and columns frame, without the open frame after them, which holds
 /// each segment's span and so differs between segments whose names are the
@@ -414,7 +452,7 @@ pub(crate) fn listing_key(index: &[u8]) -> &[u8] {
 
 /// Whether `index` holds an open frame this crate does not know: of a later
 /// version, one that does not decode, or followed by more bytes. A re-index
-/// leaves such an index as it is.
+/// leaves such an index as it is, and replaces one of an earlier version.
 pub(crate) fn has_unknown_open_frame(index: &[u8]) -> bool {
     let Some(Stored::Names(_, Some(frame))) = read(Some(index)) else {
         return false;
@@ -426,9 +464,13 @@ pub(crate) fn has_unknown_open_frame(index: &[u8]) -> bool {
     if one != Some(open.len()) {
         return true;
     }
-    let version = decode(open, MAX_OPEN_DECODED)
-        .and_then(|bytes| rmp_serde::from_slice::<OpenVersion>(&bytes).ok());
-    version.is_none_or(|v| v.version != OPEN_VERSION)
+    if open_version(open).is_some_and(|v| v > OPEN_VERSION) {
+        return true;
+    }
+    // Of this version or an earlier one: unknown only if it does not decode.
+    decode(open, MAX_OPEN_DECODED)
+        .and_then(|bytes| rmp_serde::from_slice::<StoredOpen>(&bytes).ok())
+        .is_none()
 }
 
 impl From<&SegmentOpen> for StoredOpen {
@@ -677,8 +719,9 @@ mod tests {
         assert!(!has_unknown_open_frame(&index));
     }
 
-    /// An open frame of another version is not read, and a re-index leaves
-    /// it; so does an index with a frame after the open frame.
+    /// An open frame of another version is not read. A re-index leaves one
+    /// of a later version, or with a frame after it, and replaces one of an
+    /// earlier version.
     #[test]
     fn an_open_frame_this_version_does_not_know_is_left() {
         let names = SegmentNames::default();
@@ -690,6 +733,15 @@ mod tests {
         index.extend(zstd::stream::encode_all(packed.as_slice(), 3).unwrap());
         assert_eq!(parts(&index), None);
         assert!(has_unknown_open_frame(&index));
+
+        // An earlier version's frame is not read, and a re-index replaces it.
+        let mut earlier = StoredOpen::from(&SegmentOpen::default());
+        earlier.version = OPEN_VERSION - 1;
+        let mut index = encode(&names, Some(&columns), None).unwrap();
+        let packed = rmp_serde::to_vec_named(&earlier).unwrap();
+        index.extend(zstd::stream::encode_all(packed.as_slice(), 3).unwrap());
+        assert_eq!(parts(&index), None);
+        assert!(!has_unknown_open_frame(&index));
 
         let mut extra = encode(&names, Some(&columns), Some(&SegmentOpen::default())).unwrap();
         assert!(!has_unknown_open_frame(&extra));
