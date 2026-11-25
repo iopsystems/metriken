@@ -1097,7 +1097,7 @@ impl MetricsSource for ArchiveReader {
     /// An archive has a table per sampler or acquisition group, and the list
     /// is the union of their row timestamps, so an instant at which only a
     /// slower table was read is listed. A copy of the source (a source with
-    /// its uuid, in its read group) can hold fewer or more of the
+    /// its identity, `SourceInfo::identity`, in its read group) can hold fewer or more of the
     /// recording's rows than the source; the list is their union. Another
     /// source is not listed, even one in the same read group: a second
     /// recorder of one agent samples on its own schedule. A reader of
@@ -1120,15 +1120,16 @@ impl MetricsSource for ArchiveReader {
         leads.sort_unstable();
         leads.dedup();
         for lead in leads {
-            let uuid = &sources[lead].uuid;
+            let uuid = &sources[lead].identity;
             let group = tables
                 .iter()
                 .find(|(p, _)| *p == lead)
                 .and_then(|(_, t)| self.read_group_of(t));
             let mut out: Vec<u64> = Vec::new();
             for (p, t) in &tables {
-                let copy =
-                    uuid.is_some() && sources[*p].uuid == *uuid && self.read_group_of(t) == group;
+                let copy = uuid.is_some()
+                    && sources[*p].identity == *uuid
+                    && self.read_group_of(t) == group;
                 if *p != lead && !copy {
                     continue;
                 }

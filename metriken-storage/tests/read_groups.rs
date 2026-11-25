@@ -667,3 +667,129 @@ fn a_scope_reads_only_the_sources_it_names() {
     let none = scoped_points(&reader, scope(vec![(SourceRef::Position(7), None)]));
     assert!(none.is_empty());
 }
+
+/// Two dumps of one buffer copied into one archive as dendro now writes
+/// them, the second under a fresh uuid with the first's as its origin
+/// (`copy_sources_into_as_copies`): they read as one recording, as two
+/// copies under one uuid did, but each keeps its own uuid, so a scope naming
+/// one reads only it. With an arm on each they are two recordings, and a
+/// scope naming the baseline's source reads only the baseline.
+#[test]
+fn copies_under_fresh_uuids_group_by_identity_and_scope_by_uuid() {
+    use metriken_query::{Scope, ScopedSource, SourceRef};
+
+    let dir = tempfile::tempdir().unwrap();
+    // A buffer sealed every 5 rows, so a dump of part of it holds only the
+    // segments around that part.
+    let buffer = dir.path().join("buffer.dendro");
+    {
+        let config = WriterConfig {
+            seal: dendro::seal::SealPolicy {
+                max_rows: 5,
+                ..dendro::seal::SealPolicy::default()
+            },
+            ..WriterConfig::default()
+        };
+        let spec = epoch("e1", 0..30);
+        let mut writer = ArchiveWriter::create(&buffer, config).unwrap();
+        let mut source = writer.add_source(spec.labels, spec.metadata, BASE).unwrap();
+        for t in spec.ticks {
+            let ts = BASE + t * S;
+            let staged = source.stage(&snapshot(ts), ts, 0).unwrap();
+            writer.commit(vec![staged]).unwrap();
+            source.maybe_seal().unwrap();
+        }
+        source.finalize((BASE + 29 * S, 0)).unwrap();
+        writer.join().unwrap();
+    }
+    let path = dir.path().join("dumps.dendro");
+    {
+        let src = dendro::archive::Archive::open(&buffer).unwrap();
+        let encoder = metriken_storage::Encoder::for_archive(&src).unwrap();
+        let mut out = ArchiveMut::create(&path).unwrap();
+        for (start, end) in [(0, 9), (20, 29)] {
+            let spec = CopySpec {
+                start: (BASE + start * S) as i64,
+                end: (BASE + end * S) as i64,
+                ..CopySpec::everything()
+            };
+            out.transaction(|tx| {
+                dendro::rewrite::copy_sources_into_as_copies(&src, tx, &spec, &encoder)
+            })
+            .unwrap();
+        }
+    }
+    let scope = |uuid: &str| {
+        Some(
+            Scope::new(vec![ScopedSource::new(
+                SourceRef::Uuid(uuid.to_string()),
+                None,
+            )])
+            .unwrap(),
+        )
+    };
+
+    let mut opened = groups(&path);
+    assert_eq!(opened.len(), 1, "one recording");
+    let (_, reader) = opened.remove(0);
+    let sources = reader.sources();
+    assert_eq!(sources.len(), 2);
+    assert_ne!(sources[0].uuid, sources[1].uuid, "each keeps its own uuid");
+    assert_eq!(sources[1].identity, sources[0].uuid);
+    let second = scoped_points(&reader, scope(sources[1].uuid.as_deref().unwrap()));
+    assert!(
+        !second.is_empty() && second.iter().all(|&t| t >= 20),
+        "{second:?}"
+    );
+    // The recording's instants are both dumps' rows (10 each), not the
+    // first's alone.
+    assert_eq!(reader.sample_timestamps().len(), 20);
+
+    drop((reader, opened));
+    let mut db = ArchiveMut::open(&path).unwrap();
+    for (row, arm) in db
+        .read_sources()
+        .unwrap()
+        .iter()
+        .zip(["baseline", "experiment"])
+    {
+        let mut labels = row.meta.labels.clone();
+        labels.insert("arm".to_string(), arm.to_string());
+        db.update_source_labels(row.id, &labels).unwrap();
+    }
+    drop(db);
+    let opened = groups(&path);
+    assert_eq!(opened.len(), 2, "one recording an arm");
+    let joined = ArchiveReader::flatten(opened.into_iter().map(|(_, r)| r).collect(), None);
+    let baseline = joined.sources()[0].uuid.clone().unwrap();
+    let points = scoped_points(&joined, scope(&baseline));
+    assert!(
+        !points.is_empty() && points.iter().all(|&t| t <= 10),
+        "{points:?}"
+    );
+
+    // An overlay naming the baseline's uuid relabels the baseline alone.
+    let overlay = metriken_storage::overlay::LabelOverlay::new(vec![
+        metriken_storage::overlay::OverlayEntry {
+            selector: metriken_storage::overlay::SourceSelector::Uuid(baseline.clone()),
+            labels: map(&[("arm", "control")]),
+        },
+    ])
+    .unwrap();
+    let overlaid =
+        ArchiveReader::open_read_groups_overlaid(&path, pool(), Some(std::sync::Arc::new(overlay)))
+            .unwrap();
+    // Read through the overlay, the copy keeps its origin as its identity.
+    assert_eq!(
+        overlaid[1].1.sources()[0].identity.as_deref(),
+        Some(baseline.as_str())
+    );
+    let arms: Vec<Option<String>> = overlaid
+        .iter()
+        .map(|(l, _)| l.get("arm").cloned())
+        .collect();
+    assert_eq!(
+        arms,
+        [Some("control".to_string()), Some("experiment".to_string())]
+    );
+}

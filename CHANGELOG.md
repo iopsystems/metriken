@@ -20,6 +20,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a per-device histogram summed from a BPF map, which `CounterHistogramGroup`
   (incremented one value at a time) cannot hold.
 
+### metriken-query (unreleased)
+
+- **Changed:** `ArchiveReader::sample_timestamps` lists the rows of a copy
+  kept under a fresh uuid as rows of its origin (metriken-storage's
+  `SourceInfo::identity`), as it lists a copy under the origin's uuid.
+
+### metriken-storage (unreleased)
+
+Requires dendro 0.8.3.
+
+- **Changed:** a dendro source copied under a fresh uuid because its
+  archive already held the source (dendro's `copy_sources_into_as_copies`)
+  is grouped as a copy of that source: process groups take
+  `SourceInfo::identity` (dendro's `SourceRow::identity`: the uuid of the
+  first source in a chain of copies), so two snapshots or dumps of one
+  buffer copied into one archive are one process, gaps and overlap
+  included, as two copies under one uuid were. `SourceInfo::uuid` stays the
+  source's own uuid, so a `Scope` or an overlay's `SourceSelector::Uuid`
+  naming it selects that source alone. `UuidGroup::uuid` is the identity
+  its sources share, which can be a uuid no source in the archive carries.
+- **Added:** `Catalog::source_identities` (defaulting to each source's
+  uuid), `SourceInfo::identity` and `SourceInfo::with_identity`.
+
 ### metriken-exposition 0.28.0
 
 Requires dendro 0.8.1.

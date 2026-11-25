@@ -70,11 +70,28 @@ pub trait Catalog: Send {
     fn sources(&self) -> Result<Vec<Source>, String>;
 
     /// Every source, in id order, each with its uuid: the id a dendro copy
-    /// keeps, so two sources that carry one uuid are copies of one source.
+    /// keeps unless it is kept under a fresh uuid
+    /// ([`source_identities`](Self::source_identities)), so two sources that
+    /// carry one uuid are copies of one source.
     /// The default is [`sources`](Self::sources) with no uuid, for a
     /// container that keeps none.
     fn sources_with_uuids(&self) -> Result<Vec<(Source, Option<String>)>, String> {
         Ok(self.sources()?.into_iter().map(|s| (s, None)).collect())
+    }
+
+    /// Each source's identity, in the order of
+    /// [`sources_with_uuids`](Self::sources_with_uuids): the uuid of the
+    /// source it records. For a dendro copy kept under a fresh uuid because
+    /// its archive already held the source, and any later copy of one, the
+    /// uuid of the first source in that chain of copies (dendro's
+    /// `SourceRow::identity`, which reads `origin`); otherwise its uuid,
+    /// which is the default.
+    fn source_identities(&self) -> Result<Vec<Option<String>>, String> {
+        Ok(self
+            .sources_with_uuids()?
+            .into_iter()
+            .map(|(_, uuid)| uuid)
+            .collect())
     }
 
     /// Every table of a source that has sealed segments or WAL rows.
@@ -265,6 +282,16 @@ impl Catalog for DendroCatalog {
                 ))
             })
             .collect()
+    }
+
+    fn source_identities(&self) -> Result<Vec<Option<String>>, String> {
+        Ok(self
+            .0
+            .read_sources()
+            .map_err(err)?
+            .iter()
+            .map(|s| s.identity().map(str::to_string))
+            .collect())
     }
 
     fn tables(&self, source_id: i64) -> Result<Vec<String>, String> {

@@ -11,8 +11,9 @@
 //! its sources carry ([`crate::process::read_groups`]), so removing a key
 //! from some sources of a group leaves it on the group. To remove a key from
 //! a read group, remove it from every source of the group: selecting by
-//! uuid covers one source and its copies, and a process group can hold
-//! several uuids. The readers' labels, `ArchiveReader::sources` included,
+//! uuid covers one source and its copies that keep its uuid, and a process
+//! group can hold several uuids (a copy kept under a fresh uuid has its
+//! own). The readers' labels, `ArchiveReader::sources` included,
 //! are the overlaid ones, so a caller writing to the archive
 //! (`layers::append`) must read a source's labels from the archive, not
 //! from a reader, or the write records the overlay as an outside change.
@@ -30,7 +31,9 @@ use crate::labels::Labels;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SourceSelector {
-    /// The source with this uuid, and its copies, which keep it.
+    /// The source with this uuid, and its copies that keep it. A copy kept
+    /// under a fresh uuid (dendro's `copy_sources_into_as_copies`) is named
+    /// by its own uuid, as a metriken-query `Scope` names it.
     Uuid(String),
     /// The sources whose labels, as the archive stores them, `Labels::matches`
     /// this filter: one matcher per label, each value as [`MatchOp::encode`]
@@ -154,6 +157,10 @@ impl Catalog for OverlaidCatalog {
                 (source, uuid)
             })
             .collect())
+    }
+
+    fn source_identities(&self) -> Result<Vec<Option<String>>, String> {
+        self.inner.source_identities()
     }
 
     fn tables(&self, source_id: i64) -> Result<Vec<String>, String> {

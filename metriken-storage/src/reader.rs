@@ -2063,7 +2063,22 @@ impl ArchiveReader {
         let db = shared.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
 
-        for (recording, (rec, uuid)) in db.sources_with_uuids()?.into_iter().enumerate() {
+        // One snapshot for both lists, so a source a writer adds meanwhile is
+        // in both or in neither.
+        let (sources, identities) = in_snapshot(&**db, || {
+            let sources = db.sources_with_uuids()?;
+            let identities = db.source_identities()?;
+            if sources.len() != identities.len() {
+                return Err(format!(
+                    "the catalog listed {} sources and {} identities",
+                    sources.len(),
+                    identities.len()
+                ));
+            }
+            Ok((sources, identities))
+        })?;
+        for (recording, ((rec, uuid), identity)) in sources.into_iter().zip(identities).enumerate()
+        {
             if let Some(wrote) = rec.metadata.get(dendro::keys::ENCODER) {
                 if !crate::encoder::READABLE_ENCODERS.contains(&wrote.as_str()) {
                     return Err(format!(
@@ -2257,7 +2272,8 @@ impl ArchiveReader {
                 uuid,
                 tables_span(&tables),
                 &rec.metadata,
-            );
+            )
+            .with_identity(identity);
             out.push((
                 rec.labels.clone(),
                 Self {
@@ -2686,8 +2702,8 @@ impl ArchiveReader {
         &self.sources
     }
 
-    /// The sources grouped by producer process: copies (one uuid) taken as
-    /// one, bridges set aside, and the rest joined where they share a
+    /// The sources grouped by producer process: copies (one identity,
+    /// `SourceInfo::identity`) taken as one, bridges set aside, and the rest joined where they share a
     /// producer epoch and overlap in it by a row of each (see
     /// [`crate::process`]). Worked out on first use and kept. Which rows a
     /// source holds is read from the catalog entries listed at open, and a

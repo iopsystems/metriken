@@ -4,8 +4,10 @@
 //! The rules are the data model and P6 of
 //! `docs/journal/2026-10-19-recording-identity-and-views.md`:
 //!
-//! 1. Sources sharing a uuid are copies of one source and are taken as one:
-//!    a [`UuidGroup`].
+//! 1. Sources sharing an identity ([`SourceInfo::identity`]: a uuid, or for
+//!    a dendro copy kept under a fresh uuid, and any later copy of one, the
+//!    uuid of the first source in that chain of copies) are copies of one
+//!    source and are taken as one: a [`UuidGroup`].
 //! 2. Bridges are set aside. A bridge is a uuid group that overlaps two other
 //!    uuid groups which do not overlap each other, and whose span covers the
 //!    gap between them (a continuous recording beside one recording per
@@ -72,9 +74,16 @@ pub struct SourceInfo {
     /// The source's position among its archive's catalog sources, in id
     /// order.
     pub catalog_index: usize,
-    /// The source's uuid, kept by every dendro copy; `None` where the
-    /// container has none (a `.rez`, a source built in memory).
+    /// The source's uuid, kept by a dendro copy unless it is kept under a
+    /// fresh uuid; `None` where the container has none (a `.rez`, a source
+    /// built in memory).
     pub uuid: Option<String>,
+    /// The uuid of the source it records: its [`uuid`](Self::uuid), or for a
+    /// dendro copy kept under a fresh uuid, and any later copy of one, the
+    /// uuid of the first source in that chain of copies (dendro's `origin`,
+    /// [`Catalog::source_identities`](crate::catalog::Catalog::source_identities)).
+    /// Sources with one identity are copies of one source.
+    pub identity: Option<String>,
     /// The first and last row of any of the source's tables, in
     /// nanoseconds; `None` for a source with no rows.
     pub span_ns: Option<(u64, u64)>,
@@ -97,10 +106,18 @@ impl SourceInfo {
         Self {
             labels,
             catalog_index,
+            identity: uuid.clone(),
             uuid,
             span_ns,
             epochs,
         }
+    }
+
+    /// This source with `identity` as its [`identity`](Self::identity),
+    /// where it differs from its uuid.
+    pub fn with_identity(mut self, identity: Option<String>) -> Self {
+        self.identity = identity;
+        self
     }
 }
 
@@ -221,11 +238,14 @@ pub(crate) fn listed_epochs(s: &str) -> Option<Vec<(String, u64)>> {
     Some(entries.into_iter().map(|e| (e.epoch, e.from_ts)).collect())
 }
 
-/// Sources sharing a uuid (copies of one source), or one source without a
-/// uuid or whose uuid no other source carries.
+/// Sources sharing an identity ([`SourceInfo::identity`]: copies of one
+/// source), or one source without one or whose identity no other source
+/// carries. Its `uuid` is that identity, which for copies of a copy can be a
+/// uuid no source in the archive has.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct UuidGroup {
+    /// The identity its sources share ([`SourceInfo::identity`]).
     pub uuid: Option<String>,
     /// Positions in the source list, ascending.
     pub sources: Vec<usize>,
@@ -277,7 +297,7 @@ pub struct Bridge {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Notice {
-    /// Copies of one source (one uuid) whose `host` labels differ.
+    /// Copies of one source (one identity) whose `host` labels differ.
     HostsDiffer {
         uuid_group: usize,
         hosts: Vec<String>,
@@ -439,15 +459,18 @@ pub fn form(
     let mut uuid_groups: Vec<UuidGroup> = Vec::new();
     let mut by_uuid: HashMap<&str, usize> = HashMap::new();
     for (position, source) in sources.iter().enumerate() {
-        let known = source.uuid.as_deref().and_then(|u| by_uuid.get(u).copied());
+        let known = source
+            .identity
+            .as_deref()
+            .and_then(|u| by_uuid.get(u).copied());
         match known {
             Some(i) => uuid_groups[i].sources.push(position),
             None => {
-                if let Some(uuid) = source.uuid.as_deref() {
+                if let Some(uuid) = source.identity.as_deref() {
                     by_uuid.insert(uuid, uuid_groups.len());
                 }
                 uuid_groups.push(UuidGroup {
-                    uuid: source.uuid.clone(),
+                    uuid: source.identity.clone(),
                     sources: vec![position],
                     span_ns: None,
                 });
@@ -833,10 +856,10 @@ pub fn read_groups(sources: &[SourceInfo], groups: &ProcessGroups) -> Vec<ReadGr
             if let Some(v) = sources[s].labels.get(key) {
                 return Some(v.clone());
             }
-            let uuid = sources[s].uuid.as_deref()?;
+            let uuid = sources[s].identity.as_deref()?;
             let carried: BTreeSet<&String> = unit
                 .iter()
-                .filter(|&&o| sources[o].uuid.as_deref() == Some(uuid))
+                .filter(|&&o| sources[o].identity.as_deref() == Some(uuid))
                 .filter_map(|&o| sources[o].labels.get(key))
                 .collect();
             match carried.len() {
@@ -1492,6 +1515,36 @@ mod tests {
                 (vec![0, 2], labels(&[("arm", "x"), ("host", "a")])),
                 (vec![1], labels(&[("arm", "y"), ("host", "a")])),
                 (vec![3], labels(&[("host", "a")])),
+            ]
+        );
+    }
+
+    /// A copy kept under a fresh uuid, with its origin as its identity and
+    /// without `arm`, takes its origin's value and goes with it, as a copy
+    /// under the origin's uuid does.
+    #[test]
+    fn a_fresh_uuid_copy_takes_its_origins_label() {
+        let s = vec![
+            source(
+                &[("host", "a"), ("arm", "x")],
+                Some("u1"),
+                Some((0, 10)),
+                Some("e"),
+            ),
+            source(
+                &[("host", "a"), ("arm", "y")],
+                Some("u2"),
+                Some((5, 20)),
+                Some("e"),
+            ),
+            source(&[("host", "a")], Some("f1"), Some((0, 10)), Some("e"))
+                .with_identity(Some("u1".to_string())),
+        ];
+        assert_eq!(
+            read(&s),
+            vec![
+                (vec![0, 2], labels(&[("arm", "x"), ("host", "a")])),
+                (vec![1], labels(&[("arm", "y"), ("host", "a")])),
             ]
         );
     }
