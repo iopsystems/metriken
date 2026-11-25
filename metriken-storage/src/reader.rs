@@ -2065,8 +2065,7 @@ impl ArchiveReader {
 
         // One snapshot for both lists, so a source a writer adds meanwhile is
         // in both or in neither.
-        let mut listed = None;
-        db.read_snapshot(&mut || {
+        let (sources, identities) = in_snapshot(&**db, || {
             let sources = db.sources_with_uuids()?;
             let identities = db.source_identities()?;
             if sources.len() != identities.len() {
@@ -2076,10 +2075,8 @@ impl ArchiveReader {
                     identities.len()
                 ));
             }
-            listed = Some((sources, identities));
-            Ok(())
+            Ok((sources, identities))
         })?;
-        let (sources, identities) = listed.ok_or("the catalog's snapshot read no sources")?;
         for (recording, ((rec, uuid), identity)) in sources.into_iter().zip(identities).enumerate()
         {
             if let Some(wrote) = rec.metadata.get(dendro::keys::ENCODER) {
