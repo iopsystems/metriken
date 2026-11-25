@@ -5,8 +5,9 @@
 //! `docs/journal/2026-10-19-recording-identity-and-views.md`:
 //!
 //! 1. Sources sharing an identity ([`SourceInfo::identity`]: a uuid, or for
-//!    a dendro copy kept under a fresh uuid the uuid it copies) are copies of
-//!    one source and are taken as one: a [`UuidGroup`].
+//!    a dendro copy kept under a fresh uuid, and any later copy of one, the
+//!    uuid of the first source in that chain of copies) are copies of one
+//!    source and are taken as one: a [`UuidGroup`].
 //! 2. Bridges are set aside. A bridge is a uuid group that overlaps two other
 //!    uuid groups which do not overlap each other, and whose span covers the
 //!    gap between them (a continuous recording beside one recording per
@@ -78,8 +79,9 @@ pub struct SourceInfo {
     /// built in memory).
     pub uuid: Option<String>,
     /// The uuid of the source it records: its [`uuid`](Self::uuid), or for a
-    /// dendro copy kept under a fresh uuid the uuid it copies
-    /// ([`Catalog::source_identities`](crate::catalog::Catalog::source_identities)).
+    /// dendro copy kept under a fresh uuid, and any later copy of one, the
+    /// uuid of the first source in that chain of copies (dendro's `origin`,
+    /// [`Catalog::source_identities`](crate::catalog::Catalog::source_identities)).
     /// Sources with one identity are copies of one source.
     pub identity: Option<String>,
     /// The first and last row of any of the source's tables, in

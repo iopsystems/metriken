@@ -33,11 +33,13 @@ Requires dendro 0.8.3.
 - **Changed:** a dendro source copied under a fresh uuid because its
   archive already held the source (dendro's `copy_sources_into_as_copies`)
   is grouped as a copy of that source: process groups take
-  `SourceInfo::identity` (dendro's `SourceRow::identity`, the copied uuid),
-  so two snapshots or dumps of one buffer copied into one archive are one
-  process, gaps and overlap included, as two copies under one uuid were.
-  `SourceInfo::uuid` stays the source's own uuid, so a `Scope` or an
-  overlay's `SourceSelector::Uuid` naming it selects that source alone.
+  `SourceInfo::identity` (dendro's `SourceRow::identity`: the uuid of the
+  first source in a chain of copies), so two snapshots or dumps of one
+  buffer copied into one archive are one process, gaps and overlap
+  included, as two copies under one uuid were. `SourceInfo::uuid` stays the
+  source's own uuid, so a `Scope` or an overlay's `SourceSelector::Uuid`
+  naming it selects that source alone. `UuidGroup::uuid` is the identity
+  its sources share, which can be a uuid no source in the archive carries.
 - **Added:** `Catalog::source_identities` (defaulting to each source's
   uuid), `SourceInfo::identity` and `SourceInfo::with_identity`.
 

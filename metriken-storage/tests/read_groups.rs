@@ -771,7 +771,7 @@ fn copies_under_fresh_uuids_group_by_identity_and_scope_by_uuid() {
     // An overlay naming the baseline's uuid relabels the baseline alone.
     let overlay = metriken_storage::overlay::LabelOverlay::new(vec![
         metriken_storage::overlay::OverlayEntry {
-            selector: metriken_storage::overlay::SourceSelector::Uuid(baseline),
+            selector: metriken_storage::overlay::SourceSelector::Uuid(baseline.clone()),
             labels: map(&[("arm", "control")]),
         },
     ])
@@ -779,6 +779,11 @@ fn copies_under_fresh_uuids_group_by_identity_and_scope_by_uuid() {
     let overlaid =
         ArchiveReader::open_read_groups_overlaid(&path, pool(), Some(std::sync::Arc::new(overlay)))
             .unwrap();
+    // Read through the overlay, the copy keeps its origin as its identity.
+    assert_eq!(
+        overlaid[1].1.sources()[0].identity.as_deref(),
+        Some(baseline.as_str())
+    );
     let arms: Vec<Option<String>> = overlaid
         .iter()
         .map(|(l, _)| l.get("arm").cloned())

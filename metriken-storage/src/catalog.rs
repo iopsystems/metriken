@@ -82,8 +82,10 @@ pub trait Catalog: Send {
     /// Each source's identity, in the order of
     /// [`sources_with_uuids`](Self::sources_with_uuids): the uuid of the
     /// source it records. For a dendro copy kept under a fresh uuid because
-    /// its archive already held the source, the uuid it copies (dendro's
-    /// `SourceRow::identity`); otherwise its uuid, which is the default.
+    /// its archive already held the source, and any later copy of one, the
+    /// uuid of the first source in that chain of copies (dendro's
+    /// `SourceRow::identity`, which reads `origin`); otherwise its uuid,
+    /// which is the default.
     fn source_identities(&self) -> Result<Vec<Option<String>>, String> {
         Ok(self
             .sources_with_uuids()?
