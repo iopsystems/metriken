@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-### metriken (unreleased)
+### metriken 0.11.8
 
 - **Added:** `RwLockCounterHistogramGroup`, a counting histogram group whose
   entries are written as whole bucket arrays: `update_from(idx, &buckets)`
